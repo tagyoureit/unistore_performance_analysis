@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">
+  <g fill="none" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <!-- "Interactive" = snowflake-esque mark -->
+    <path d="M32 10v44" />
+    <path d="M10 32h44" />
+    <path d="M18 18l28 28" />
+    <path d="M18 46l28-28" />
+
+    <path d="M32 10l-4 5" />
+    <path d="M32 10l4 5" />
+    <path d="M32 54l-4-5" />
+    <path d="M32 54l4-5" />
+
+    <path d="M10 32l5-4" />
+    <path d="M10 32l5 4" />
+    <path d="M54 32l-5-4" />
+    <path d="M54 32l-5 4" />
+  </g>
+</svg>

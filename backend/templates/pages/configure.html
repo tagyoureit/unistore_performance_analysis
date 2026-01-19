@@ -436,34 +436,28 @@
             <div class="form-group">
                 <label class="form-label">Load Mode</label>
                 <select class="form-select" x-model="config.load_mode">
-                    <option value="CONCURRENCY">Fixed concurrency (workers)</option>
-                    <option value="QPS">Auto-scale workers (Target)</option>
-                    <option value="FIND_MAX_CONCURRENCY">Find Max Concurrency (step-load)</option>
+                    <option value="CONCURRENCY">Fixed workers (closed model)</option>
+                    <option value="QPS">Target throughput (QPS) (auto-scale workers)</option>
+                    <option value="FIND_MAX_CONCURRENCY">Find max (step-load)</option>
                 </select>
                 <small class="form-text">
-                    Fixed concurrency runs a constant number of workers. Auto-scale dynamically adjusts workers to hit a target.
-                    Find Max Concurrency incrementally increases workers to find the maximum sustainable concurrency.
+                    Fixed workers runs a constant number of worker tasks. Target throughput dynamically adjusts workers to hit a target ops/sec.
+                    Find max incrementally increases workers to find the maximum sustainable worker count.
                 </small>
             </div>
 
             <div class="form-group" x-show="String(config.load_mode || 'CONCURRENCY').toUpperCase() === 'QPS'">
-                <label
-                    class="form-label"
-                    x-text="isPostgresFamilyTableType(config.table_type) ? 'Target QPS' : 'Target Snowflake Running'"
-                ></label>
+                <label class="form-label">Target QPS (ops/sec)</label>
                 <input type="number" class="form-input" x-model.number="config.target_qps" min="1" max="100000" step="1">
-                <small class="form-text" x-show="isPostgresFamilyTableType(config.table_type)">
-                    Desired total operations per second across the template mix (reads + writes)
-                </small>
-                <small class="form-text" x-show="!isPostgresFamilyTableType(config.table_type)">
-                    Desired concurrent Snowflake <code>RUNNING</code> queries for this test’s <code>QUERY_TAG</code>. Throughput (QPS) is measured separately.
+                <small class="form-text">
+                    Desired total operations per second across the template mix (reads + writes). Concurrency and Snowflake server-side metrics are measured separately.
                 </small>
             </div>
 
             <div class="form-group" x-show="String(config.load_mode || 'CONCURRENCY').toUpperCase() === 'CONCURRENCY'">
-                <label class="form-label">Concurrent Connections</label>
+                <label class="form-label">Workers</label>
                 <input type="number" class="form-input" x-model.number="config.concurrent_connections" min="1" max="1000">
-                <small class="form-text">Number of parallel workers (1-1000)</small>
+                <small class="form-text">Fixed number of worker tasks (1-1000)</small>
             </div>
 
             <div class="mt-2" x-show="String(config.load_mode || 'CONCURRENCY').toUpperCase() === 'QPS'">
@@ -475,7 +469,7 @@
                         <div class="form-group">
                             <label class="form-label">Min Workers</label>
                             <input type="number" class="form-input" x-model.number="config.min_concurrency" min="1" max="1000" step="1" :disabled="String(config.load_mode || 'CONCURRENCY').toUpperCase() !== 'QPS'">
-                            <small class="form-text">Starting worker count for auto-scale mode (the controller will scale up/down)</small>
+                            <small class="form-text">Starting worker count for target-throughput mode (the controller will scale up/down)</small>
                         </div>
 
                         <div class="form-group">
@@ -496,7 +490,7 @@
             <div class="mt-2" x-show="String(config.load_mode || 'CONCURRENCY').toUpperCase() === 'FIND_MAX_CONCURRENCY'">
                 <div class="p-3 bg-blue-50 rounded border border-blue-200 mb-3" style="background-color: #eff6ff; border-color: #bfdbfe;">
                     <div class="text-sm" style="color: #1e40af;">
-                        <strong>Find Max Concurrency</strong> automatically finds the maximum sustainable concurrency.
+                        <strong>Find Max (step-load)</strong> automatically finds the maximum sustainable worker count.
                         <strong>The test runs until degradation is detected or max workers is reached</strong> (no fixed duration).
                         <ol class="mt-2 ml-4" style="list-style-type: decimal; margin-left: 1.5rem;">
                             <li>Starts at the specified concurrency level</li>
@@ -537,21 +531,21 @@
                     </summary>
                     <div class="mt-2">
                         <div class="form-group">
-                            <label class="form-label">QPS Stability Threshold (%)</label>
+                            <label class="form-label">QPS Drop Threshold (%)</label>
                             <input type="number" class="form-input" x-model.number="config.qps_stability_pct" min="1" max="50" step="1">
-                            <small class="form-text">QPS must stay within this % of previous step to be considered stable (default: 5%)</small>
+                            <small class="form-text">If QPS drops by more than this % vs. previous step, test stops. Increases are allowed. (default: 5%)</small>
                         </div>
 
                         <div class="form-group">
-                            <label class="form-label">Latency Stability Threshold (%)</label>
+                            <label class="form-label">P95 Latency Stability Threshold (%)</label>
                             <input type="number" class="form-input" x-model.number="config.latency_stability_pct" min="5" max="100" step="5">
-                            <small class="form-text">P95 latency can increase up to this % and still be stable (default: 20%)</small>
+                            <small class="form-text">P95 latency can increase up to this % vs. previous step (or 2x vs. baseline) and still be stable (default: 20%)</small>
                         </div>
 
                         <div class="form-group">
-                            <label class="form-label">Max Error Rate (%)</label>
+                            <label class="form-label">Global Max Error Rate (%)</label>
                             <input type="number" class="form-input" x-model.number="config.max_error_rate_pct" min="0" max="100" step="0.5">
-                            <small class="form-text">Test stops if error rate exceeds this (default: 1%)</small>
+                            <small class="form-text">Hard ceiling on total error rate across all operations, independent of per-SLO targets above (default: 1%)</small>
                         </div>
                     </div>
                 </details>
@@ -569,17 +563,20 @@
                 <small class="form-text">Time to warm up caches before measurement starts</small>
             </div>
 
-            <div
-                class="form-group"
-                x-show="config.table_type === 'STANDARD'"
-            >
+            <div class="form-group" x-show="config.table_type === 'STANDARD' || config.table_type === 'INTERACTIVE'">
                 <label class="form-label">
                     <input type="checkbox" x-model="config.use_cached_result">
                     Use Snowflake result cache (<code>USE_CACHED_RESULT</code>)
                 </label>
-                <small class="form-text">
-                    If enabled, identical SELECT statements may return cached results. Disable to force query execution each time.
-                    (Only applicable to standard tables; hybrid/interactive tables are optimized for transactional workloads where caching is not beneficial.)
+                <small class="form-text" x-show="config.table_type === 'STANDARD'">
+                    If enabled, identical SELECT statements may return cached results within 24 hours. 
+                    Disable to force query execution each time for accurate performance benchmarking.
+                    <strong>Note:</strong> If using clustering, reclustering operations will invalidate cached results.
+                </small>
+                <small class="form-text" x-show="config.table_type === 'INTERACTIVE'">
+                    <strong>Interactive tables:</strong> Interactive warehouses are optimized for low-latency queries.
+                    Result caching behavior may differ from standard tables. This setting controls the <code>USE_CACHED_RESULT</code>
+                    session parameter, but the effective caching behavior depends on the interactive warehouse implementation.
                 </small>
             </div>
         </div>
@@ -1629,7 +1626,7 @@ function testConfiguration() {
             // Validate load mode.
             const loadMode = String(this.config.load_mode || 'CONCURRENCY').trim().toUpperCase();
             if (!['CONCURRENCY', 'QPS', 'FIND_MAX_CONCURRENCY'].includes(loadMode)) {
-                window.toast.warning('Invalid load mode. Choose Fixed concurrency, Auto-scale, or Find Max Concurrency.');
+                window.toast.warning('Invalid load mode. Choose Fixed workers, Target throughput (QPS), or Find max.');
                 return;
             }
 

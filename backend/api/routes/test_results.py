@@ -483,6 +483,8 @@ async def list_tests(
     warehouse_size: str = "",
     status_filter: str = Query("", alias="status"),
     date_range: str = "all",
+    start_date: str = "",
+    end_date: str = "",
 ) -> dict[str, Any]:
     try:
         pool = snowflake_pool.get_default_pool()
@@ -504,6 +506,17 @@ async def list_tests(
             days = {"today": 1, "week": 7, "month": 30}[date_range]
             where_clauses.append("START_TIME >= DATEADD(day, ?, CURRENT_TIMESTAMP())")
             params.append(-days)
+        elif date_range == "custom":
+
+            def _is_date(value: str) -> bool:
+                return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""))
+
+            if _is_date(start_date):
+                where_clauses.append("START_TIME >= TO_DATE(?)")
+                params.append(start_date)
+            if _is_date(end_date):
+                where_clauses.append("START_TIME < DATEADD(day, 1, TO_DATE(?))")
+                params.append(end_date)
 
         where_sql = ""
         if where_clauses:
@@ -523,7 +536,8 @@ async def list_tests(
             ERROR_RATE,
             STATUS,
             CONCURRENT_CONNECTIONS,
-            DURATION_SECONDS
+            DURATION_SECONDS,
+            FAILURE_REASON
         FROM {_prefix()}.TEST_RESULTS
         {where_sql}
         ORDER BY START_TIME DESC
@@ -551,6 +565,7 @@ async def list_tests(
                 status_db,
                 concurrency,
                 duration,
+                failure_reason,
             ) = row
 
             # For running tests, get the current phase from the in-memory registry
@@ -580,6 +595,7 @@ async def list_tests(
                     "phase": phase,
                     "concurrent_connections": int(concurrency or 0),
                     "duration": float(duration or 0),
+                    "failure_reason": failure_reason,
                 }
             )
 
@@ -593,7 +609,10 @@ async def list_tests(
 async def search_tests(q: str) -> dict[str, Any]:
     try:
         pool = snowflake_pool.get_default_pool()
-        like = f"%{q.lower()}%"
+        q_text = str(q or "").strip()
+        if not q_text:
+            return {"results": []}
+        like = f"%{q_text.lower()}%"
         query = f"""
         SELECT
             TEST_ID,
@@ -607,11 +626,22 @@ async def search_tests(q: str) -> dict[str, Any]:
             P99_LATENCY_MS,
             ERROR_RATE
         FROM {_prefix()}.TEST_RESULTS
-        WHERE LOWER(TEST_NAME) LIKE ?
+        WHERE (
+            LOWER(TEST_NAME) LIKE ?
+            OR LOWER(SCENARIO_NAME) LIKE ?
+            OR LOWER(TABLE_NAME) LIKE ?
+            OR LOWER(WAREHOUSE) LIKE ?
+            OR LOWER(WAREHOUSE_SIZE) LIKE ?
+            OR LOWER(TABLE_TYPE) LIKE ?
+            OR LOWER(NOTES) LIKE ?
+            OR LOWER(TO_VARCHAR(TEST_CONFIG:"database")) LIKE ?
+            OR LOWER(TO_VARCHAR(TEST_CONFIG:"schema")) LIKE ?
+            OR LOWER(TO_VARCHAR(TEST_CONFIG:"table_name")) LIKE ?
+        )
         ORDER BY START_TIME DESC
         LIMIT 25
         """
-        rows = await pool.execute_query(query, params=[like])
+        rows = await pool.execute_query(query, params=[like] * 10)
         results = []
         for row in rows:
             (
@@ -752,7 +782,10 @@ async def get_test(test_id: str) -> dict[str, Any]:
             UPDATE_MIN_LATENCY_MS,
             UPDATE_MAX_LATENCY_MS,
             QUERY_TAG,
-            FIND_MAX_RESULT
+            FIND_MAX_RESULT,
+            FAILURE_REASON,
+            ENRICHMENT_STATUS,
+            ENRICHMENT_ERROR
         FROM {_prefix()}.TEST_RESULTS
         WHERE TEST_ID = ?
         """
@@ -833,9 +866,7 @@ async def get_test(test_id: str) -> dict[str, Any]:
                     )
                     if load_mode == "QPS"
                     else None,
-                    "qps_target_mode": ("QPS" if is_postgres else "SF_RUNNING")
-                    if load_mode == "QPS"
-                    else None,
+                    "qps_target_mode": "QPS" if load_mode == "QPS" else None,
                     "workload_type": str(running.scenario.workload_type),
                     "custom_point_lookup_pct": _pct_from_dict(
                         cfg, "custom_point_lookup_pct"
@@ -962,6 +993,9 @@ async def get_test(test_id: str) -> dict[str, Any]:
             update_max_latency_ms,
             query_tag,
             find_max_result_raw,
+            failure_reason,
+            enrichment_status,
+            enrichment_error,
         ) = rows[0]
 
         cfg = test_config
@@ -1033,9 +1067,7 @@ async def get_test(test_id: str) -> dict[str, Any]:
             "load_mode": load_mode,
             "target_qps": target_qps if load_mode == "QPS" else None,
             "min_concurrency": min_concurrency if load_mode == "QPS" else None,
-            "qps_target_mode": ("QPS" if is_postgres else "SF_RUNNING")
-            if load_mode == "QPS"
-            else None,
+            "qps_target_mode": "QPS" if load_mode == "QPS" else None,
             "workload_type": workload_type,
             "custom_point_lookup_pct": _pct_from_dict(
                 template_cfg, "custom_point_lookup_pct"
@@ -1129,6 +1161,14 @@ async def get_test(test_id: str) -> dict[str, Any]:
             "update_min_latency_ms": float(update_min_latency_ms or 0),
             "update_max_latency_ms": float(update_max_latency_ms or 0),
             "find_max_result": find_max_result,
+            "failure_reason": failure_reason,
+            # Enrichment status (post-processing)
+            "enrichment_status": enrichment_status,
+            "enrichment_error": enrichment_error,
+            "can_retry_enrichment": (
+                str(status_db or "").upper() == "COMPLETED"
+                and str(enrichment_status or "").upper() == "FAILED"
+            ),
         }
 
         # Per-query-type error rates and counts (best-effort; derived from QUERY_EXECUTIONS).
@@ -1851,6 +1891,8 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                     "sf_queued": _to_int(warehouse.get("queued")),
                     # Per-test queued query count from QUERY_HISTORY (best-effort).
                     "sf_queued_bench": _to_int(sf_bench.get("queued")),
+                    # Per-test blocked query count from QUERY_HISTORY (lock contention).
+                    "sf_blocked": _to_int(sf_bench.get("blocked")),
                     # App-side QPS breakdown (from internal counters).
                     "app_point_lookup_ops_sec": float(
                         app_ops.get("point_lookup_ops_sec") or 0
@@ -2048,6 +2090,142 @@ async def rerun_test(test_id: str) -> dict[str, Any]:
         raise http_exception("rerun test", e)
 
 
+@router.post("/{test_id}/retry-enrichment")
+async def retry_enrichment(test_id: str) -> dict[str, Any]:
+    """
+    Retry post-processing enrichment for a completed test.
+
+    This allows users to retry enrichment if it failed or was cancelled,
+    without having to re-run the entire test.
+
+    Only allowed for tests with status=COMPLETED and enrichment_status=FAILED.
+    """
+    from backend.core.results_store import (
+        enrich_query_executions_with_retry,
+        update_test_overhead_percentiles,
+        update_enrichment_status,
+    )
+
+    try:
+        pool = snowflake_pool.get_default_pool()
+        prefix = _prefix()
+
+        # Check test status and enrichment status
+        rows = await pool.execute_query(
+            f"""
+            SELECT STATUS, ENRICHMENT_STATUS, TEST_CONFIG
+            FROM {prefix}.TEST_RESULTS
+            WHERE TEST_ID = ?
+            """,
+            params=[test_id],
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Test not found")
+
+        test_status = rows[0][0]
+        enrichment_status = rows[0][1]
+        test_config = rows[0][2]
+
+        # Only allow retry for COMPLETED tests
+        if str(test_status).upper() != "COMPLETED":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot retry enrichment: test status is {test_status}, must be COMPLETED",
+            )
+
+        # Only allow retry if enrichment failed (not if skipped or pending)
+        if enrichment_status and str(enrichment_status).upper() not in (
+            "FAILED",
+            "PENDING",
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot retry enrichment: current status is {enrichment_status}",
+            )
+
+        # Parse test config to check if collect_query_history was enabled
+        if isinstance(test_config, str):
+            test_config = json.loads(test_config)
+
+        scenario_config = test_config.get("scenario") or test_config.get(
+            "template_config", {}
+        )
+        collect_query_history = bool(
+            scenario_config.get("collect_query_history", False)
+        )
+
+        if not collect_query_history:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot retry enrichment: collect_query_history was not enabled for this test",
+            )
+
+        # Update status to PENDING
+        await update_enrichment_status(test_id=test_id, status="PENDING", error=None)
+
+        # Run enrichment
+        try:
+            stats = await enrich_query_executions_with_retry(
+                test_id=test_id,
+                target_ratio=0.90,
+                max_wait_seconds=240,
+                poll_interval_seconds=10,
+            )
+            await update_test_overhead_percentiles(test_id=test_id)
+            await update_enrichment_status(
+                test_id=test_id, status="COMPLETED", error=None
+            )
+
+            return {
+                "test_id": test_id,
+                "enrichment_status": "COMPLETED",
+                "stats": {
+                    "total_queries": stats.total_queries,
+                    "enriched_queries": stats.enriched_queries,
+                    "enrichment_ratio": round(stats.enrichment_ratio * 100, 1),
+                },
+            }
+        except Exception as e:
+            await update_enrichment_status(
+                test_id=test_id, status="FAILED", error=str(e)
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Enrichment failed: {e}",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise http_exception("retry enrichment", e)
+
+
+@router.get("/{test_id}/enrichment-status")
+async def get_test_enrichment_status(test_id: str) -> dict[str, Any]:
+    """Get the enrichment status for a test."""
+    from backend.core.results_store import get_enrichment_status
+
+    try:
+        status_info = await get_enrichment_status(test_id=test_id)
+        if status_info is None:
+            raise HTTPException(status_code=404, detail="Test not found")
+
+        return {
+            "test_id": test_id,
+            "test_status": status_info["test_status"],
+            "enrichment_status": status_info["enrichment_status"],
+            "enrichment_error": status_info["enrichment_error"],
+            "can_retry": (
+                str(status_info["test_status"]).upper() == "COMPLETED"
+                and str(status_info.get("enrichment_status") or "").upper() == "FAILED"
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise http_exception("get enrichment status", e)
+
+
 class AiAnalysisRequest(BaseModel):
     context: str | None = None
 
@@ -2197,7 +2375,7 @@ EXECUTION LOGS (filtered for relevance):
 
     return f"""You are analyzing a Snowflake CONCURRENCY mode benchmark test.
 
-**Mode: CONCURRENCY (Fixed Worker Count)**
+**Mode: CONCURRENCY (Fixed Workers / Closed Model)**
 This test ran a fixed number of concurrent workers for a set duration to measure steady-state performance under constant load.
 
 TEST SUMMARY:
@@ -2205,7 +2383,7 @@ TEST SUMMARY:
 - Status: {test_status}
 - Table Type: {table_type}
 - Warehouse: {warehouse} ({warehouse_size})
-- Fixed Concurrency: {concurrency} workers
+- Fixed Workers: {concurrency} workers
 - Duration: {duration}s
 - Total Operations: {total_ops} (Reads: {read_ops}, Writes: {write_ops})
 - Failed Operations: {failed_ops} ({error_pct:.2f}%)
@@ -2284,7 +2462,7 @@ AUTO-SCALER LOGS (showing controller decisions):
 
     return f"""You are analyzing a Snowflake QPS mode benchmark test.
 
-**Mode: QPS (Auto-Scale to Target)**
+**Mode: QPS (Auto-Scale to Target Throughput)**
 This test dynamically scaled workers between {min_concurrency}-{max_concurrency} to achieve a target throughput of {target_qps} ops/sec. The controller adjusts concurrency based on achieved vs target QPS.
 
 TEST SUMMARY:
@@ -2661,9 +2839,16 @@ async def ai_analysis(
             except Exception:
                 pg_metrics = {"postgres_stats_available": False}
 
+            if not isinstance(pg_metrics, dict):
+                pg_metrics = {}
+
             if pg_metrics.get("postgres_stats_available"):
                 ps = pg_metrics.get("postgres_stats", {})
+                if not isinstance(ps, dict):
+                    ps = {}
                 pool_stats = ps.get("pool", {}) or {}
+                if not isinstance(pool_stats, dict):
+                    pool_stats = {}
                 pg_text = (
                     "POSTGRES METRICS:\n"
                     f"- Pool size: {pool_stats.get('size', 'N/A')}\n"
@@ -2781,7 +2966,7 @@ async def ai_analysis(
             ai_resp = await pool.execute_query(
                 "SELECT AI_COMPLETE(model => ?, prompt => ?, model_parameters => PARSE_JSON(?)) AS RESP",
                 params=[
-                    "claude-3-5-sonnet",
+                    "claude-4-sonnet",
                     prompt,
                     json.dumps({"temperature": 0.3, "max_tokens": 2500}),
                 ],
@@ -2880,7 +3065,7 @@ If asked about data you don't have access to, say so and suggest what data would
             ai_resp = await pool.execute_query(
                 "SELECT AI_COMPLETE(model => ?, prompt => ?, model_parameters => PARSE_JSON(?)) AS RESP",
                 params=[
-                    "claude-3-5-sonnet",
+                    "claude-4-sonnet",
                     full_prompt,
                     json.dumps({"temperature": 0.5, "max_tokens": 1500}),
                 ],

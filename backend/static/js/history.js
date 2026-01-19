@@ -105,6 +105,35 @@ function testHistory() {
     } catch (_) {}
   };
 
+  const tableTypeKey = (test) =>
+    String(test?.table_type || "").trim().toUpperCase();
+
+  const tableTypeLabel = (test) => {
+    const t = tableTypeKey(test);
+    if (t === "POSTGRES" || t === "SNOWFLAKE_POSTGRES") return "POSTGRES";
+    if (t === "HYBRID") return "HYBRID";
+    if (t === "STANDARD") return "STANDARD";
+    if (t === "INTERACTIVE") return "INTERACTIVE";
+    return t || "";
+  };
+
+  const tableTypeIconSrc = (test) => {
+    const t = tableTypeKey(test);
+    if (t === "POSTGRES" || t === "SNOWFLAKE_POSTGRES") {
+      return "/static/img/postgres_elephant.svg";
+    }
+    if (t === "HYBRID") {
+      return "/static/img/table_hybrid.svg";
+    }
+    if (t === "STANDARD") {
+      return "/static/img/table_standard.svg";
+    }
+    if (t === "INTERACTIVE") {
+      return "/static/img/table_interactive.svg";
+    }
+    return "";
+  };
+
   return {
     tests: [],
     error: null,
@@ -113,6 +142,8 @@ function testHistory() {
       warehouse_size: "",
       status: "",
       date_range: "all",
+      start_date: "",
+      end_date: "",
     },
     sortField: "created_at",
     sortDirection: "desc",
@@ -139,6 +170,8 @@ function testHistory() {
     chatLoading: false,
 
     _refreshInterval: null,
+    tableTypeLabel,
+    tableTypeIconSrc,
 
     init() {
       this.loadTests();
@@ -355,6 +388,10 @@ function testHistory() {
     },
 
     applyFilters() {
+      if (this.filters.date_range !== "custom") {
+        this.filters.start_date = "";
+        this.filters.end_date = "";
+      }
       this.currentPage = 1;
       this.loadTests();
     },
@@ -365,6 +402,8 @@ function testHistory() {
         warehouse_size: "",
         status: "",
         date_range: "all",
+        start_date: "",
+        end_date: "",
       };
       this.applyFilters();
     },

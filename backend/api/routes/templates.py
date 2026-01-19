@@ -173,6 +173,21 @@ def _full_table_name(database: str, schema: str, table: str) -> str:
     return f"{_quote_ident(db)}.{_quote_ident(sch)}.{_quote_ident(tbl)}"
 
 
+def _sample_clause(is_view: bool, limit: int, percentage: int = 10) -> str:
+    """
+    Return appropriate SQL sampling clause.
+
+    TABLESAMPLE SYSTEM is fast (block-level) but doesn't work on views.
+    For views, we just use LIMIT which gets sequential rows (not random but fast).
+    """
+    if is_view:
+        # Views don't support TABLESAMPLE; use simple LIMIT (not random but fast)
+        return f"LIMIT {limit}"
+    else:
+        # Tables: use fast block-level sampling
+        return f"TABLESAMPLE SYSTEM ({percentage}) LIMIT {limit}"
+
+
 def _results_prefix() -> str:
     return f"{settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}"
 
@@ -324,9 +339,8 @@ def _normalize_template_config(cfg: Any) -> dict[str, Any]:
 
         # Targets are optional (default -1). When enabled, validate ranges above.
 
-    # Load mode: fixed concurrency vs auto-scale (QPS).
-    # - Snowflake tables: QPS targets Snowflake RUNNING (by QUERY_TAG)
-    # - Postgres-family templates: QPS targets QPS
+    # Load mode: fixed workers vs auto-scale (QPS target).
+    # - QPS mode targets app-side throughput (ops/sec). Snowflake RUNNING is observed separately.
     load_mode_raw = str(out.get("load_mode") or "CONCURRENCY").strip()
     load_mode = load_mode_raw.upper() if load_mode_raw else "CONCURRENCY"
     if load_mode not in {"CONCURRENCY", "QPS", "FIND_MAX_CONCURRENCY"}:
@@ -1122,6 +1136,22 @@ async def ai_adjust_sql(req: AiAdjustSqlRequest):
         is_hybrid = table_type == "HYBRID"
         is_interactive = table_type == "INTERACTIVE"
 
+        # Check if object is a view (TABLESAMPLE doesn't work on views)
+        is_view = False
+        try:
+            view_check = await pool.execute_query(
+                f"""
+                SELECT TABLE_TYPE
+                FROM {_quote_ident(db)}.INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                """,
+                params=[sch, tbl],
+            )
+            if view_check and str(view_check[0][0]).upper() == "VIEW":
+                is_view = True
+        except Exception:
+            pass  # If check fails, assume table
+
         # For pool sizing in preparation, treat concurrent_connections as:
         # - CONCURRENCY mode: fixed worker count
         # - QPS mode: max worker cap (may be -1 => no user cap; use engine cap)
@@ -1321,9 +1351,14 @@ async def ai_adjust_sql(req: AiAdjustSqlRequest):
                     if obj_parts
                     else "OBJECT_CONSTRUCT()"
                 )
-                sample_rows = await pool.execute_query(
-                    f"SELECT {obj_expr} FROM {full_name} SAMPLE (20 ROWS)"
-                )
+                if is_view:
+                    sample_rows = await pool.execute_query(
+                        f"SELECT {obj_expr} FROM {full_name} LIMIT 20"
+                    )
+                else:
+                    sample_rows = await pool.execute_query(
+                        f"SELECT {obj_expr} FROM {full_name} TABLESAMPLE SYSTEM (1) LIMIT 20"
+                    )
                 sample_payload = [r[0] for r in sample_rows if r]
 
                 cols_for_prompt = []
@@ -2036,6 +2071,22 @@ async def prepare_ai_template(template_id: str):
         time_col = profile.time_column
         range_mode: str | None = "ID_BETWEEN" if (is_hybrid and key_col) else None
 
+        # Check if object is a view (TABLESAMPLE doesn't work on views)
+        is_view = False
+        try:
+            view_check = await pool.execute_query(
+                f"""
+                SELECT TABLE_TYPE
+                FROM {_quote_ident(db)}.INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                """,
+                params=[sch, tbl],
+            )
+            if view_check and str(view_check[0][0]).upper() == "VIEW":
+                is_view = True
+        except Exception:
+            pass  # If check fails, assume table
+
         # Pull full DESCRIBE metadata so we can choose safe insert/update columns.
         desc_rows = await pool.execute_query(f"DESCRIBE TABLE {full_name}")
         col_types: dict[str, str] = {}
@@ -2231,9 +2282,14 @@ async def prepare_ai_template(template_id: str):
                     if obj_parts
                     else "OBJECT_CONSTRUCT()"
                 )
-                sample_rows = await pool.execute_query(
-                    f"SELECT {obj_expr} FROM {full_name} SAMPLE (20 ROWS)"
-                )
+                if is_view:
+                    sample_rows = await pool.execute_query(
+                        f"SELECT {obj_expr} FROM {full_name} LIMIT 20"
+                    )
+                else:
+                    sample_rows = await pool.execute_query(
+                        f"SELECT {obj_expr} FROM {full_name} TABLESAMPLE SYSTEM (1) LIMIT 20"
+                    )
                 sample_payload = [r[0] for r in sample_rows if r]
 
                 cols_for_prompt = []
@@ -2416,19 +2472,38 @@ async def prepare_ai_template(template_id: str):
             key_ident = _validate_ident(key_col, label="key_column")
             key_expr = _quote_ident(key_ident)
 
-            insert_key_pool = f"""
-            INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
-                POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
-            )
-            SELECT
-                ?, ?, 'KEY', ?, SEQ4(), TO_VARIANT(KEY_VAL)
-            FROM (
-                SELECT DISTINCT {key_expr} AS KEY_VAL
-                FROM {full_name} SAMPLE ({sample_n} ROWS)
-                WHERE {key_expr} IS NOT NULL
-            )
-            LIMIT {target_n}
-            """
+            # Use TABLESAMPLE SYSTEM for fast block-level sampling on tables.
+            # For views, use simple LIMIT (not random, but fast - avoids timeout).
+            if is_view:
+                insert_key_pool = f"""
+                INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
+                    POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
+                )
+                SELECT
+                    ?, ?, 'KEY', ?, SEQ4(), TO_VARIANT(KEY_VAL)
+                FROM (
+                    SELECT DISTINCT {key_expr} AS KEY_VAL
+                    FROM {full_name}
+                    WHERE {key_expr} IS NOT NULL
+                    LIMIT {sample_n}
+                )
+                LIMIT {target_n}
+                """
+            else:
+                insert_key_pool = f"""
+                INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
+                    POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
+                )
+                SELECT
+                    ?, ?, 'KEY', ?, SEQ4(), TO_VARIANT(KEY_VAL)
+                FROM (
+                    SELECT DISTINCT {key_expr} AS KEY_VAL
+                    FROM {full_name} TABLESAMPLE SYSTEM (10)
+                    WHERE {key_expr} IS NOT NULL
+                    LIMIT {sample_n}
+                )
+                LIMIT {target_n}
+                """
             await pool.execute_query(
                 insert_key_pool, params=[pool_id, template_id, key_ident]
             )
@@ -2475,45 +2550,41 @@ async def prepare_ai_template(template_id: str):
                 )
                 pools_created["RANGE"] = int(target_n)
             else:
-                # Fallback: SAMPLE distinct values (may be broad).
-                insert_time_pool = f"""
-                INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
-                    POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
-                )
-                SELECT
-                    ?, ?, 'RANGE', ?, SEQ4(), TO_VARIANT(T_VAL)
-                FROM (
-                    SELECT DISTINCT {time_expr} AS T_VAL
-                    FROM {full_name} SAMPLE ({sample_n} ROWS)
-                    WHERE {time_expr} IS NOT NULL
-                )
-                LIMIT {target_n}
-                """
+                # Fallback: sample distinct time values
+                if is_view:
+                    insert_time_pool = f"""
+                    INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
+                        POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
+                    )
+                    SELECT
+                        ?, ?, 'RANGE', ?, SEQ4(), TO_VARIANT(T_VAL)
+                    FROM (
+                        SELECT DISTINCT {time_expr} AS T_VAL
+                        FROM {full_name}
+                        WHERE {time_expr} IS NOT NULL
+                        LIMIT {sample_n}
+                    )
+                    LIMIT {target_n}
+                    """
+                else:
+                    insert_time_pool = f"""
+                    INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
+                        POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
+                    )
+                    SELECT
+                        ?, ?, 'RANGE', ?, SEQ4(), TO_VARIANT(T_VAL)
+                    FROM (
+                        SELECT DISTINCT {time_expr} AS T_VAL
+                        FROM {full_name} TABLESAMPLE SYSTEM (10)
+                        WHERE {time_expr} IS NOT NULL
+                        LIMIT {sample_n}
+                    )
+                    LIMIT {target_n}
+                    """
                 await pool.execute_query(
                     insert_time_pool, params=[pool_id, template_id, time_ident]
                 )
                 pools_created["RANGE"] = int(target_n)
-
-        # 3.3 Row pool for inserts (sample rows packed as VARIANT objects)
-        row_pool_n = max(2000, concurrency * 10)
-        row_pool_n = min(100_000, row_pool_n)
-        if insert_cols:
-            obj_parts: list[str] = []
-            for c in insert_cols:
-                c_ident = _validate_ident(c, label="column")
-                obj_parts.append(f"'{c_ident}'")
-                obj_parts.append(_quote_ident(c_ident))
-            obj_expr = f"OBJECT_CONSTRUCT_KEEP_NULL({', '.join(obj_parts)})"
-
-            insert_row_pool = f"""
-            INSERT INTO {_results_prefix()}.TEMPLATE_VALUE_POOLS (
-                POOL_ID, TEMPLATE_ID, POOL_KIND, COLUMN_NAME, SEQ, VALUE
-            )
-            SELECT
-                ?, ?, 'ROW', NULL, SEQ4(), {obj_expr}
-            FROM {full_name} SAMPLE ({row_pool_n} ROWS)
-            """
-            await pool.execute_query(insert_row_pool, params=[pool_id, template_id])
 
         # ------------------------------------------------------------------
         # 4) Count inserted pool sizes (exact) and persist plan metadata into template config

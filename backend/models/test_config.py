@@ -197,15 +197,13 @@ class TestScenario(BaseModel):
         description=(
             "Load mode: CONCURRENCY (fixed workers), QPS (auto-scale workers), "
             "or FIND_MAX_CONCURRENCY (step-load to find max sustainable concurrency). "
-            "For Snowflake tables, QPS targets Snowflake RUNNING (by QUERY_TAG). "
-            "For Postgres-family templates, QPS targets QPS."
+            "In QPS mode, target_qps is an app-side throughput target (ops/sec), not Snowflake RUNNING."
         ),
     )
     target_qps: Optional[float] = Field(
         None,
         description=(
-            "Target value when load_mode=QPS. For Snowflake tables: target Snowflake RUNNING "
-            "(concurrent) for the test's QUERY_TAG. For Postgres-family: target QPS."
+            "Target throughput (ops/sec) when load_mode=QPS (app-side QPS across the template mix)."
         ),
     )
     min_concurrency: int = Field(

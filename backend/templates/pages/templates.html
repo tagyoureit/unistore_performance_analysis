@@ -124,7 +124,7 @@
                                 ></td>
                                 <td>
                                     <div>
-                                        <span x-text="(template.config?.load_mode || 'CONCURRENCY')"></span>
+                                        <span x-text="(template.config?.load_mode === 'QPS') ? 'Target QPS' : ((template.config?.load_mode === 'FIND_MAX_CONCURRENCY') ? 'Find Max' : 'Fixed Workers')"></span>
                                         <span x-show="(template.config?.load_mode || 'CONCURRENCY') === 'CONCURRENCY'">
                                             • <span x-text="template.config?.concurrent_connections"></span>
                                         </span>
@@ -253,7 +253,7 @@
                         </div>
                         <div>
                             <strong>Load Mode:</strong> 
-                            <span x-text="(template.config?.load_mode || 'CONCURRENCY')"></span>
+                            <span x-text="(template.config?.load_mode === 'QPS') ? 'Target throughput (QPS)' : ((template.config?.load_mode === 'FIND_MAX_CONCURRENCY') ? 'Find max (step-load)' : 'Fixed workers (closed model)')"></span>
                         </div>
                         <div x-show="(template.config?.load_mode || 'CONCURRENCY') === 'CONCURRENCY'">
                         <strong>Workers:</strong> 
@@ -261,7 +261,7 @@
                         </div>
                         <div x-show="template.config?.load_mode === 'QPS'">
                         <strong>Target:</strong>
-                        <span x-text="(template.config?.table_type === 'POSTGRES' || template.config?.table_type === 'SNOWFLAKE_POSTGRES') ? 'QPS' : 'Snowflake Running'"></span>
+                        <span x-text="'QPS (ops/sec)'"></span>
                         = <span x-text="template.config?.target_qps"></span>
                         <div class="mt-1">
                             <strong>Workers:</strong>
@@ -269,7 +269,7 @@
                         </div>
                         </div>
                         <div x-show="template.config?.load_mode === 'FIND_MAX_CONCURRENCY'">
-                        <strong>Find Max Concurrency:</strong>
+                        <strong>Find Max (step-load):</strong>
                         <div class="mt-1">
                             Start: <span x-text="template.config?.start_concurrency ?? 5"></span>,
                             Increment: +<span x-text="template.config?.concurrency_increment ?? 10"></span>,

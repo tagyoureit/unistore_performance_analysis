@@ -1,0 +1,47 @@
+version: '3.45'
+
+set: [pipefail]
+
+vars:
+  BASE_URL: '{{.BASE_URL | default "http://127.0.0.1:8000"}}'
+  MAX_WAIT_SECONDS: '{{.MAX_WAIT_SECONDS | default "1800"}}'
+  POLL_INTERVAL_SECONDS: '{{.POLL_INTERVAL_SECONDS | default "5"}}'
+  METRICS_WAIT_SECONDS: '{{.METRICS_WAIT_SECONDS | default "60"}}'
+
+tasks:
+  default:
+    desc: "List available tasks"
+    cmds:
+      - task --list
+
+  test:variations:smoke:
+    desc: "Run short (45s) 4-variation smoke checks via API"
+    preconditions:
+      - sh: command -v uv
+        msg: "uv not found. Install from https://docs.astral.sh/uv/"
+    cmds:
+      - BASE_URL="{{.BASE_URL}}" MAX_WAIT_SECONDS="300" POLL_INTERVAL_SECONDS="{{.POLL_INTERVAL_SECONDS}}" METRICS_WAIT_SECONDS="30" DURATION_SECONDS="45" WARMUP_SECONDS="0" SMOKE_CONCURRENCY="5" SMOKE_ROWS="300" uv run python scripts/run_variation_smoke.py
+
+  test:variations:smoke:long:
+    desc: "Run long 4-variation smoke checks via API"
+    preconditions:
+      - sh: command -v uv
+        msg: "uv not found. Install from https://docs.astral.sh/uv/"
+    cmds:
+      - BASE_URL="{{.BASE_URL}}" MAX_WAIT_SECONDS="{{.MAX_WAIT_SECONDS}}" POLL_INTERVAL_SECONDS="{{.POLL_INTERVAL_SECONDS}}" METRICS_WAIT_SECONDS="{{.METRICS_WAIT_SECONDS}}" DURATION_SECONDS="300" WARMUP_SECONDS="10" SMOKE_CONCURRENCY="10" SMOKE_ROWS="300" uv run python scripts/run_variation_smoke.py
+
+  test:variations:setup:
+    desc: "Create smoke data tables + templates (no tests)"
+    preconditions:
+      - sh: command -v uv
+        msg: "uv not found. Install from https://docs.astral.sh/uv/"
+    cmds:
+      - BASE_URL="{{.BASE_URL}}" DURATION_SECONDS="45" WARMUP_SECONDS="0" SMOKE_CONCURRENCY="5" SMOKE_ROWS="300" uv run python scripts/run_variation_smoke.py --setup-only
+
+  test:variations:cleanup:
+    desc: "Drop smoke data tables + templates (no tests)"
+    preconditions:
+      - sh: command -v uv
+        msg: "uv not found. Install from https://docs.astral.sh/uv/"
+    cmds:
+      - BASE_URL="{{.BASE_URL}}" uv run python scripts/run_variation_smoke.py --cleanup-only

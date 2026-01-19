@@ -103,6 +103,23 @@
         ></div>
     </div>
 
+    <div
+        class="metrics-grid-spacer"
+        x-show="mode === 'live' && !['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())"
+    ></div>
+
+    <div class="metric-card info">
+        <div class="metric-label">
+            <span x-text="'P50 (Median)'"></span>
+            <span
+                class="info-icon"
+                title="P50 latency (selected view): 50% of operations complete faster than this (the median). This represents the typical user experience. End-to-end (app) includes client/network + Snowflake; SQL execution (Snowflake) uses QUERY_HISTORY.EXECUTION_TIME and excludes client/network."
+            >i</span>
+        </div>
+        <div class="metric-value" x-text="formatMsWithUnit(currentLatencyMs(50))"></div>
+        <div class="metric-change" x-text="latencyViewLabel()"></div>
+    </div>
+
     <div class="metric-card success">
         <div class="metric-label">
             <span x-text="'P95 Latency'"></span>
@@ -141,7 +158,7 @@
 </div>
 
 <div class="card" x-show="mode === 'live' && isFindMaxMode()">
-    <div class="card-title">Find Max Concurrency (live)</div>
+    <div class="card-title">Find Max (step-load) (live)</div>
     <div class="text-sm text-gray-700" style="margin-top: -0.25rem;">
         Step-load controller metrics (baseline vs current latency, upcoming worker change, and conclusion reason).
     </div>
@@ -154,9 +171,9 @@
                     <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">Established P95 (baseline)</th>
                     <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">Current P95</th>
                     <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">% diff</th>
-                    <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">P95 max threshold</th>
+                    <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">P95 drift threshold</th>
                     <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">Current P99</th>
-                    <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">P99 max threshold</th>
+                    <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">P99 drift threshold</th>
                     <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">Error %</th>
                     <th style="padding: 0.5rem; text-align: right; border-bottom: 2px solid #e5e7eb; white-space: nowrap;">Max Error %</th>
                 </tr>

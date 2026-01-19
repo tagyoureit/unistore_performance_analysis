@@ -178,6 +178,9 @@ class TestResult(BaseModel):
     # Errors and issues
     error_count: int = Field(0, description="Number of errors")
     error_rate: float = Field(0.0, description="Error rate (0.0-1.0)")
+    failure_reason: Optional[str] = Field(
+        None, description="Reason for test failure (setup/validation errors)"
+    )
     errors: Optional[List[ErrorInfo]] = Field(
         None, description="Detailed error information"
     )

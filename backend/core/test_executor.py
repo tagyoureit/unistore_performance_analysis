@@ -215,6 +215,9 @@ class TestExecutor:
         # Results
         self.test_result: Optional[TestResult] = None
 
+        # Setup/validation error message (for UI display when test fails during setup)
+        self._setup_error: Optional[str] = None
+
         # Callbacks
         self.metrics_callback: Optional[Callable[[Metrics], None]] = None
 
@@ -500,14 +503,14 @@ class TestExecutor:
             # Check for failures
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    logger.error(
-                        f"Failed to setup table {self.table_managers[i].table_name}: {result}"
-                    )
+                    self._setup_error = f"Failed to setup table {self.table_managers[i].table_name}: {result}"
+                    logger.error(self._setup_error)
                     return False
                 elif not result:
-                    logger.error(
+                    self._setup_error = (
                         f"Failed to setup table {self.table_managers[i].table_name}"
                     )
+                    logger.error(self._setup_error)
                     return False
 
             logger.info(
@@ -537,11 +540,11 @@ class TestExecutor:
                             break
 
                 if writes_in_workload or writes_in_custom:
-                    logger.error(
-                        "Selected object is a VIEW, but workload %s includes writes. "
-                        "Choose a TABLE or set workload_type=READ_ONLY.",
-                        getattr(workload, "value", workload),
+                    self._setup_error = (
+                        f"Selected object is a VIEW, but workload {getattr(workload, 'value', workload)} includes writes. "
+                        "Choose a TABLE or set workload_type=READ_ONLY."
                     )
+                    logger.error(self._setup_error)
                     return False
 
             # Snowflake-first: lightweight profiling for adaptive reads/range scans
@@ -549,7 +552,8 @@ class TestExecutor:
             return True
 
         except Exception as e:
-            logger.error(f"Error during test setup: {e}")
+            self._setup_error = f"Error during test setup: {e}"
+            logger.error(self._setup_error)
             return False
 
     async def _profile_tables(self) -> None:
@@ -914,16 +918,11 @@ class TestExecutor:
                     max_cc,
                 )
             elif load_mode == "QPS":
-                # In "QPS" mode we dynamically scale workers. For Snowflake tests we
-                # target Snowflake RUNNING (bench queries tagged with QUERY_TAG). For
-                # non-Snowflake backends we fall back to QPS control.
-                has_sf_bench = bool(
-                    self._benchmark_warehouse_name and self._benchmark_query_tag
-                )
+                # In "QPS" mode we dynamically scale workers to target throughput (ops/sec).
+                # Snowflake RUNNING/queued are sampled for observability/safety, but are not the target.
                 logger.info(
-                    "📋 Workload: %s, Mode: QPS (auto-scale), Target %s: %s, Warmup: %ss, Run: %ss, Min workers: %s, Max workers: %s",
+                    "📋 Workload: %s, Mode: QPS (auto-scale), Target QPS: %s, Warmup: %ss, Run: %ss, Min workers: %s, Max workers: %s",
                     self.scenario.workload_type,
-                    "SF RUNNING" if has_sf_bench else "QPS",
                     getattr(self.scenario, "target_qps", None),
                     self.scenario.warmup_seconds,
                     self.scenario.duration_seconds,
@@ -1759,10 +1758,10 @@ class TestExecutor:
                     p95_latency_ms: float
                     p99_latency_ms: float
                     error_rate_pct: float
+                    stable: bool
                     kind_metrics: dict[str, dict[str, float | None]] = field(
                         default_factory=dict
                     )
-                    stable: bool
                     stop_reason: str | None = None
                     is_backoff: bool = False
 
@@ -1813,6 +1812,23 @@ class TestExecutor:
                 current_cc = start_cc
                 step_num = 0
                 backoff_attempted = False
+
+                def _build_step_history():
+                    return [
+                        {
+                            "step": s.step_num,
+                            "concurrency": s.concurrency,
+                            "qps": s.qps,
+                            "p95_latency_ms": s.p95_latency_ms,
+                            "p99_latency_ms": s.p99_latency_ms,
+                            "error_rate_pct": s.error_rate_pct,
+                            "kind_metrics": s.kind_metrics,
+                            "stable": s.stable,
+                            "stop_reason": s.stop_reason,
+                            "is_backoff": s.is_backoff,
+                        }
+                        for s in step_results
+                    ]
 
                 async def run_step(cc: int, is_backoff: bool = False) -> StepResult:
                     nonlocal step_num, baseline_p95_latency, baseline_p99_latency
@@ -1895,21 +1911,7 @@ class TestExecutor:
                         "baseline_p95_latency_ms": baseline_p95_latency,
                         "baseline_p99_latency_ms": baseline_p99_latency,
                         # Completed steps so far
-                        "step_history": [
-                            {
-                                "step": s.step_num,
-                                "concurrency": s.concurrency,
-                                "qps": s.qps,
-                                "p95_latency_ms": s.p95_latency_ms,
-                                "p99_latency_ms": s.p99_latency_ms,
-                                "error_rate_pct": s.error_rate_pct,
-                                "kind_metrics": s.kind_metrics,
-                                "stable": s.stable,
-                                "stop_reason": s.stop_reason,
-                                "is_backoff": s.is_backoff,
-                            }
-                            for s in step_results
-                        ],
+                        "step_history": _build_step_history(),
                     }
 
                     # Run for step duration, collecting metrics
@@ -2097,15 +2099,39 @@ class TestExecutor:
                                 stable = False
                                 stop_reason = f"QPS dropped {-qps_change_pct:.1f}% vs previous ({prev.qps:.1f} → {step_qps:.1f})"
 
-                        # Latency should not increase too much vs previous stable step
-                        if stable and prev.p95_latency_ms > 0:
+                        # Latency should not increase too much vs the previous stable step.
+                        #
+                        # Guard against a false stop when the previous step was unusually fast
+                        # (e.g. cache warmth), but the absolute latency is still under the
+                        # baseline established at step 1.
+                        if stable and prev.p95_latency_ms > 0 and step_p95_latency > 0:
+                            ref_latency = float(prev.p95_latency_ms)
+                            ref_label = "previous"
+                            if (
+                                baseline_p95_latency is not None
+                                and math.isfinite(float(baseline_p95_latency))
+                                and float(baseline_p95_latency) > ref_latency
+                            ):
+                                ref_latency = float(baseline_p95_latency)
+                                ref_label = "baseline"
+
                             latency_change_pct = (
-                                (step_p95_latency - prev.p95_latency_ms)
-                                / prev.p95_latency_ms
+                                (float(step_p95_latency) - float(ref_latency))
+                                / float(ref_latency)
                             ) * 100.0
                             if latency_change_pct > latency_stability_pct:
                                 stable = False
-                                stop_reason = f"P95 latency increased {latency_change_pct:.1f}% vs previous ({prev.p95_latency_ms:.1f}ms → {step_p95_latency:.1f}ms)"
+                                if ref_label == "previous":
+                                    stop_reason = (
+                                        f"P95 latency increased {latency_change_pct:.1f}% "
+                                        f"vs previous ({prev.p95_latency_ms:.1f}ms → {step_p95_latency:.1f}ms)"
+                                    )
+                                else:
+                                    stop_reason = (
+                                        f"P95 latency increased {latency_change_pct:.1f}% "
+                                        f"vs baseline ({baseline_p95_latency:.1f}ms → {step_p95_latency:.1f}ms) "
+                                        f"(previous stable was {prev.p95_latency_ms:.1f}ms)"
+                                    )
 
                     # Also check against baseline (first step) - catch gradual drift
                     if (
@@ -2194,21 +2220,7 @@ class TestExecutor:
                         "best_qps": best_qps,
                         "baseline_p95_latency_ms": baseline_p95_latency,
                         "baseline_p99_latency_ms": baseline_p99_latency,
-                        "step_history": [
-                            {
-                                "step": s.step_num,
-                                "concurrency": s.concurrency,
-                                "qps": s.qps,
-                                "p95_latency_ms": s.p95_latency_ms,
-                                "p99_latency_ms": s.p99_latency_ms,
-                                "error_rate_pct": s.error_rate_pct,
-                                "kind_metrics": s.kind_metrics,
-                                "stable": s.stable,
-                                "stop_reason": s.stop_reason,
-                                "is_backoff": s.is_backoff,
-                            }
-                            for s in step_results
-                        ],
+                        "step_history": _build_step_history(),
                     }
 
                     if not step_result.stable:
@@ -2266,6 +2278,11 @@ class TestExecutor:
 
                     # Increase concurrency for next step
                     current_cc += increment
+
+                if self._find_max_controller_state:
+                    self._find_max_controller_state["step_history"] = (
+                        _build_step_history()
+                    )
 
                 # Final result
                 if termination_reason:
@@ -2435,9 +2452,20 @@ class TestExecutor:
             raise
 
         except Exception as e:
-            logger.error(f"Error during test execution: {e}")
+            self._setup_error = f"Error during test execution: {e}"
+            logger.error(self._setup_error)
             self.status = TestStatus.FAILED
             self.end_time = datetime.now()
+
+            # Stop metrics collector immediately to stop WebSocket streaming
+            if metrics_task is not None:
+                metrics_task.cancel()
+                try:
+                    await metrics_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
 
             # Build partial result
             self.test_result = await self._build_result()
@@ -2448,6 +2476,12 @@ class TestExecutor:
             if qps_controller_task is not None and not qps_controller_task.done():
                 try:
                     qps_controller_task.cancel()
+                except Exception:
+                    pass
+            # Ensure metrics task is cancelled (belt and suspenders for edge cases)
+            if metrics_task is not None and not metrics_task.done():
+                try:
+                    metrics_task.cancel()
                 except Exception:
                     pass
 
@@ -3251,11 +3285,10 @@ class TestExecutor:
         columns = list(manager.config.columns.keys())
         batch_size = self.scenario.write_batch_size
         id_col = state.profile.id_column if state.profile else None
-        row_pool: list[Any] = self._pool_values("ROW", None)
         is_postgres = self._is_postgres_pool(pool)
         use_params = hasattr(getattr(manager, "pool", None), "execute_query_with_info")
 
-        # If template specifies explicit insert columns, honor them (and keep ROW pool aligned).
+        # If template specifies explicit insert columns, honor them.
         tpl_cfg = getattr(self, "_template_config", None)
         if isinstance(tpl_cfg, dict):
             ai_cfg = tpl_cfg.get("ai_workload")
@@ -3335,11 +3368,10 @@ class TestExecutor:
                 None,
             )
 
-        # Parameterized Snowflake insert using pooled rows when available.
+        # Parameterized Snowflake insert - generate synthetic values.
         placeholders: list[str] = []
         params: list[Any] = []
         for i in range(batch_size):
-            sample_row = row_pool[(i % len(row_pool))] if row_pool else {}
             row_ph: list[str] = []
             for col in columns:
                 col_upper = col.upper()
@@ -3355,11 +3387,6 @@ class TestExecutor:
                         params.append(next(seq))
                     else:
                         params.append(str(uuid4()))
-                    row_ph.append("?")
-                    continue
-
-                if isinstance(sample_row, dict) and col_upper in sample_row:
-                    params.append(sample_row.get(col_upper))
                     row_ph.append("?")
                     continue
 
@@ -3496,12 +3523,21 @@ class TestExecutor:
                 pooled = self._next_from_pool(worker_id, "KEY", profile.id_column)
                 if pooled is not None:
                     return pooled
-                # Fallback: if KEY pool wasn't prepared, try extracting an ID from the ROW pool.
-                row_obj = self._next_from_pool(worker_id, "ROW", None)
-                if isinstance(row_obj, dict):
-                    row_id = row_obj.get(str(profile.id_column).upper())
-                    if row_id is not None:
-                        return row_id
+                # Fallback: use ROW pool when KEY pool is missing.
+                row_pool = self._pool_values("ROW", None)
+                if row_pool:
+                    key_col = getattr(self, "_ai_workload", {}).get("key_column")
+                    key_col_u = str(key_col or "").strip().upper()
+                    for row in row_pool:
+                        if not isinstance(row, dict):
+                            continue
+                        if key_col_u and key_col_u in row:
+                            return row.get(key_col_u)
+                        if profile.id_column:
+                            col_u = str(profile.id_column).strip().upper()
+                            if col_u in row:
+                                return row.get(col_u)
+                # Fallback: use id bounds from profile.
                 if (
                     profile.id_min is not None
                     and profile.id_max is not None
@@ -3655,17 +3691,28 @@ class TestExecutor:
                     )
                     if pooled is not None:
                         params = [pooled]
+                    elif profile.time_max is not None:
+                        params = [profile.time_max - timedelta(days=7)]
                     else:
-                        # Fallback: grab a timestamp/date from a sampled ROW pool when available.
-                        row_t = None
-                        row_obj = self._next_from_pool(worker_id, "ROW", None)
-                        if isinstance(row_obj, dict):
-                            row_t = row_obj.get(str(profile.time_column).upper())
-                        if row_t is not None:
-                            params = [row_t]
-                        elif profile.time_max is not None:
-                            params = [profile.time_max - timedelta(days=7)]
-                        else:
+                        # Fallback: use ROW pool when RANGE pool is missing.
+                        row_pool = self._pool_values("ROW", None)
+                        if row_pool:
+                            time_col = getattr(self, "_ai_workload", {}).get(
+                                "time_column"
+                            )
+                            time_col_u = str(time_col or "").strip().upper()
+                            for row in row_pool:
+                                if not isinstance(row, dict):
+                                    continue
+                                if time_col_u and time_col_u in row:
+                                    params = [row.get(time_col_u)]
+                                    break
+                                if profile.time_column:
+                                    col_u = str(profile.time_column).strip().upper()
+                                    if col_u in row:
+                                        params = [row.get(col_u)]
+                                        break
+                        if params is None:
                             raise ValueError(
                                 "Cannot choose range cutoff (missing RANGE pool and time bounds)"
                             )
@@ -3693,7 +3740,6 @@ class TestExecutor:
                     str(c).upper() for c in manager.config.columns.keys()
                 ]
                 cols = cols[:ph]
-            sample_row = self._next_from_pool(worker_id, "ROW", None) or {}
 
             params = []
             for c in cols:
@@ -3712,18 +3758,6 @@ class TestExecutor:
                     else:
                         params.append(str(uuid4()))
                     continue
-                # Case-insensitive lookup in sample_row
-                if isinstance(sample_row, dict):
-                    val = sample_row.get(c_upper) or sample_row.get(c)
-                    if val is not None:
-                        # Convert date strings to datetime.date for asyncpg compatibility
-                        if isinstance(val, str) and len(val) == 10:
-                            try:
-                                val = datetime.strptime(val, "%Y-%m-%d").date()
-                            except ValueError:
-                                pass
-                        params.append(val)
-                        continue
                 params.append(_new_value_for(c_upper))
             rows_written_expected = 1
             if not warmup:
@@ -4400,6 +4434,7 @@ class TestExecutor:
             read_operations=self.metrics.read_metrics.count,
             write_operations=self.metrics.write_metrics.count,
             failed_operations=self.metrics.failed_operations,
+            failure_reason=self._setup_error,
             qps=self.metrics.avg_qps,
             reads_per_second=self.metrics.read_metrics.count / duration
             if duration > 0

@@ -33,6 +33,7 @@ from backend.core.results_store import (
     enrich_query_executions_with_retry,
     update_test_overhead_percentiles,
     update_test_result_final,
+    update_enrichment_status,
 )
 from backend.core.test_log_stream import CURRENT_TEST_ID, TestLogQueueHandler
 from backend.core.test_executor import TestExecutor
@@ -500,6 +501,11 @@ class TestRegistry:
         if not is_postgres:
             # Template-controlled result cache behavior (Snowflake session parameter).
             # Default to TRUE for backwards compatibility with existing templates.
+            #
+            # Cache behavior varies by table type (per Snowflake documentation):
+            # - STANDARD: Result cache is controllable via USE_CACHED_RESULT session parameter
+            # - HYBRID: Result cache is ALWAYS bypassed (USE_CACHED_RESULT has no effect)
+            # - INTERACTIVE: Result cache behavior depends on interactive warehouse implementation
             raw_use_cached = (
                 template_config.get("use_cached_result")
                 if isinstance(template_config, dict)
@@ -520,6 +526,23 @@ class TestRegistry:
                 }
             else:
                 use_cached_result = True
+
+            # Log cache setting with table-type-specific information
+            cache_status = "enabled" if use_cached_result else "disabled"
+            if table_type == TableType.HYBRID:
+                logger.info(
+                    f"Result cache setting: USE_CACHED_RESULT={cache_status.upper()} "
+                    f"(Note: Hybrid tables automatically bypass result cache per Snowflake docs)"
+                )
+            elif table_type == TableType.INTERACTIVE:
+                logger.info(
+                    f"Result cache setting: USE_CACHED_RESULT={cache_status.upper()} "
+                    f"(Note: Interactive table caching behavior may vary from standard tables)"
+                )
+            else:
+                logger.info(
+                    f"Result cache setting: USE_CACHED_RESULT={cache_status.upper()}"
+                )
 
             load_mode = (
                 str(getattr(scenario, "load_mode", "CONCURRENCY") or "CONCURRENCY")
@@ -860,13 +883,16 @@ class TestRegistry:
             elapsed_total = (ts - start).total_seconds() if start else 0.0
             phase_upper = str(phase).upper()
             if total_expected_seconds > 0 and phase_upper not in {
+                "RUNNING",
                 "PROCESSING",
                 "COMPLETED",
             }:
+                # During WARMUP, cap elapsed display to expected duration.
                 elapsed_display = min(elapsed_total, float(total_expected_seconds))
             else:
-                # During PROCESSING (and the terminal COMPLETED payload), keep counting
-                # past the expected end time so UI can show e.g. 95/90.
+                # During RUNNING, PROCESSING, and COMPLETED: keep counting past the
+                # expected end time so UI can show e.g. 320/310 when blocked queries
+                # extend the actual test duration beyond the scheduled window.
                 elapsed_display = elapsed_total
 
             payload = dict(base_payload or {})
@@ -922,6 +948,7 @@ class TestRegistry:
 
         # Execute
         persisted_query_executions = False
+        test_saved_as_completed = False
         try:
             # Pre-create the benchmark Snowflake pool before setup/warmup/measurement so
             # RUNNING never stalls on connection spin-up at high concurrency.
@@ -967,12 +994,20 @@ class TestRegistry:
                 stats = await pool.get_pool_stats()
                 created = int(stats.get("total") or 0)
                 if created < int(pool.pool_size):
+                    pool_error = f"Failed to pre-create benchmark Snowflake pool ({created}/{int(pool.pool_size)} sessions created)"
                     logger.error(
-                        "Failed to pre-create benchmark Snowflake pool (%d/%d sessions created).",
-                        created,
-                        int(pool.pool_size),
+                        "🔴 Pool initialization incomplete - sending failure to UI: %s",
+                        pool_error,
                     )
+                    failure_payload = _with_phase(preparing_payload, phase="COMPLETED")
+                    failure_payload["status"] = "FAILED"
+                    failure_payload["error"] = {
+                        "type": "connection_error",
+                        "message": pool_error,
+                    }
+                    await self._publish(test_id, failure_payload)
                     executor.status = TestStatus.FAILED
+                    executor._setup_error = pool_error
                     result = await executor._build_result()
                     await update_test_result_final(test_id=test_id, result=result)
                     return
@@ -983,12 +1018,58 @@ class TestRegistry:
 
             ok = await executor.setup()
             if not ok:
+                # Setup failed - notify UI with error details for toast notification
+                setup_error = (
+                    getattr(executor, "_setup_error", None) or "Test setup failed"
+                )
+                logger.error(
+                    "🔴 Test setup failed - sending failure to UI: %s",
+                    setup_error,
+                )
+                failure_payload = _with_phase(preparing_payload, phase="COMPLETED")
+                failure_payload["status"] = "FAILED"
+                failure_payload["error"] = {
+                    "type": "setup_error",
+                    "message": setup_error,
+                }
+                await self._publish(test_id, failure_payload)
                 executor.status = TestStatus.FAILED
                 result = await executor._build_result()
                 await update_test_result_final(test_id=test_id, result=result)
                 return
 
             result = await executor.execute()
+
+            # Check if execution failed - notify UI with error details for toast notification
+            if result.status == TestStatus.FAILED:
+                exec_error = (
+                    getattr(executor, "_setup_error", None) or "Test execution failed"
+                )
+                logger.error(
+                    "🔴 Test execution failed - sending failure to UI: %s",
+                    exec_error,
+                )
+                failure_payload = _with_phase(last_payload, phase="COMPLETED")
+                failure_payload["status"] = "FAILED"
+                failure_payload["error"] = {
+                    "type": "execution_error",
+                    "message": exec_error,
+                }
+                await self._publish(test_id, failure_payload)
+                await update_test_result_final(test_id=test_id, result=result)
+                return
+
+            # =========================================================================
+            # CRITICAL: Save COMPLETED status IMMEDIATELY after execution succeeds.
+            # This ensures the test result is preserved even if post-processing
+            # (enrichment) is cancelled or fails.
+            # =========================================================================
+            find_max_result = getattr(executor, "_find_max_controller_state", None)
+            await update_test_result_final(
+                test_id=test_id, result=result, find_max_result=find_max_result
+            )
+            test_saved_as_completed = True
+            logger.info("✅ Test %s saved as COMPLETED", test_id)
 
             # Execution window is finished; post-processing (Snowflake writes,
             # query-history enrichment, overhead percentiles) can take time.
@@ -997,6 +1078,19 @@ class TestRegistry:
                 _with_phase(last_payload, phase="PROCESSING"),
             )
 
+            # Determine if enrichment is requested
+            should_enrich = bool(getattr(scenario, "collect_query_history", False))
+
+            # Set enrichment status based on whether it's requested
+            if should_enrich:
+                await update_enrichment_status(
+                    test_id=test_id, status="PENDING", error=None
+                )
+            else:
+                await update_enrichment_status(
+                    test_id=test_id, status="SKIPPED", error=None
+                )
+
             # Persist per-operation query executions.
             #
             # - If collect_query_history is enabled: persist all operations (warmup + measured).
@@ -1004,9 +1098,7 @@ class TestRegistry:
             try:
                 records = executor.get_query_execution_records()
                 if records:
-                    persist_all = bool(
-                        getattr(scenario, "collect_query_history", False)
-                    )
+                    persist_all = should_enrich
                     selected = (
                         records if persist_all else [r for r in records if r.warmup]
                     )
@@ -1045,8 +1137,8 @@ class TestRegistry:
 
             # Enrich persisted QUERY_EXECUTIONS with Snowflake timings from QUERY_HISTORY.
             # QUERY_HISTORY has ~45+ second latency; retry until 90% of queries are enriched.
-            try:
-                if getattr(scenario, "collect_query_history", False):
+            if should_enrich:
+                try:
                     await enrich_query_executions_with_retry(
                         test_id=test_id,
                         target_ratio=0.90,
@@ -1054,25 +1146,48 @@ class TestRegistry:
                         poll_interval_seconds=10,
                     )
                     await update_test_overhead_percentiles(test_id=test_id)
-            except Exception as e:
-                logger.debug("Failed to enrich QUERY_EXECUTIONS for %s: %s", test_id, e)
+                    await update_enrichment_status(
+                        test_id=test_id, status="COMPLETED", error=None
+                    )
+                    logger.info("✅ Enrichment completed for test %s", test_id)
+                except asyncio.CancelledError:
+                    # Enrichment was cancelled (e.g., server shutdown) but test is already saved.
+                    await update_enrichment_status(
+                        test_id=test_id,
+                        status="FAILED",
+                        error="Enrichment cancelled (server shutdown or user action)",
+                    )
+                    logger.warning(
+                        "⚠️ Enrichment cancelled for test %s (test result preserved)",
+                        test_id,
+                    )
+                    raise
+                except Exception as e:
+                    await update_enrichment_status(
+                        test_id=test_id, status="FAILED", error=str(e)
+                    )
+                    logger.warning(
+                        "⚠️ Enrichment failed for test %s: %s (test result preserved)",
+                        test_id,
+                        e,
+                    )
 
-            find_max_result = getattr(executor, "_find_max_controller_state", None)
-            await update_test_result_final(
-                test_id=test_id, result=result, find_max_result=find_max_result
-            )
         except asyncio.CancelledError:
-            # Test was stopped. Record a partial final result as CANCELLED.
-            executor.status = TestStatus.CANCELLED
-            executor.end_time = datetime.now()
-            try:
-                result = await executor._build_result()
-                find_max_result = getattr(executor, "_find_max_controller_state", None)
-                await update_test_result_final(
-                    test_id=test_id, result=result, find_max_result=find_max_result
-                )
-            except Exception:
-                pass
+            # Test was stopped/cancelled.
+            # Only set status to CANCELLED if we haven't already saved it as COMPLETED.
+            if not test_saved_as_completed:
+                executor.status = TestStatus.CANCELLED
+                executor.end_time = datetime.now()
+                try:
+                    result = await executor._build_result()
+                    find_max_result = getattr(
+                        executor, "_find_max_controller_state", None
+                    )
+                    await update_test_result_final(
+                        test_id=test_id, result=result, find_max_result=find_max_result
+                    )
+                except Exception:
+                    pass
             raise
         except Exception as e:
             logger.exception("Test %s crashed: %s", test_id, e)

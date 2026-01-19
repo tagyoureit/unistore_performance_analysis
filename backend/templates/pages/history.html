@@ -8,15 +8,17 @@
 
 {% block content %}
 <div x-data="testHistory()">
-    <div class="card">
-        <div class="card-title">Test History</div>
+    <div class="card card-compact">
+        <div class="card-title card-title--compact">Test History</div>
         <p>Browse and manage all previous test results</p>
     </div>
 
-    <div class="card">
-        <div class="card-title">Filters</div>
-        
-        <div class="filters-grid">
+    <details class="card card-collapsible">
+        <summary class="card-collapsible__summary">
+            <span class="card-title card-title--compact">Filters</span>
+        </summary>
+        <div class="card-collapsible__body">
+            <div class="filters-grid">
             <div>
                 <label class="form-label">Table Type</label>
                 <select class="form-select" x-model="filters.table_type" @change="applyFilters">
@@ -61,17 +63,108 @@
                     <option value="custom">Custom Range</option>
                 </select>
             </div>
+            <div class="filters-custom-range" x-show="filters.date_range === 'custom'">
+                <div>
+                    <label class="form-label">Start Date</label>
+                    <input
+                        type="date"
+                        class="form-input"
+                        x-model="filters.start_date"
+                        @change="applyFilters"
+                    >
+                </div>
+                <div>
+                    <label class="form-label">End Date</label>
+                    <input
+                        type="date"
+                        class="form-input"
+                        x-model="filters.end_date"
+                        @change="applyFilters"
+                    >
+                </div>
+            </div>
         </div>
 
-        <div class="btn-group">
-            <button type="button" class="btn btn-secondary" @click="resetFilters">Reset Filters</button>
-            <button type="button" class="btn btn-primary" @click="applyFilters">Apply</button>
+            <div class="form-group">
+                <label class="form-label">Search Tests</label>
+                <input
+                    type="text"
+                    class="form-input"
+                    x-model="searchQuery"
+                    @input.debounce.300ms="searchTests"
+                    placeholder="Search by test name..."
+                >
+            </div>
+
+            <div class="btn-group">
+                <button type="button" class="btn btn-secondary" @click="resetFilters">Reset Filters</button>
+                <button type="button" class="btn btn-primary" @click="applyFilters">Apply</button>
+            </div>
+
+            <div x-show="searchError" class="alert alert-error mb-4">
+                <strong>Search failed.</strong>
+                <span x-text="searchError"></span>
+            </div>
+
+            <div x-show="searchLoading" class="text-center py-4">
+                {% include "components/loading_spinner.html" %}
+            </div>
+
+            <div class="mb-4" x-show="!searchLoading && searchResults.length > 0">
+                <div class="font-semibold mb-2">Search Results</div>
+                <div class="table">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Test Name</th>
+                                <th>Type</th>
+                                <th>Table Type</th>
+                                <th>Date</th>
+                                <th>QPS</th>
+                                <th>P95 Latency</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="test in searchResults" :key="test.test_id">
+                                <tr>
+                                    <td x-text="test.test_name"></td>
+                                    <td>
+                                        <img
+                                            x-show="tableTypeIconSrc(test)"
+                                            class="template-type-icon"
+                                            :src="tableTypeIconSrc(test)"
+                                            :alt="tableTypeLabel(test)"
+                                            :title="tableTypeLabel(test)"
+                                        >
+                                    </td>
+                                    <td x-text="tableTypeLabel(test) || test.table_type"></td>
+                                    <td x-text="new Date(test.created_at).toLocaleDateString()"></td>
+                                    <td x-text="Number(test.ops_per_sec || 0).toFixed(0)"></td>
+                                    <td x-text="Number(test.p95_latency || 0).toFixed(2) + ' ms'"></td>
+                                    <td>
+                                        <button
+                                            type="button"
+                                            class="btn btn-sm"
+                                            :class="isCompared(test.test_id) ? 'btn-secondary' : 'btn-primary'"
+                                            @click="toggleCompare(test.test_id)"
+                                            :disabled="!isCompared(test.test_id) && compareTests.length >= 2"
+                                        >
+                                            <span x-text="isCompared(test.test_id) ? 'Remove' : 'Add to compare'"></span>
+                                        </button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
-    </div>
+    </details>
 
     <div class="card">
         <div class="flex justify-between items-center mb-4">
-            <div class="card-title mb-0">
+            <div class="card-title card-title--compact mb-0">
                 Compare
                 (<span x-text="compareTests.length"></span>/2)
             </div>
@@ -90,66 +183,6 @@
         <div x-show="compareError" class="alert alert-error mb-4">
             <strong>Compare error.</strong>
             <span x-text="compareError"></span>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label">Search Tests</label>
-            <input
-                type="text"
-                class="form-input"
-                x-model="searchQuery"
-                @input.debounce.300ms="searchTests"
-                placeholder="Search by test name..."
-            >
-        </div>
-
-        <div x-show="searchError" class="alert alert-error mb-4">
-            <strong>Search failed.</strong>
-            <span x-text="searchError"></span>
-        </div>
-
-        <div x-show="searchLoading" class="text-center py-4">
-            {% include "components/loading_spinner.html" %}
-        </div>
-
-        <div class="mb-4" x-show="!searchLoading && searchResults.length > 0">
-            <div class="font-semibold mb-2">Search Results</div>
-            <div class="table">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Test Name</th>
-                            <th>Table Type</th>
-                            <th>Date</th>
-                            <th>QPS</th>
-                            <th>P95 Latency</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <template x-for="test in searchResults" :key="test.test_id">
-                            <tr>
-                                <td x-text="test.test_name"></td>
-                                <td x-text="test.table_type"></td>
-                                <td x-text="new Date(test.created_at).toLocaleDateString()"></td>
-                                <td x-text="Number(test.ops_per_sec || 0).toFixed(0)"></td>
-                                <td x-text="Number(test.p95_latency || 0).toFixed(2) + ' ms'"></td>
-                                <td>
-                                    <button
-                                        type="button"
-                                        class="btn btn-sm"
-                                        :class="isCompared(test.test_id) ? 'btn-secondary' : 'btn-primary'"
-                                        @click="toggleCompare(test.test_id)"
-                                        :disabled="!isCompared(test.test_id) && compareTests.length >= 2"
-                                    >
-                                        <span x-text="isCompared(test.test_id) ? 'Remove' : 'Add to compare'"></span>
-                                    </button>
-                                </td>
-                            </tr>
-                        </template>
-                    </tbody>
-                </table>
-            </div>
         </div>
 
         <div x-show="compareTests.length > 0" class="mb-4">
@@ -304,7 +337,7 @@
 
     <div class="card">
         <div class="flex justify-between items-center mb-4">
-            <div class="card-title mb-0">Test Results</div>
+            <div class="card-title card-title--compact mb-0">Test Results</div>
             <div>
                 <span class="text-sm text-gray-600">
                     Showing <span x-text="tests.length"></span> results
@@ -328,6 +361,7 @@
                             Test Name 
                             <span x-show="sortField === 'test_name'" x-text="sortDirection === 'asc' ? '↑' : '↓'"></span>
                         </th>
+                        <th>Type</th>
                         <th @click="sortBy('table_type')" class="cursor-pointer">
                             Table Type
                             <span x-show="sortField === 'table_type'" x-text="sortDirection === 'asc' ? '↑' : '↓'"></span>
@@ -354,34 +388,52 @@
                             <td>
                                 <a :href="dashboardUrl(test)" class="text-blue-600 hover:underline" x-text="test.test_name"></a>
                             </td>
-                            <td x-text="test.table_type"></td>
+                            <td>
+                                <img
+                                    x-show="tableTypeIconSrc(test)"
+                                    class="template-type-icon"
+                                    :src="tableTypeIconSrc(test)"
+                                    :alt="tableTypeLabel(test)"
+                                    :title="tableTypeLabel(test)"
+                                >
+                            </td>
+                            <td x-text="tableTypeLabel(test) || test.table_type"></td>
                             <td x-text="new Date(test.created_at).toLocaleString()"></td>
                             <td x-text="test.ops_per_sec.toFixed(0)"></td>
                             <td x-text="test.p95_latency.toFixed(2) + ' ms'"></td>
                             <td>
-                                <span 
-                                    class="status-badge"
-                                    :class="(() => {
-                                        const phase = test.phase ? test.phase.toUpperCase() : null;
-                                        const status = test.status ? test.status.toUpperCase() : '';
-                                        if (phase && status === 'RUNNING') {
+                                <div class="flex flex-col gap-1">
+                                    <span 
+                                        class="status-badge"
+                                        :class="(() => {
+                                            const phase = test.phase ? test.phase.toUpperCase() : null;
+                                            const status = test.status ? test.status.toUpperCase() : '';
+                                            if (phase && status === 'RUNNING') {
+                                                return {
+                                                    'status-preparing': phase === 'PREPARING',
+                                                    'status-warmup': phase === 'WARMUP' || phase === 'WARM-UP',
+                                                    'status-running': phase === 'RUNNING',
+                                                    'status-processing': phase === 'PROCESSING'
+                                                };
+                                            }
                                             return {
-                                                'status-preparing': phase === 'PREPARING',
-                                                'status-warmup': phase === 'WARMUP' || phase === 'WARM-UP',
-                                                'status-running': phase === 'RUNNING',
-                                                'status-processing': phase === 'PROCESSING'
+                                                'status-completed': status === 'COMPLETED',
+                                                'status-running': status === 'RUNNING',
+                                                'status-failed': status === 'FAILED',
+                                                'status-paused': status === 'PAUSED',
+                                                'status-cancelled': status === 'CANCELLED'
                                             };
-                                        }
-                                        return {
-                                            'status-completed': status === 'COMPLETED',
-                                            'status-running': status === 'RUNNING',
-                                            'status-failed': status === 'FAILED',
-                                            'status-paused': status === 'PAUSED',
-                                            'status-cancelled': status === 'CANCELLED'
-                                        };
-                                    })()"
-                                    x-text="test.phase && test.status === 'RUNNING' ? test.phase : test.status">
-                                </span>
+                                        })()"
+                                        x-text="test.phase && test.status === 'RUNNING' ? test.phase : test.status">
+                                    </span>
+                                    <template x-if="test.status && test.status.toUpperCase() === 'FAILED' && test.failure_reason">
+                                        <span 
+                                            class="text-xs text-red-600 max-w-[200px] truncate cursor-help"
+                                            :title="test.failure_reason"
+                                            x-text="test.failure_reason.length > 50 ? test.failure_reason.substring(0, 50) + '...' : test.failure_reason">
+                                        </span>
+                                    </template>
+                                </div>
                             </td>
                             <td>
                                 <div class="flex gap-2">

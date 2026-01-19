@@ -393,6 +393,7 @@ async def update_test_result_final(
         MAX_LATENCY_MS = ?,
         ERROR_COUNT = ?,
         ERROR_RATE = ?,
+        FAILURE_REASON = ?,
         ROWS_READ = ?,
         ROWS_WRITTEN = ?,
         READ_P50_LATENCY_MS = ?,
@@ -457,6 +458,7 @@ async def update_test_result_final(
         result.max_latency_ms,
         result.error_count,
         error_rate,
+        result.failure_reason,
         result.rows_read,
         result.rows_written,
         result.read_p50_latency_ms,
@@ -767,3 +769,60 @@ async def update_test_overhead_percentiles(*, test_id: str) -> None:
     """
 
     await pool.execute_query(query, params=[test_id, test_id, test_id, test_id])
+
+
+async def update_enrichment_status(
+    *,
+    test_id: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """
+    Update the enrichment status for a test.
+
+    Args:
+        test_id: The test ID
+        status: One of PENDING, COMPLETED, FAILED, SKIPPED
+        error: Optional error message if status is FAILED
+    """
+    pool = snowflake_pool.get_default_pool()
+    prefix = _results_prefix()
+
+    query = f"""
+    UPDATE {prefix}.TEST_RESULTS
+    SET
+        ENRICHMENT_STATUS = ?,
+        ENRICHMENT_ERROR = ?,
+        UPDATED_AT = CURRENT_TIMESTAMP()
+    WHERE TEST_ID = ?
+    """
+
+    await pool.execute_query(query, params=[status, error, test_id])
+
+
+async def get_enrichment_status(*, test_id: str) -> dict[str, Any] | None:
+    """
+    Get the enrichment status for a test.
+
+    Returns dict with enrichment_status, enrichment_error, or None if test not found.
+    """
+    pool = snowflake_pool.get_default_pool()
+    prefix = _results_prefix()
+
+    rows = await pool.execute_query(
+        f"""
+        SELECT STATUS, ENRICHMENT_STATUS, ENRICHMENT_ERROR
+        FROM {prefix}.TEST_RESULTS
+        WHERE TEST_ID = ?
+        """,
+        params=[test_id],
+    )
+
+    if not rows:
+        return None
+
+    return {
+        "test_status": rows[0][0],
+        "enrichment_status": rows[0][1],
+        "enrichment_error": rows[0][2],
+    }

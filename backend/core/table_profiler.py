@@ -2,9 +2,7 @@
 Table Profiler (Snowflake-first)
 
 Provides lightweight, low-cost table "profiling" to support adaptive workload
-query generation across:
-- blank slate benchmark-created tables
-- existing production schemas being evaluated for migration
+query generation for existing production schemas being evaluated for migration.
 
 This module intentionally avoids heavy scans. It uses:
 - DESCRIBE TABLE (column names/types)
@@ -113,6 +111,43 @@ async def _is_hybrid_table(pool, full_table_name: str) -> bool:
     except Exception as e:
         logger.warning(
             "Failed to detect hybrid table status for %s: %s, assuming standard table",
+            full_table_name,
+            e,
+        )
+        return False
+
+
+async def _is_view(pool, full_table_name: str) -> bool:
+    """
+    Detect if the object is a view (not a table).
+
+    Views don't support TABLESAMPLE or efficient SAMPLE operations.
+    For views, we skip sample-based analysis to avoid timeouts.
+    """
+    # Parse the fully qualified table name: "DB"."SCHEMA"."TABLE"
+    parts = re.split(r'\.(?=(?:[^"]*"[^"]*")*[^"]*$)', full_table_name)
+    if len(parts) != 3:
+        return False
+
+    db_name = parts[0].strip('"')
+    schema_name = parts[1].strip('"')
+    table_name = parts[2].strip('"')
+
+    try:
+        rows = await pool.execute_query(
+            f"""
+            SELECT TABLE_TYPE
+            FROM "{db_name}".INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'
+            """
+        )
+        if rows and str(rows[0][0]).upper() == "VIEW":
+            logger.debug("Object %s detected as VIEW", full_table_name)
+            return True
+        return False
+    except Exception as e:
+        logger.warning(
+            "Failed to detect view status for %s: %s, assuming table",
             full_table_name,
             e,
         )
@@ -334,11 +369,19 @@ async def profile_snowflake_table(
         col_type = str(row[1]).upper() if len(row) > 1 else ""
         columns[col_name] = col_type
 
-    # Detect hybrid table to skip expensive SAMPLE queries
+    # Detect hybrid table or view to skip expensive SAMPLE queries
     is_hybrid = await _is_hybrid_table(pool, full_table_name)
+    is_view_obj = await _is_view(pool, full_table_name)
+    skip_sample = is_hybrid or is_view_obj
+
     if is_hybrid:
         logger.info(
             "Table %s is a hybrid table - skipping SAMPLE-based key detection",
+            full_table_name,
+        )
+    if is_view_obj:
+        logger.info(
+            "Object %s is a view - skipping SAMPLE-based key detection",
             full_table_name,
         )
 
@@ -348,12 +391,12 @@ async def profile_snowflake_table(
         id_col = None
     elif len(candidates) == 1:
         id_col = candidates[0]
-    elif is_hybrid:
-        # For hybrid tables, use heuristic selection (first candidate) to avoid
-        # expensive SAMPLE queries that can timeout on large hybrid tables.
+    elif skip_sample:
+        # For hybrid tables and views, use heuristic selection (first candidate) to avoid
+        # expensive SAMPLE queries that can timeout.
         id_col = candidates[0]
         logger.debug(
-            "Using heuristic key selection for hybrid table %s: %s",
+            "Using heuristic key selection for %s: %s",
             full_table_name,
             id_col,
         )

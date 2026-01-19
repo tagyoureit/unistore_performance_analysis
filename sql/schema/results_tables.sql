@@ -77,6 +77,7 @@ CREATE OR ALTER TABLE TEST_RESULTS (
     -- Errors and issues
     error_count INTEGER DEFAULT 0,
     error_rate FLOAT DEFAULT 0.0,
+    failure_reason TEXT,  -- Reason for test failure (setup/validation errors)
     errors VARIANT,
     
     -- Detailed data (JSON/VARIANT)
@@ -145,7 +146,12 @@ CREATE OR ALTER TABLE TEST_RESULTS (
     query_tag VARCHAR(200),
 
     -- FIND_MAX_CONCURRENCY mode results (step history, best concurrency, etc.)
-    find_max_result VARIANT
+    find_max_result VARIANT,
+
+    -- Post-processing enrichment status (separate from test execution status)
+    -- Values: NULL (legacy), PENDING, COMPLETED, FAILED, SKIPPED
+    enrichment_status VARCHAR(20),
+    enrichment_error TEXT
 );
 
 -- =============================================================================

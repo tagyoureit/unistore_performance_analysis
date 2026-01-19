@@ -51,7 +51,7 @@
                     </span>
                     <span x-show="String(templateInfo?.load_mode || 'CONCURRENCY').toUpperCase() === 'QPS'">
                         <strong>Target:</strong>
-                        <span x-text="templateInfo ? (templateInfo.qps_target_mode === 'SF_RUNNING' ? 'Snowflake Running' : 'QPS') : ''"></span>
+                        <span x-text="templateInfo ? 'QPS (ops/sec)' : ''"></span>
                         = <span x-text="templateInfo ? (templateInfo.target_qps ?? '') : ''"></span>
                         • <strong>Workers:</strong>
                         <span x-text="templateInfo ? ((templateInfo.min_concurrency ?? '') + '-' + (templateInfo.concurrent_connections ?? '')) : ''"></span>
@@ -91,6 +91,35 @@
         </div>
     </div>
 
+    <!-- Enrichment Status Alert (shows if enrichment failed) -->
+    <div
+        class="alert alert-warning"
+        style="margin-bottom: 1rem;"
+        x-show="templateInfo && templateInfo.enrichment_status === 'FAILED'"
+        x-cloak
+    >
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
+            <div>
+                <strong>Post-processing incomplete:</strong>
+                <span x-text="templateInfo?.enrichment_error || 'Enrichment failed'"></span>
+                <br>
+                <small style="color: var(--text-muted);">
+                    Test results are preserved. You can retry enrichment to get Snowflake timing details (cluster info, queue times, etc.).
+                </small>
+            </div>
+            <button
+                type="button"
+                class="btn btn-primary"
+                style="white-space: nowrap;"
+                @click="retryEnrichment()"
+                :disabled="enrichmentRetrying"
+            >
+                <span x-show="enrichmentRetrying" class="ai-btn-spinner"></span>
+                <span x-text="enrichmentRetrying ? 'Retrying...' : 'Retry Enrichment'"></span>
+            </button>
+        </div>
+    </div>
+
     <div class="ai-analysis-card" x-show="!aiAnalysisModal" x-cloak>
         <div class="ai-analysis-card-content">
             <div class="ai-analysis-card-icon">✦</div>
@@ -102,7 +131,7 @@
                 type="button"
                 class="btn btn-primary ai-analysis-card-btn"
                 @click="openAiAnalysis()"
-                :disabled="!testId || (templateInfo && templateInfo.status !== 'COMPLETED') || aiAnalysisLoading"
+                :disabled="!testId || !isTerminalStatus(templateInfo?.status) || aiAnalysisLoading"
             >
                 <span x-show="aiAnalysisLoading" class="ai-btn-spinner"></span>
                 <span x-text="aiAnalysisLoading ? 'Analyzing...' : 'Analyze'"></span>
@@ -189,9 +218,9 @@
     </div>
 
     <div class="card" x-show="hasStepHistory()">
-        <div class="card-title">Find Max Concurrency - Step History</div>
+        <div class="card-title">Find Max (step-load) - Step History</div>
         <div style="color: #6b7280; margin-top: -0.25rem;">
-            Step-by-step progression showing how concurrency was scaled until degradation was detected.
+            Step-by-step progression showing how worker count was scaled until degradation was detected.
         </div>
 
         <div style="margin-top: 1rem;">

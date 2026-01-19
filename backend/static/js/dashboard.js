@@ -36,6 +36,7 @@ function dashboard(opts) {
       sf_running_range_scan_bench: 0,
       sf_running_insert_bench: 0,
       sf_running_update_bench: 0,
+      p50_latency: 0,
       p95_latency: 0,
       p99_latency: 0,
       error_rate: 0,
@@ -106,6 +107,7 @@ function dashboard(opts) {
     findMaxCountdownSeconds: null,
     _findMaxCountdownIntervalId: null,
     _findMaxCountdownTargetEpochMs: null,
+    enrichmentRetrying: false,
 
     init() {
       // Enable debug logging when ?debug=1 is present.
@@ -875,6 +877,21 @@ function dashboard(opts) {
 
     sloObservedP95Ms(kind) {
       // Always use end-to-end (app) latencies for SLO evaluation.
+      //
+      // In FIND_MAX_CONCURRENCY, prefer per-step, per-kind latencies so the SLO
+      // table reflects the step currently being evaluated (or the unstable step
+      // when the run terminates).
+      if (this.isFindMaxMode()) {
+        const s = this.findMaxState();
+        const terminal = this._findMaxIsTerminal(s);
+        const step = terminal
+          ? (this._findMaxLastUnstableStep() || null)
+          : null;
+        const hist = this._findMaxStepHistory();
+        const effectiveStep = step || (hist.length ? hist[hist.length - 1] : null);
+        return this.stepSloObservedP95Ms(kind, effectiveStep);
+      }
+
       const info = this.templateInfo;
       if (!info) return null;
       const k = this._kindKey(kind);
@@ -886,6 +903,17 @@ function dashboard(opts) {
 
     sloObservedP99Ms(kind) {
       // Always use end-to-end (app) latencies for SLO evaluation.
+      if (this.isFindMaxMode()) {
+        const s = this.findMaxState();
+        const terminal = this._findMaxIsTerminal(s);
+        const step = terminal
+          ? (this._findMaxLastUnstableStep() || null)
+          : null;
+        const hist = this._findMaxStepHistory();
+        const effectiveStep = step || (hist.length ? hist[hist.length - 1] : null);
+        return this.stepSloObservedP99Ms(kind, effectiveStep);
+      }
+
       const info = this.templateInfo;
       if (!info) return null;
       const k = this._kindKey(kind);
@@ -896,6 +924,17 @@ function dashboard(opts) {
     },
 
     sloObservedErrorPct(kind) {
+      if (this.isFindMaxMode()) {
+        const s = this.findMaxState();
+        const terminal = this._findMaxIsTerminal(s);
+        const step = terminal
+          ? (this._findMaxLastUnstableStep() || null)
+          : null;
+        const hist = this._findMaxStepHistory();
+        const effectiveStep = step || (hist.length ? hist[hist.length - 1] : null);
+        return this.stepSloObservedErrorPct(kind, effectiveStep);
+      }
+
       const info = this.templateInfo;
       if (!info) return null;
       const k = this._kindKey(kind);
@@ -1029,6 +1068,17 @@ function dashboard(opts) {
     },
 
     sloRowStatus(kind) {
+      if (this.isFindMaxMode()) {
+        const s = this.findMaxState();
+        const terminal = this._findMaxIsTerminal(s);
+        const step = terminal
+          ? (this._findMaxLastUnstableStep() || null)
+          : null;
+        const hist = this._findMaxStepHistory();
+        const effectiveStep = step || (hist.length ? hist[hist.length - 1] : null);
+        return this.stepSloRowStatus(effectiveStep, kind);
+      }
+
       const weight = this.workloadPct(kind);
       if (weight <= 0) return "N/A";
 
@@ -1072,6 +1122,17 @@ function dashboard(opts) {
     },
 
     sloOverallStatus() {
+      if (this.isFindMaxMode()) {
+        const s = this.findMaxState();
+        const terminal = this._findMaxIsTerminal(s);
+        const step = terminal
+          ? (this._findMaxLastUnstableStep() || null)
+          : null;
+        const hist = this._findMaxStepHistory();
+        const effectiveStep = step || (hist.length ? hist[hist.length - 1] : null);
+        return this.stepSloStatus(effectiveStep);
+      }
+
       const kinds = ["POINT_LOOKUP", "RANGE_SCAN", "INSERT", "UPDATE"];
       let anyTargetsEnabled = false;
       let sawPending = false;
@@ -1155,10 +1216,12 @@ function dashboard(opts) {
       if (this.latencyView === "sf_execution") {
         if (!this.templateInfo) return null;
         if (!this.sfLatencyAvailable()) return null;
+        if (p === 50) return this.templateInfo.sf_p50_latency_ms;
         if (p === 95) return this.templateInfo.sf_p95_latency_ms;
         if (p === 99) return this.templateInfo.sf_p99_latency_ms;
         return null;
       }
+      if (p === 50) return this.metrics.p50_latency;
       if (p === 95) return this.metrics.p95_latency;
       if (p === 99) return this.metrics.p99_latency;
       return null;
@@ -1211,15 +1274,14 @@ function dashboard(opts) {
             !!canvas &&
             (!chart ||
               (isPostgres && ds.length !== 2) ||
-              (!isPostgres && ds.length !== 4) ||
+              (!isPostgres && ds.length !== 3) ||
               (isPostgres &&
                 (!hasLabel(0, "Target workers") ||
                   !hasLabel(1, "In-flight queries"))) ||
             (!isPostgres &&
                 (!hasLabel(0, "Target workers") ||
-                  !hasLabel(1, "Snowflake running (bench)") ||
-                  !hasLabel(2, "In-flight (client)") ||
-                  !hasLabel(3, "Snowflake queued (queries)"))));
+                  !hasLabel(1, "In-flight (client)") ||
+                  !hasLabel(2, "Snowflake queued (queries)"))));
           if (needsRebuild) {
             this.initCharts({ onlyConcurrency: true });
           }
@@ -1259,6 +1321,7 @@ function dashboard(opts) {
           }
           this.metrics.ops_per_sec = data.qps || 0;
           this.metrics.in_flight = 0;
+          this.metrics.p50_latency = data.p50_latency_ms || 0;
           this.metrics.p95_latency = data.p95_latency_ms || 0;
           this.metrics.p99_latency = data.p99_latency_ms || 0;
           this.metrics.error_rate = data.total_operations > 0 
@@ -1726,17 +1789,15 @@ function dashboard(opts) {
                 concurrencyChart2.data.datasets[1].data.push(inFlight);
               }
             } else {
+              // Snowflake: three datasets (target_workers, in_flight, sf_queued)
               if (concurrencyChart2.data.datasets[0]) {
                 concurrencyChart2.data.datasets[0].data.push(target);
               }
               if (concurrencyChart2.data.datasets[1]) {
-                concurrencyChart2.data.datasets[1].data.push(sfRunning);
+                concurrencyChart2.data.datasets[1].data.push(inFlight);
               }
               if (concurrencyChart2.data.datasets[2]) {
-                concurrencyChart2.data.datasets[2].data.push(inFlight);
-              }
-              if (concurrencyChart2.data.datasets[3]) {
-                concurrencyChart2.data.datasets[3].data.push(sfQueued);
+                concurrencyChart2.data.datasets[2].data.push(sfQueued);
               }
             }
           }
@@ -1771,6 +1832,9 @@ function dashboard(opts) {
             );
             sfRunningChart2.data.datasets[6].data.push(
               Number(snapshot.sf_running_update || 0),
+            );
+            sfRunningChart2.data.datasets[7].data.push(
+              Number(snapshot.sf_blocked || 0),
             );
           }
 
@@ -1885,13 +1949,6 @@ function dashboard(opts) {
               ]
             : [
                 targetWorkersDataset,
-                {
-                  label: "Snowflake running (bench)",
-                  data: [],
-                  borderColor: "rgb(59, 130, 246)",
-                  backgroundColor: "transparent",
-                  tension: 0.4,
-                },
                 {
                   label: "In-flight (client)",
                   data: [],
@@ -2059,13 +2116,6 @@ function dashboard(opts) {
             : [
                 targetWorkersDataset,
                 {
-                  label: "Snowflake running (bench)",
-                  data: [],
-                  borderColor: "rgb(59, 130, 246)",
-                  backgroundColor: "transparent",
-                  tension: 0.4,
-                },
-                {
                   label: "In-flight (client)",
                   data: [],
                   borderColor: "rgb(245, 158, 11)",
@@ -2186,6 +2236,14 @@ function dashboard(opts) {
                   backgroundColor: "transparent",
                   tension: 0.4,
                   hidden: !byKind,
+                },
+                {
+                  label: "Blocked",
+                  data: [],
+                  borderColor: "rgb(168, 85, 247)",
+                  backgroundColor: "transparent",
+                  tension: 0.4,
+                  borderDash: [6, 4],
                 },
               ],
             },
@@ -2810,9 +2868,16 @@ function dashboard(opts) {
         if (payload.error) {
           console.log("[dashboard] Received error payload:", payload.error);
         }
-        if (payload.error && payload.error.type === "connection_error") {
-          const errorMsg = payload.error.message || "Snowflake connection failed";
-          console.error("[dashboard] Connection error - showing toast:", errorMsg);
+        const errorTypes = ["connection_error", "setup_error", "execution_error"];
+        if (payload.error && errorTypes.includes(payload.error.type)) {
+          const errorTypeLabels = {
+            "connection_error": "Connection error",
+            "setup_error": "Setup error",
+            "execution_error": "Execution error"
+          };
+          const errorType = errorTypeLabels[payload.error.type] || "Error";
+          const errorMsg = payload.error.message || `${errorType}: Test failed`;
+          console.error(`[dashboard] ${errorType} - showing toast:`, errorMsg);
           if (window.toast && typeof window.toast.error === "function") {
             window.toast.error(errorMsg);
           }
@@ -2938,6 +3003,7 @@ function dashboard(opts) {
           this.metrics.qps_avg_30s = this.qpsHistory.length > 0 ? sum / this.qpsHistory.length : 0;
         }
         if (latency) {
+          this.metrics.p50_latency = latency.p50 || 0;
           this.metrics.p95_latency = latency.p95 || 0;
           this.metrics.p99_latency = latency.p99 || 0;
         }
@@ -3059,19 +3125,15 @@ function dashboard(opts) {
               concurrencyChart2.data.datasets[0].data.push(this.metrics.target_workers);
               concurrencyChart2.data.datasets[1].data.push(this.metrics.in_flight);
             } else {
-              // Snowflake: four datasets (target_workers, sf_running, in_flight, sf_queued)
-              const sfRunning = this.metrics.sf_bench_available
-                ? this.metrics.sf_running_bench
-                : this.metrics.sf_running;
+              // Snowflake: three datasets (target_workers, in_flight, sf_queued)
               // Prefer per-test queued queries; fall back to warehouse queued clusters if needed.
               const sfQueued = this.metrics.sf_queued_bench > 0
                 ? this.metrics.sf_queued_bench
                 : this.metrics.sf_queued;
 
               concurrencyChart2.data.datasets[0].data.push(this.metrics.target_workers);
-              concurrencyChart2.data.datasets[1].data.push(sfRunning);
-              concurrencyChart2.data.datasets[2].data.push(this.metrics.in_flight);
-              concurrencyChart2.data.datasets[3].data.push(sfQueued);
+              concurrencyChart2.data.datasets[1].data.push(this.metrics.in_flight);
+              concurrencyChart2.data.datasets[2].data.push(sfQueued);
             }
             concurrencyChart2.update();
           }
@@ -3145,6 +3207,9 @@ function dashboard(opts) {
             sfRunningChart2.data.datasets[4].data.push(writes);
             sfRunningChart2.data.datasets[5].data.push(ins);
             sfRunningChart2.data.datasets[6].data.push(upd);
+            sfRunningChart2.data.datasets[7].data.push(
+              this.metrics.sf_bench_available ? this.metrics.sf_blocked_bench : 0
+            );
             sfRunningChart2.update();
           }
         }
@@ -3219,6 +3284,59 @@ function dashboard(opts) {
       this.aiAnalysisError = null;
       this.chatHistory = [];
       this.chatMessage = "";
+    },
+
+    /**
+     * Check if a test status is terminal (test execution has finished).
+     * Terminal statuses are: COMPLETED, FAILED, STOPPED, CANCELLED, ERROR
+     */
+    isTerminalStatus(status) {
+      if (!status) return false;
+      const s = String(status).toUpperCase();
+      return ["COMPLETED", "FAILED", "STOPPED", "CANCELLED", "ERROR"].includes(s);
+    },
+
+    /**
+     * Retry enrichment for a test that has failed enrichment.
+     */
+    async retryEnrichment() {
+      if (!this.testId || this.enrichmentRetrying) return;
+
+      this.enrichmentRetrying = true;
+      try {
+        const resp = await fetch(`/api/tests/${this.testId}/retry-enrichment`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          const detail = err.detail;
+          const msg = typeof detail === 'object' && detail !== null
+            ? (detail.message || JSON.stringify(detail))
+            : (detail || `HTTP ${resp.status}`);
+          throw new Error(msg);
+        }
+        const data = await resp.json();
+        // Update templateInfo with the new enrichment status
+        if (this.templateInfo) {
+          this.templateInfo.enrichment_status = data.enrichment_status;
+          this.templateInfo.enrichment_error = null;
+          this.templateInfo.can_retry_enrichment = false;
+        }
+        if (window.toast && typeof window.toast.success === "function") {
+          const ratio = data.stats?.enrichment_ratio || 0;
+          window.toast.success(`Enrichment completed (${ratio}% queries enriched)`);
+        }
+        // Reload test info to refresh all metrics
+        await this.loadTestInfo();
+      } catch (e) {
+        console.error("Retry enrichment failed:", e);
+        if (window.toast && typeof window.toast.error === "function") {
+          window.toast.error(`Enrichment failed: ${e.message || e}`);
+        }
+      } finally {
+        this.enrichmentRetrying = false;
+      }
     },
 
     async sendChatMessage() {

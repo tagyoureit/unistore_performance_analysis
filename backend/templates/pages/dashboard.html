@@ -48,7 +48,7 @@
                     </span>
                     <span x-show="String(templateInfo?.load_mode || 'CONCURRENCY').toUpperCase() === 'QPS'">
                         • <strong>Target:</strong>
-                        <span x-text="templateInfo ? (templateInfo.qps_target_mode === 'SF_RUNNING' ? 'Snowflake Running' : 'QPS') : ''"></span>
+                        <span x-text="templateInfo ? 'QPS (ops/sec)' : ''"></span>
                         = <span x-text="templateInfo ? (templateInfo.target_qps ?? '') : ''"></span>
                         • <strong>Workers:</strong>
                         <span x-text="templateInfo ? ((templateInfo.min_concurrency ?? '') + '-' + (templateInfo.concurrent_connections ?? '')) : ''"></span>

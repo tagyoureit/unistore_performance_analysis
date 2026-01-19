@@ -1,7 +1,8 @@
 # Unistore Benchmark
 
-> **Performance benchmarking tool for Snowflake and Postgres databases**  
-> "3DMark for databases" - Test Standard Tables, Hybrid Tables, Interactive Tables, and Postgres
+> **Performance benchmarking tool for Snowflake and Postgres databases**
+> "3DMark for databases" - Test Standard Tables, Hybrid Tables, Interactive
+> Tables, and Postgres
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![Python](https://img.shields.io/badge/python-3.11+-green)
@@ -9,13 +10,18 @@
 
 ## 🎯 Overview
 
-Unistore Benchmark is a comprehensive performance testing tool designed to benchmark and compare different Snowflake table types (Standard, Hybrid, Interactive) and Postgres databases. It provides real-time metrics visualization, configurable test scenarios, and side-by-side comparison of up to 5 test results.
+Unistore Benchmark is a comprehensive performance testing tool designed to
+benchmark and compare different Snowflake table types (Standard, Hybrid,
+Interactive) and Postgres databases. It provides real-time metrics visualization,
+configurable test scenarios, and side-by-side comparison of up to 5 test results.
 
 ### Key Features
 
 - ⚡ **Real-time Dashboard** - Live metrics updates every 1 second via WebSocket
-- 🔧 **Configurable Tests** - Select existing tables/views, pick warehouses, and tune workload parameters
-- 📊 **Performance Metrics** - Operations/sec, latency percentiles (p50, p95, p99), throughput
+- 🔧 **Configurable Tests** - Select existing tables/views, pick warehouses, and
+  tune workload parameters
+- 📊 **Performance Metrics** - Operations/sec, latency percentiles (p50, p95,
+  p99), throughput
 - 🔄 **Comparison View** - Side-by-side comparison of up to 5 test configurations
 - 📚 **Test Templates** - Pre-built scenarios including R180 POC template
 - 💾 **Results Storage** - All test results stored in Snowflake for historical analysis
@@ -91,7 +97,7 @@ uv run uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
 ### 5. Open Your Browser
 
-Navigate to: http://localhost:8000
+Navigate to: <http://localhost:8000>
 
 ## 📖 Usage Guide
 
@@ -103,16 +109,24 @@ Navigate to: http://localhost:8000
    - **Table:** Choose an existing database/schema/table (or view) from dropdowns
    - **Warehouse:** Size, multi-cluster, scaling policy
    - **Test Parameters:** Duration + load mode (fixed workers or auto-scale target)
-  - **Queries, Mix, and Targets:** Templates store all SQL (4 canonical queries) and the per-query mix % + SLO targets (P95/P99 latency + error%).
+   - **Queries, Mix, and Targets:** Templates store all SQL (4 canonical queries)
+     and the per-query mix % + SLO targets (P95/P99 latency + error%).
      - **Mix preset:** Quickly adjusts weights (does not change SQL)
-     - **Generate SQL for This Table Type:** Auto-fills the 4 canonical queries (point lookup / range scan / insert / update) to match the selected table + backend (Snowflake vs Postgres-family).
+     - **Generate SQL for This Table Type:** Auto-fills the 4 canonical queries
+       (point lookup / range scan / insert / update) to match the selected table
+       and backend (Snowflake vs Postgres-family).
      - Preview-only: **no DB writes happen until you save the template**
-     - If a usable key/time column can’t be detected, the affected SQL will be blank and its % set to 0 (toast will be yellow with details)
+     - If a usable key/time column can’t be detected, the affected SQL will be
+       blank and its % set to 0 (toast will be yellow with details)
 4. Click **"Start Test"**
 
-**Note:** Views are supported for benchmarking, but they are read-only. Use `READ_ONLY` workloads when selecting a view.
+**Note:** Views are supported for benchmarking, but they are read-only. Use
+`READ_ONLY` workloads when selecting a view.
 
-After saving a template, you can optionally run **"Prepare AI Workload (Pools + Metadata)"** (or use **"Save & Prepare"**) to persist large value pools for high-concurrency runs (stored in `TEMPLATE_VALUE_POOLS`) and avoid generating values at runtime.
+After saving a template, you can optionally run **"Prepare AI Workload (Pools +
+Metadata)"** (or use **"Save & Prepare"**) to persist large value pools for
+high-concurrency runs (stored in `TEMPLATE_VALUE_POOLS`) and avoid generating
+values at runtime.
 
 ### Viewing Real-Time Results
 
@@ -139,9 +153,65 @@ Pre-built templates available:
 - **Mixed Workload** - Concurrent reads and writes
 - **High Concurrency** - Stress test for throughput
 
+### Smoke Check (4 Variations)
+
+Run a quick, on-demand smoke check across the four table-type variations
+(STANDARD, HYBRID, INTERACTIVE, POSTGRES). This validates that each variation
+completes and produces metrics, and prints an AI analysis summary per run.
+
+The smoke runner is self-contained: it creates small smoke tables in
+`RESULTS_DATABASE.SMOKE_DATA`, builds temporary templates, runs the tests, and
+cleans up unless you opt to keep the data. Postgres smoke setup is attempted
+only if a Postgres connection is available (otherwise it is skipped).
+
+Requirements:
+- App server running at `http://127.0.0.1:8000` (or set `BASE_URL`)
+- SnowCLI installed and configured (the smoke setup uses `snow sql`)
+- Results schema created via `uv run python -m backend.setup_schema`
+
+```bash
+task test:variations:smoke
+```
+
+Setup only (no tests):
+
+```bash
+task test:variations:setup
+```
+
+Cleanup only (drops smoke tables/templates):
+
+```bash
+task test:variations:cleanup
+```
+
+Optional overrides:
+
+```bash
+BASE_URL="http://127.0.0.1:8000" \
+MAX_WAIT_SECONDS=300 \
+POLL_INTERVAL_SECONDS=5 \
+METRICS_WAIT_SECONDS=30 \
+DURATION_SECONDS=45 \
+WARMUP_SECONDS=0 \
+SMOKE_ROWS=300 \
+SMOKE_SCHEMA=SMOKE_DATA \
+SMOKE_WAREHOUSE=SMOKE_WH \
+SMOKE_CONCURRENCY=5 \
+KEEP_SMOKE_DATA=true \
+SKIP_POSTGRES=true \
+task test:variations:smoke
+```
+
+Long smoke test:
+
+```bash
+task test:variations:smoke:long
+```
+
 ## 🎨 Project Structure
 
-```
+```text
 unistore_performance_analysis/
 ├── backend/
 │   ├── api/routes/          # REST and WebSocket routes
@@ -181,9 +251,11 @@ unistore_performance_analysis/
 
 ### Postgres Startup Behavior
 
-Postgres is optional. By default, the app does **not** try to connect to Postgres at startup.
+Postgres is optional. By default, the app does **not** try to connect to Postgres
+at startup.
 
-- **POSTGRES_CONNECT_ON_STARTUP**: Set to `true` to initialize the Postgres pool during FastAPI startup (default: `false`).
+- **POSTGRES_CONNECT_ON_STARTUP**: Set to `true` to initialize the Postgres pool
+  during FastAPI startup (default: `false`).
 
 ### Warehouse Configurations
 
@@ -225,17 +297,20 @@ workload:
 ## 📊 Metrics Collected
 
 ### Performance Metrics
+
 - **Operations/Second:** Read, write, query throughput
 - **Latency:** p50, p95, p99, max response times
 - **Throughput:** Rows/sec, MB/sec
 - **Errors:** Error count, error rate, error types
 
 ### Resource Metrics
+
 - **Warehouse Utilization:** CPU, memory, concurrency
 - **Connection Pool:** Active connections, pool saturation
 - **Cache Statistics:** Hit rates, evictions (when available)
 
 ### Cost Metrics (when enabled)
+
 - **Credit Consumption:** Warehouse compute credits
 - **Storage Costs:** Data storage estimates
 - **Total Cost:** Estimated cost per test
@@ -292,19 +367,24 @@ open dist/Unistore\ Benchmark.app
 - Verify WebSocket connection is stable
 
 **High concurrency stalls at start (connection spin-up):**
-- The benchmark creates a **dedicated per-test Snowflake pool** sized to the requested concurrency.
-- If startup is slow, reduce `SNOWFLAKE_POOL_MAX_PARALLEL_CREATES` to avoid overwhelming the client with too many concurrent `connect()` calls.
-- Ensure results persistence has its own threads via `SNOWFLAKE_RESULTS_EXECUTOR_MAX_WORKERS`.
+- The benchmark creates a **dedicated per-test Snowflake pool** sized to the
+  requested concurrency.
+- If startup is slow, reduce `SNOWFLAKE_POOL_MAX_PARALLEL_CREATES` to avoid
+  overwhelming the client with too many concurrent `connect()` calls.
+- Ensure results persistence has its own threads via
+  `SNOWFLAKE_RESULTS_EXECUTOR_MAX_WORKERS`.
 
 **Tests timeout:**
 - Increase warehouse size
 - Reduce concurrency level
 - Check for long-running queries
 - Verify adequate connection pool size / executor capacity:
-  - `SNOWFLAKE_BENCHMARK_EXECUTOR_MAX_WORKERS` must be >= requested concurrency per node (to avoid app-side queueing)
+  - `SNOWFLAKE_BENCHMARK_EXECUTOR_MAX_WORKERS` must be >= requested concurrency
+    per node (to avoid app-side queueing)
 
 **Need to simulate thousands of users:**
-- See `docs/scaling.md` for the current concurrency model and the recommended multi-process/multi-node approach.
+- See `docs/scaling.md` for the current concurrency model and the recommended
+  multi-process/multi-node approach.
 
 ## 📚 Additional Resources
 
@@ -312,9 +392,11 @@ open dist/Unistore\ Benchmark.app
 - [API Documentation](docs/api.md) - REST and WebSocket API reference
 - [Test Scenarios Guide](docs/scenarios.md) - Creating custom test scenarios
 - [Performance Tuning](docs/performance.md) - Optimization tips
-- [Scaling & Concurrency Model](docs/scaling.md) - How to run high concurrency and when to scale out
+- [Scaling & Concurrency Model](docs/scaling.md) - How to run high concurrency
+  and when to scale out
 
 ### External Documentation
+
 - [Snowflake Hybrid Tables Best Practices](https://docs.snowflake.com/en/user-guide/tables-hybrid-best-practices)
 - [Snowflake Interactive Tables](https://docs.snowflake.com/en/user-guide/interactive)
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
@@ -323,7 +405,8 @@ open dist/Unistore\ Benchmark.app
 
 ## 🤝 Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for
+guidelines.
 
 ## 📄 License
 

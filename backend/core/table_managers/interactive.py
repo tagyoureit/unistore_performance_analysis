@@ -1,80 +1,26 @@
 """
-Interactive Table Manager (Placeholder)
+Interactive Table Manager
 
 Manages Snowflake interactive tables.
+
+Interactive tables are standard tables with CLUSTER BY. This manager
+inherits from StandardTableManager since the underlying operations are identical.
 """
 
 import logging
-from typing import Dict, Any
 
-from backend.core.table_managers.base import TableManager
-from backend.models.test_config import TableConfig
+from backend.core.table_managers.standard import StandardTableManager
 
 logger = logging.getLogger(__name__)
 
 
-class InteractiveTableManager(TableManager):
+class InteractiveTableManager(StandardTableManager):
     """
     Manages Snowflake interactive tables.
 
-    NOTE: Interactive tables are currently in preview and require:
-    - Interactive warehouse
-    - CLUSTER BY clause (required)
-    - Specific query patterns for optimal performance
-
-    This is a placeholder implementation until interactive tables
-    are generally available.
+    Interactive tables are standard tables with automatic clustering.
+    This manager inherits all functionality from StandardTableManager.
     """
-
-    def __init__(self, config: TableConfig):
-        """Initialize interactive table manager."""
-        super().__init__(config)
-
-        # Validate config
-        if not config.cluster_by:
-            raise ValueError("Interactive tables require CLUSTER BY columns")
-
-        logger.warning(
-            "Interactive tables are in preview. This implementation is a placeholder."
-        )
-
-    async def create_table(self) -> bool:
-        """Create interactive table (placeholder)."""
-        logger.error(
-            "Interactive tables are not yet fully supported. "
-            "Please use standard or hybrid tables."
-        )
-        return False
-
-    async def drop_table(self) -> bool:
-        """Drop interactive table (placeholder)."""
-        logger.error("Interactive tables are not yet fully supported.")
-        return False
-
-    async def truncate_table(self) -> bool:
-        """Truncate interactive table (placeholder)."""
-        logger.error("Interactive tables are not yet fully supported.")
-        return False
-
-    async def populate_data(self, row_count: int) -> bool:
-        """Populate interactive table (placeholder)."""
-        logger.error("Interactive tables are not yet fully supported.")
-        return False
-
-    async def get_table_stats(self) -> Dict[str, Any]:
-        """Get interactive table stats (placeholder)."""
-        return {
-            "error": "Interactive tables are not yet fully supported",
-            "status": "preview",
-        }
-
-    async def table_exists(self) -> bool:
-        """Check if interactive table exists (placeholder)."""
-        return False
-
-    async def validate_schema(self) -> bool:
-        """Validate interactive table schema (placeholder)."""
-        return False
 
 
 # Future implementation notes:

@@ -103,11 +103,51 @@ main {
   margin-bottom: 1.5rem;
 }
 
+.card-compact {
+  padding: 1rem 1.25rem;
+}
+
 .card-title {
   font-size: 1.25rem;
   font-weight: 600;
   margin-bottom: 1rem;
   color: var(--text-dark);
+}
+
+.card-title--compact {
+  font-size: 1.05rem;
+  margin-bottom: 0.5rem;
+}
+
+.card-collapsible {
+  padding: 0;
+}
+
+.card-collapsible__summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 1rem 1.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.card-collapsible__summary::-webkit-details-marker {
+  display: none;
+}
+
+.card-collapsible__summary::after {
+  content: "▸";
+  color: var(--text-light);
+  font-size: 0.9rem;
+}
+
+.card-collapsible[open] .card-collapsible__summary::after {
+  content: "▾";
+}
+
+.card-collapsible__body {
+  padding: 0 1.25rem 1.25rem;
 }
 
 .dashboard-top-grid {
@@ -128,6 +168,14 @@ main {
   margin-bottom: 2rem;
 }
 
+.metrics-grid-spacer {
+  background: transparent;
+  box-shadow: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
 .filters-grid {
   display: grid;
   grid-template-columns: 1fr;
@@ -135,9 +183,22 @@ main {
   margin-bottom: 1rem;
 }
 
+.filters-custom-range {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  grid-column: 1 / -1;
+}
+
 @media (min-width: 768px) {
   .filters-grid {
     grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+@media (max-width: 767px) {
+  .filters-custom-range {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -151,6 +212,10 @@ main {
 
 .metric-card.success {
   background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+}
+
+.metric-card.info {
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
 }
 
 .metric-card.warning {

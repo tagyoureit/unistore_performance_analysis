@@ -61,7 +61,9 @@ function templatesManager() {
       if (t === "STANDARD") {
         return "/static/img/table_standard.svg";
       }
-      // INTERACTIVE: blank for now (per Russ request)
+      if (t === "INTERACTIVE") {
+        return "/static/img/table_interactive.svg";
+      }
       return "";
     },
 
