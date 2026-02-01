@@ -110,7 +110,11 @@ window.DashboardMixins.dataLoading = {
         this.stopProcessingLogTimer();
       }
 
-      if (data.enrichment_status === "PENDING") {
+      const wsOpen = this.websocket && this.websocket.readyState === 1;
+      const shouldPollEnrichment =
+        data.enrichment_status === "PENDING" &&
+        (this.mode === "history" || !wsOpen);
+      if (shouldPollEnrichment) {
         this.startEnrichmentPolling();
       } else {
         this.stopEnrichmentPolling();
@@ -120,7 +124,7 @@ window.DashboardMixins.dataLoading = {
         this.updateLiveTransport();
       }
 
-      // Active phases where polling and warehouse details are needed
+      // Active phases where metrics polling + warehouse details are needed
       const activePhases = ["WARMUP", "MEASUREMENT"];
 
       if (this.mode === "live") {
@@ -128,11 +132,9 @@ window.DashboardMixins.dataLoading = {
           typeof this.shouldUseWebSocket === "function"
             ? this.shouldUseWebSocket()
             : false;
-        // When WebSocket is active, it handles both metrics and logs - no HTTP polling needed
         const shouldPollMetrics =
           !shouldUseWebSocket && activePhases.includes(phaseUpper);
-        const shouldPollLogs =
-          !shouldUseWebSocket && activePhases.includes(phaseUpper);
+        const shouldPollLogs = false;
         if (shouldPollMetrics) {
           this.startMultiNodeMetricsPolling();
         } else {
@@ -179,7 +181,7 @@ window.DashboardMixins.dataLoading = {
 
       // Load warehouse details only during active phases to avoid 404 errors
       // before the test starts running.
-      if (activePhases.includes(phaseUpper)) {
+      if (activePhases.includes(phaseUpper) && (this.mode === "history" || !wsOpen)) {
         this.loadWarehouseDetails();
       }
       // History view: load aggregated error summary (Snowflake query history + local errors).
@@ -448,6 +450,13 @@ window.DashboardMixins.dataLoading = {
     } finally {
       this.warehouseDetailsLoading = false;
     }
+  },
+
+  applyWarehouseDetails(payload) {
+    if (!payload || typeof payload !== "object") return;
+    this.warehouseDetails = payload || null;
+    this.warehouseDetailsLoading = false;
+    this.warehouseDetailsError = null;
   },
 
   async loadErrorSummary() {

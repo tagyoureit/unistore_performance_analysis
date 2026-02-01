@@ -213,7 +213,7 @@ async def test_poll_loop_guardrail_emits_stop(monkeypatch):
         status="RUNNING",
         phase="WARMUP",
         start_time=None,
-        heartbeat_row=(1, 1, 0, 0, None, 90.0, 10.0),
+        heartbeat_row=(1, 1, 0, 0, 0, None, 90.0, 10.0),
     )
     svc = OrchestratorService()
     svc._pool = pool
@@ -260,7 +260,7 @@ async def test_poll_loop_duration_emits_stop(monkeypatch):
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=start_time,
-        heartbeat_row=(1, 1, 0, 0, None, None, None),
+        heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
     svc = OrchestratorService()
@@ -307,7 +307,7 @@ async def test_poll_loop_rollup_updates_run_status(monkeypatch):
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=None,
-        heartbeat_row=(2, 2, 0, 0, heartbeat_updated_at, None, None),
+        heartbeat_row=(2, 2, 0, 0, 0, heartbeat_updated_at, None, None),
         metrics_row=(100, 2, 12.5, 50, latest_ts),
     )
     svc = OrchestratorService()
@@ -347,7 +347,7 @@ async def test_poll_loop_bounded_qps_completes_on_bounds_limit(monkeypatch):
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=None,
-        heartbeat_row=(2, 2, 0, 0, heartbeat_updated_at, None, None),
+        heartbeat_row=(2, 2, 0, 0, 0, heartbeat_updated_at, None, None),
         metrics_row=(100, 0, 80.0, 20, latest_ts),
     )
     svc = OrchestratorService()
@@ -470,7 +470,7 @@ async def test_poll_loop_duration_includes_warmup(monkeypatch):
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=start_time,
-        heartbeat_row=(1, 1, 0, 0, None, None, None),
+        heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
     svc = OrchestratorService()
@@ -528,7 +528,7 @@ async def test_poll_loop_duration_stops_after_warmup_plus_duration(monkeypatch):
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=start_time,
-        heartbeat_row=(1, 1, 0, 0, None, None, None),
+        heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
     svc = OrchestratorService()
@@ -581,7 +581,7 @@ async def test_poll_loop_warmup_phase_transition(monkeypatch):
         status="RUNNING",
         phase="WARMUP",  # Still in WARMUP phase
         start_time=start_time,
-        heartbeat_row=(1, 1, 0, 0, None, None, None),
+        heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
     svc = OrchestratorService()
@@ -634,7 +634,7 @@ async def test_poll_loop_worker_exit_ends_poll(monkeypatch):
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=datetime.now(UTC),
-        heartbeat_row=(1, 1, 0, 0, None, None, None),
+        heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
     svc = OrchestratorService()

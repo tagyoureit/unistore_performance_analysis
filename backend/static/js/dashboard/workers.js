@@ -65,5 +65,8 @@ window.DashboardMixins.workers = {
       return this.workerLabel(a).localeCompare(this.workerLabel(b));
     });
     this.liveWorkers = normalized;
+    if (typeof this.updateLogTargetsFromWorkers === "function") {
+      this.updateLogTargetsFromWorkers(normalized);
+    }
   },
 };

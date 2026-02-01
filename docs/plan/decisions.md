@@ -75,33 +75,40 @@ See [query-execution-streaming.md](query-execution-streaming.md) for full design
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | Flush interval | 5 seconds | Balance latency vs write overhead |
-| Batch trigger | 1000 records | ~100 QPS/worker × 10s buffer |
+| Flush interval bias | Prefer lower interval if no benchmark impact | Minimize ingest lag |
+| Batch trigger | 1000 records | Headroom above 5s interval; caps buffer to ~10s at 100 QPS/worker |
 | Batch INSERT size | 500 rows | Proven chunk size |
-| Back-pressure threshold | 100,000 records | Fail test if writes can't keep up |
+| Back-pressure threshold | 100,000 records | Back off recording when writes can't keep up |
+| Control warehouse scaling | Auto-scale configured in backend | Avoid manual tuning |
 
 ### Failure Behavior
 
-- **Flush failure**: Raise exception → worker catches → test fails
-- **Shutdown timeout**: 2× p99 latency (minimum 30 seconds)
-- **Buffer overflow**: Fail test immediately when buffer exceeds 100k records
+- **Benchmark priority**: Never throttle benchmark queries for recording.
+- **Flush failure**: Back off recording immediately; benchmark continues; mark run partial.
+- **Shutdown timeout**: Best-effort flush; remaining records dropped and run marked partial.
+- **Buffer overflow**: Back off recording immediately when buffer exceeds 100k records.
 
 ### Sampling Strategy
 
 1. **Never drop errors**: 100% retention for `success=False` records
 2. **Never drop warmup**: 100% retention for warmup phase queries
-3. **Sample measurement queries**: Configurable rate based on QPS
+3. **Sample measurement queries**: Constant per-run rate based on template target QPS (temporary guardrail)
+4. **Phase classification**: Captured at query submit time using latest `RUN_CONTROL_EVENTS.SEQUENCE_ID`
+5. **Standard tables**: Target full capture; fixed sampling remains until ingest headroom is validated
 
-**Sample rate calculation**: OPEN - options under consideration:
-- Option A: Per-worker QPS threshold
-- Option B: Target QPS from template config
-- Option C: Buffer pressure (adaptive)
-- Option D: Hybrid (config + adaptive floor)
+**Sample rate calculation (DECIDED)**:
+- Compute sample rate once at run start from template target QPS and worker count
+- Store on `TEST_RESULTS.SAMPLE_RATE` and apply for the full run
 
 ### Downstream Impact
 
 - **QPS calculations**: Scale by `1/sample_rate`
 - **Error rates**: Errors are 100% captured; scale success count by sample rate
 - **UI**: Show sample rate in test summary + indicator on charts when `sample_rate < 1.0`
+- **Post-test p50/p95/p99 and latency**: Calculated from sampled measurement rows (no scaling on percentiles)
+- **Live dashboard charts**: Unchanged; real-time p50/p95/p99 and QPS use in-memory metrics
+- **Time buckets**: Use Snowflake server time for per-second charts to avoid worker clock skew
+- **Recording backoff**: Post-test stats are partial and must be flagged as incomplete
 
 ### Enrichment
 

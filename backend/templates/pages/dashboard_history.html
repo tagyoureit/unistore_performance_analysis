@@ -7,7 +7,9 @@
 {% block title %}Dashboard History - Unistore Benchmark{% endblock %}
 
 {% block content %}
-<div x-data="dashboard({ mode: 'history' })" data-test-id="{{ test_id or '' }}">
+<div x-data="dashboard({ mode: 'history' })" data-test-id="{{ test_id or '' }}"
+     x-init="$nextTick(() => initFloatingToolbar())"
+>
     <div class="dashboard-top-grid">
         <div class="card" x-show="templateInfo">
             <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
@@ -106,7 +108,7 @@
                 Read-only analysis dashboard. For realtime execution and controls, use the live dashboard.
             </div>
             <div style="margin-top: 0.75rem;">
-                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
                     <a 
                         class="btn btn-primary" 
                         :href="testId ? `/dashboard/${testId}` : '/dashboard'"
@@ -125,6 +127,52 @@
                     </button>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Floating View Controls Toolbar -->
+    <div
+        class="floating-toolbar"
+        :class="{ 'hidden': !floatingToolbarVisible }"
+        x-show="latencyInView || chartsInView"
+        x-cloak
+    >
+        <div class="floating-toolbar-group" x-show="latencyInView">
+            <span class="floating-toolbar-label">Latency</span>
+            <button
+                type="button"
+                class="btn btn-sm"
+                :class="latencyView === 'sf_execution' ? 'btn-primary' : 'btn-secondary'"
+                @click="setLatencyView('sf_execution')"
+                :disabled="!sfLatencyAvailable()"
+            >
+                SQL (Snowflake)
+            </button>
+            <button
+                type="button"
+                class="btn btn-sm"
+                :class="latencyView === 'end_to_end' ? 'btn-primary' : 'btn-secondary'"
+                @click="setLatencyView('end_to_end')"
+            >
+                End-to-end
+            </button>
+        </div>
+
+        <div class="floating-toolbar-divider" x-show="latencyInView && chartsInView && metricsWarmupEndElapsed > 0"></div>
+
+        <div class="floating-toolbar-group" x-show="chartsInView && metricsWarmupEndElapsed != null && metricsWarmupEndElapsed > 0">
+            <span class="floating-toolbar-label">Charts</span>
+            <button
+                type="button"
+                class="btn btn-sm"
+                :class="showWarmup ? 'btn-warning' : 'btn-secondary'"
+                @click="toggleShowWarmup()"
+            >
+                <span x-text="showWarmup ? 'Hide Warmup' : 'Show Warmup'"></span>
+            </button>
+            <span class="floating-toolbar-indicator" :class="{ 'active': showWarmup }">
+                <span x-text="showWarmup ? 'Showing warmup' : 'Measurement only'"></span>
+            </span>
         </div>
     </div>
 
@@ -183,6 +231,8 @@
             </div>
         </div>
     </div>
+
+    {% include "components/latency_sections.html" %}
 
     <div class="ai-analysis-card" x-show="!aiAnalysisModal" x-cloak>
         <div class="ai-analysis-card-content">
@@ -388,8 +438,8 @@
         </div>
     </div>
 
-    {% include "components/latency_sections.html" %}
-
+    <!-- Charts section wrapper for floating toolbar visibility detection -->
+    <div data-section="charts">
 
     <div class="card">
         <div class="card-title">Real-Time Metrics (captured)</div>
@@ -405,6 +455,69 @@
         </div>
         <div style="margin-top: 0.5rem; color: #6b7280;">
             Note: charts are based on end-to-end app timings collected during execution.
+        </div>
+    </div>
+
+    <div class="card">
+        <div style="display:flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+            <div class="card-title" style="margin-bottom: 0;">Operations Per Second (app)</div>
+            <div style="display:flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                <div style="font-weight: 600;">Breakdown:</div>
+                <button
+                    type="button"
+                    class="btn btn-sm"
+                    :class="opsSecBreakdown === 'read_write' ? 'btn-primary' : 'btn-secondary'"
+                    @click="setOpsSecBreakdown('read_write')"
+                >
+                    Read / Write
+                </button>
+                <button
+                    type="button"
+                    class="btn btn-sm"
+                    :class="opsSecBreakdown === 'by_kind' ? 'btn-primary' : 'btn-secondary'"
+                    @click="setOpsSecBreakdown('by_kind')"
+                >
+                    Point / Range / Insert / Update
+                </button>
+            </div>
+        </div>
+        <div style="color: #6b7280; margin-top: 0.5rem;">
+            App-side operations per second breakdown, captured from internal counters during execution.
+        </div>
+        <div class="chart-container" style="margin-top: 0.75rem;">
+            <canvas id="opsSecChart"></canvas>
+        </div>
+    </div>
+
+    <div class="card" x-show="!['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())">
+        <div style="display:flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+            <div class="card-title" style="margin-bottom: 0;">Snowflake Running Queries (Server)</div>
+            <div style="display:flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                <div style="font-weight: 600;">Breakdown:</div>
+                <button
+                    type="button"
+                    class="btn btn-sm"
+                    :class="sfRunningBreakdown === 'read_write' ? 'btn-primary' : 'btn-secondary'"
+                    @click="setSfRunningBreakdown('read_write')"
+                >
+                    Read / Write
+                </button>
+                <button
+                    type="button"
+                    class="btn btn-sm"
+                    :class="sfRunningBreakdown === 'by_kind' ? 'btn-primary' : 'btn-secondary'"
+                    @click="setSfRunningBreakdown('by_kind')"
+                >
+                    Point / Range / Insert / Update
+                </button>
+            </div>
+        </div>
+        <div style="color: #6b7280; margin-top: 0.5rem;">
+            Captured during the run from <code>INFORMATION_SCHEMA.QUERY_HISTORY_BY_WAREHOUSE</code> (per-test <code>QUERY_TAG</code>) and stored in per-second snapshots.
+            "Total" is the sum of benchmark statements (best-effort). If kind tagging is unavailable for a run, the chart falls back to Snowflake's per-test Running total.
+        </div>
+        <div class="chart-container" style="margin-top: 0.75rem;">
+            <canvas id="sfRunningChart"></canvas>
         </div>
     </div>
 
@@ -451,69 +564,6 @@
         </div>
     </div>
 
-    <div class="card" x-show="!['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())">
-        <div style="display:flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
-            <div class="card-title" style="margin-bottom: 0;">Snowflake Running Queries (Server)</div>
-            <div style="display:flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
-                <div style="font-weight: 600;">Breakdown:</div>
-                <button
-                    type="button"
-                    class="btn btn-sm"
-                    :class="sfRunningBreakdown === 'read_write' ? 'btn-primary' : 'btn-secondary'"
-                    @click="setSfRunningBreakdown('read_write')"
-                >
-                    Read / Write
-                </button>
-                <button
-                    type="button"
-                    class="btn btn-sm"
-                    :class="sfRunningBreakdown === 'by_kind' ? 'btn-primary' : 'btn-secondary'"
-                    @click="setSfRunningBreakdown('by_kind')"
-                >
-                    Point / Range / Insert / Update
-                </button>
-            </div>
-        </div>
-        <div style="color: #6b7280; margin-top: 0.5rem;">
-            Captured during the run from <code>INFORMATION_SCHEMA.QUERY_HISTORY_BY_WAREHOUSE</code> (per-test <code>QUERY_TAG</code>) and stored in per-second snapshots.
-            "Total" is the sum of benchmark statements (best-effort). If kind tagging is unavailable for a run, the chart falls back to Snowflake's per-test Running total.
-        </div>
-        <div class="chart-container" style="margin-top: 0.75rem;">
-            <canvas id="sfRunningChart"></canvas>
-        </div>
-    </div>
-
-    <div class="card">
-        <div style="display:flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
-            <div class="card-title" style="margin-bottom: 0;">Operations Per Second (app)</div>
-            <div style="display:flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
-                <div style="font-weight: 600;">Breakdown:</div>
-                <button
-                    type="button"
-                    class="btn btn-sm"
-                    :class="opsSecBreakdown === 'read_write' ? 'btn-primary' : 'btn-secondary'"
-                    @click="setOpsSecBreakdown('read_write')"
-                >
-                    Read / Write
-                </button>
-                <button
-                    type="button"
-                    class="btn btn-sm"
-                    :class="opsSecBreakdown === 'by_kind' ? 'btn-primary' : 'btn-secondary'"
-                    @click="setOpsSecBreakdown('by_kind')"
-                >
-                    Point / Range / Insert / Update
-                </button>
-            </div>
-        </div>
-        <div style="color: #6b7280; margin-top: 0.5rem;">
-            App-side operations per second breakdown, captured from internal counters during execution.
-        </div>
-        <div class="chart-container" style="margin-top: 0.75rem;">
-            <canvas id="opsSecChart"></canvas>
-        </div>
-    </div>
-    
     <div
         class="card"
         x-show="templateInfo && isFinalMetricsReady() && !['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())"
@@ -700,6 +750,8 @@
         </div>
     </div>
 
+    </div><!-- end data-section="charts" wrapper -->
+
     <div class="card" x-show="metrics.resources_available">
         <div
             style="display:flex; align-items: center; justify-content: space-between; gap: 0.75rem; cursor: pointer;"
@@ -884,9 +936,76 @@
             </div>
         </div>
     </div>
+
+    <div class="card" x-show="mode === 'history'">
+        <div class="card-title">Run Logs</div>
+
+        <div
+            class="form-group"
+            x-show="logTargets && logTargets.length"
+            style="margin-bottom: 0.75rem;"
+        >
+            <label class="form-label">Source</label>
+            <select class="form-select" x-model="logSelectedTargetId" @change="onLogTargetChange()">
+                <template x-for="target in logTargets" :key="target.target_id || target.test_id">
+                    <option
+                        :value="target.target_id || target.test_id"
+                        x-text="target.label || target.worker_id || target.test_id"
+                    ></option>
+                </template>
+            </select>
+        </div>
+
+        <div class="log-controls">
+            <div class="log-control">
+                <label class="form-label">Level</label>
+                <select class="form-select" x-model="logLevelFilter">
+                    <template x-for="opt in logLevelOptions()" :key="opt.value">
+                        <option :value="opt.value" x-text="opt.label"></option>
+                    </template>
+                </select>
+            </div>
+            <div class="log-control log-control-toggle">
+                <label class="form-label">
+                    <input type="checkbox" class="form-checkbox" x-model="logVerboseMode">
+                    Verbose mode
+                </label>
+            </div>
+        </div>
+
+        <div
+            class="alert alert-error"
+            x-show="(status || '').toUpperCase() === 'FAILED'"
+        >
+            Test failed. See logs below.
+        </div>
+
+        <div class="log-output">
+            <template x-if="filteredLogs().length === 0">
+                <div class="log-empty">No logs yet.</div>
+            </template>
+            <template x-for="log in filteredLogs()" :key="log.log_id">
+                <div class="log-line">
+                    <span class="log-ts" x-text="formatLogTimestamp(log.timestamp)"></span>
+                    <span class="log-level" :class="logLineLevelClass(log.level)" x-text="(log.level || 'INFO').toUpperCase()"></span>
+                    <button
+                        type="button"
+                        :class="logWorkerBadgeClass(log.worker_id)"
+                        @click="setLogWorkerFilter(_normalizeWorkerId(log.worker_id))"
+                        x-text="_normalizeWorkerId(log.worker_id)"
+                    ></button>
+                    <span class="log-logger" x-text="formatLogLogger(log.logger)"></span>
+                    <span class="log-sep">-</span>
+                    <span class="log-message" x-text="log.message"></span>
+                    <template x-if="log.exception">
+                        <pre class="log-exception" x-text="log.exception"></pre>
+                    </template>
+                </div>
+            </template>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
 {% block extra_scripts %}{% endblock %}
-
 

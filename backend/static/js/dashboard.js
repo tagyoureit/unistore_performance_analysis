@@ -70,6 +70,10 @@ function dashboard(opts) {
         this.debug = false;
       }
 
+      if (typeof this.initLogControls === "function") {
+        this.initLogControls();
+      }
+
       this.initCharts();
 
       const el = this.$el;
@@ -86,8 +90,9 @@ function dashboard(opts) {
         this.testId = initialTestId;
         this.loadTestInfo();
         if (this.mode === "live") {
-          this.loadLogs();
           this.updateLiveTransport();
+        } else if (this.mode === "history") {
+          this.loadLogs();
         }
       }
 
@@ -1115,6 +1120,18 @@ function dashboard(opts) {
         }
         if (Array.isArray(normalized.workers)) {
           this.updateLiveWorkers(normalized.workers);
+        }
+        if (
+          normalized.enrichment_progress &&
+          typeof this.applyEnrichmentProgress === "function"
+        ) {
+          this.applyEnrichmentProgress(normalized.enrichment_progress);
+        }
+        if (
+          normalized.warehouse_details &&
+          typeof this.applyWarehouseDetails === "function"
+        ) {
+          this.applyWarehouseDetails(normalized.warehouse_details);
         }
         payload = normalized;
         if ("latency_aggregation_method" in payload) {

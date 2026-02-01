@@ -35,7 +35,8 @@
 | 16 | 2857-2920 | Build query (SQL + params) | CPU | <1ms | No |
 | 17 | **2928** | **FIRST SNOWFLAKE QUERY** | **SF Query** | **1-100ms+** | N/A |
 
-**Total overhead (before first query): ~213-313ms**
+### Total overhead (before first query): ~213-313ms
+
 - CPU operations: ~14ms
 - Required SF queries: ~200-400ms (Heartbeat + TEST_RESULTS)
 
@@ -46,9 +47,10 @@
 ### ❌ NOT in the path after `_wait_for_start()` returns
 The overhead is only ~213-313ms, not 7-8 seconds.
 
-### ✅ Likely locations for the 7-8 second delay:
+### ✅ Likely locations for the 7-8 second delay
 
 #### 1. **Pool Initialization (Lines 620-638)**
+
 ```python
 # Lines 620-638: Initialize benchmark pool BEFORE _wait_for_start
 if not is_postgres:
@@ -72,6 +74,7 @@ if not is_postgres:
 - Exception during pool init (falls through to _wait_for_start without init)
 
 #### 2. **The `_wait_for_start()` Loop Itself (Lines 693-769)**
+
 ```python
 # Lines 693-769: Wait for orchestrator to set RUNNING
 async def _wait_for_start(timeout_seconds: int = 120) -> bool:
@@ -88,6 +91,7 @@ async def _wait_for_start(timeout_seconds: int = 120) -> bool:
 - **To measure:** Log entry/exit times of `_wait_for_start()`
 
 #### 3. **Executor Setup (Lines 641-648)**
+
 ```python
 # Lines 641-648: Setup executor (profiling, value pools)
 ok = await executor.setup()
@@ -125,6 +129,7 @@ Long function with many operations before reaching line 620:
 **Status:** Already implemented in the code
 
 **Evidence:**
+
 ```python
 # Lines 620-638
 # =========================================================================
@@ -143,6 +148,7 @@ if not is_postgres:
 ```
 
 **Comment on lines 808-809:**
+
 ```python
 # NOTE: Pool initialization and executor.setup() now happen BEFORE _wait_for_start()
 # to ensure workers are ready when warmup begins (see "CRITICAL" block above).
@@ -157,7 +163,8 @@ This optimization is **already in place**.
 #### 1. Parallelize TEST_RESULTS Insert with Worker Spawn (Save ~100-200ms)
 
 **Current flow (sequential):**
-```
+
+```text
 Line 772: Heartbeat RUNNING (100-200ms)
     ↓
 Lines 779-800: Insert TEST_RESULTS (100-200ms)
@@ -168,7 +175,8 @@ Workers start executing
 ```
 
 **Optimized flow (parallel):**
-```
+
+```text
 Line 772: Heartbeat RUNNING (100-200ms)
     ↓
 Line 877: Spawn workers (~10ms) ← Start immediately
@@ -179,6 +187,7 @@ Lines 779-800: Insert TEST_RESULTS (background, 100-200ms)
 ```
 
 **Implementation:**
+
 ```python
 # Line 772: Required heartbeat
 await _safe_heartbeat("RUNNING")
@@ -227,19 +236,22 @@ executor.status = TestStatus.RUNNING
 #### 2. Batch Heartbeat with TEST_RESULTS Insert (Save ~100ms)
 
 **Current flow:**
-```
+
+```text
 Line 772: Heartbeat RUNNING (100-200ms)
 Lines 779-800: Insert TEST_RESULTS (100-200ms)
 Total: 200-400ms
 ```
 
 **Optimized flow:**
-```
+
+```text
 Combined query: Multi-statement or MERGE (100-200ms)
 Total: 100-200ms
 ```
 
 **Implementation:**
+
 ```python
 # Combine heartbeat + test start in single query
 await results_store.insert_test_start_with_heartbeat(
@@ -412,7 +424,7 @@ Verify pool init is actually running:
 
 ## Conclusion
 
-### Key Findings:
+### Key Findings
 
 1. ✅ **Pool initialization is already optimized** (moved before _wait_for_start())
 2. ✅ **Post-_wait_for_start() overhead is only ~213-313ms**, not 7-8 seconds
@@ -421,14 +433,14 @@ Verify pool init is actually running:
    - In pool initialization (if not actually executing)
    - In setup before pool init (unlikely)
 
-### Next Steps:
+### Next Steps
 
 1. **Add timing instrumentation** to measure exact delays
 2. **If delay is after _wait_for_start():** Implement parallelization optimization
 3. **If delay is in _wait_for_start():** Investigate orchestrator timing
 4. **If delay is in pool init:** Verify pool init code path is executing
 
-### Expected Outcome:
+### Expected Outcome
 
 With timing logs, you'll be able to pinpoint the exact location of the 7-8 second delay and determine if it's:
 - A real performance issue that can be fixed

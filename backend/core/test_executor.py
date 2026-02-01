@@ -898,9 +898,7 @@ class TestExecutor:
         key = (int(worker_id), (kind or "").upper(), (column or "").upper())
         n = int(getattr(self, "_worker_pool_seq", {}).get(key, 0))
         getattr(self, "_worker_pool_seq")[key] = n + 1
-        local_concurrency = int(
-            getattr(self.scenario, "total_threads", 1) or 1
-        )
+        local_concurrency = int(getattr(self.scenario, "total_threads", 1) or 1)
         local_concurrency = max(1, local_concurrency)
         group_id = int(getattr(self.scenario, "worker_group_id", 0) or 0)
         group_count = int(getattr(self.scenario, "worker_group_count", 1) or 1)
@@ -936,6 +934,10 @@ class TestExecutor:
             )
             if load_mode not in {"CONCURRENCY", "QPS", "FIND_MAX_CONCURRENCY"}:
                 load_mode = "CONCURRENCY"
+
+            controller_logger = logging.LoggerAdapter(
+                logger, {"worker_id": "CONTROLLER"}
+            )
 
             logger.info("🚀 Executing test: %s", self.scenario.name)
             if load_mode == "FIND_MAX_CONCURRENCY":
@@ -1015,10 +1017,10 @@ class TestExecutor:
                     if parent_run_id:
                         autoscale_parent_run_id = str(parent_run_id)
 
-                min_workers = int(getattr(self.scenario, "min_threads_per_worker", 1) or 1)
-                max_workers = int(
-                    getattr(self.scenario, "total_threads", 1) or 1
+                min_workers = int(
+                    getattr(self.scenario, "min_threads_per_worker", 1) or 1
                 )
+                max_workers = int(getattr(self.scenario, "total_threads", 1) or 1)
                 min_workers = max(1, min_workers)
                 max_workers = max(1, max_workers)
                 if min_workers > max_workers:
@@ -1417,7 +1419,7 @@ class TestExecutor:
                                 now_live = _live_worker_count()
                                 if last_logged_target != desired:
                                     phase = "WARMUP" if warmup else "RUNNING"
-                                    logger.info(
+                                    controller_logger.info(
                                         "Auto-scale controller (%s): target_sf_running=%d observed_sf_running=%d queued=%d blocked=%d resuming=%d running_workers=%d → %d (live=%d → %d)",
                                         phase,
                                         int(target_sf_running),
@@ -1547,7 +1549,7 @@ class TestExecutor:
                                 now_live = _live_worker_count()
                                 if last_logged_target != desired:
                                     phase = "WARMUP" if warmup else "RUNNING"
-                                    logger.info(
+                                    controller_logger.info(
                                         "QPS controller (%s): target_qps=%.2f observed_qps=%.2f (windowed=%.2f smoothed=%.2f raw=%.2f) running_workers=%d → %d (live=%d → %d)",
                                         phase,
                                         float(current_target_qps),
@@ -1906,7 +1908,7 @@ class TestExecutor:
 
                 # Warmup period (optional, at start_concurrency level)
                 if self.scenario.warmup_seconds > 0:
-                    logger.info(
+                    controller_logger.info(
                         f"FIND_MAX: Warmup for {self.scenario.warmup_seconds}s at {start_cc} workers..."
                     )
                     await _fmc_scale_to(target=start_cc, warmup=True)
@@ -1965,7 +1967,7 @@ class TestExecutor:
                     step_label = f"Step {step_num}" + (
                         " (backoff)" if is_backoff else ""
                     )
-                    logger.info(
+                    controller_logger.info(
                         f"FIND_MAX: {step_label} - Testing {cc} workers for {step_dur}s..."
                     )
 
@@ -1984,7 +1986,7 @@ class TestExecutor:
                     # Settling period when scaling down (backoff) to let system stabilize
                     if is_backoff:
                         settle_seconds = min(5, step_dur // 3)
-                        logger.info(
+                        controller_logger.info(
                             f"FIND_MAX: Settling for {settle_seconds}s after scale-down..."
                         )
                         await asyncio.sleep(settle_seconds)
@@ -2299,7 +2301,7 @@ class TestExecutor:
                     if prev_stable_results:
                         prev = prev_stable_results[-1]
                         comparison_info = f" (vs step {prev.step_num}: {prev.qps:.1f} QPS, p95={prev.p95_latency_ms:.1f}ms)"
-                    logger.info(
+                    controller_logger.info(
                         f"FIND_MAX: {step_label} complete - {cc} workers: {step_qps:.1f} QPS, p95={step_p95_latency:.1f}ms, errors={step_error_rate:.2f}%, stable={stable}{comparison_info}"
                     )
 
@@ -2372,7 +2374,7 @@ class TestExecutor:
                             and best_concurrency < current_cc
                         ):
                             backoff_attempts += 1
-                            logger.info(
+                            controller_logger.info(
                                 f"FIND_MAX: Degradation detected at {current_cc}. Backing off to verify {best_concurrency} is stable..."
                             )
 
@@ -2382,7 +2384,7 @@ class TestExecutor:
                             step_results.append(backoff_result)
 
                             if backoff_result.stable:
-                                logger.info(
+                                controller_logger.info(
                                     f"FIND_MAX: Backoff confirmed - {best_concurrency} workers is stable @ {backoff_result.qps:.1f} QPS"
                                 )
                                 # Try a midpoint between best and failed
@@ -2394,7 +2396,7 @@ class TestExecutor:
                                     midpoint > best_concurrency
                                     and midpoint < current_cc
                                 ):
-                                    logger.info(
+                                    controller_logger.info(
                                         f"FIND_MAX: Trying midpoint {midpoint} workers..."
                                     )
                                     mid_result = await run_step(midpoint)
@@ -2403,14 +2405,14 @@ class TestExecutor:
                                         if mid_result.qps > best_qps:
                                             best_concurrency = midpoint
                                             best_qps = mid_result.qps
-                                            logger.info(
+                                            controller_logger.info(
                                                 f"FIND_MAX: Midpoint {midpoint} is better! New best: {best_qps:.1f} QPS"
                                             )
                                         recovered = True
                                         next_cc = min(
                                             max_cc, int(midpoint) + int(increment)
                                         )
-                                        logger.info(
+                                        controller_logger.info(
                                             "FIND_MAX: Recovery observed at %d workers; continuing search (backoff %d/%d) at %d workers",
                                             midpoint,
                                             backoff_attempts,
@@ -2419,14 +2421,16 @@ class TestExecutor:
                                         )
                                         current_cc = next_cc
                             else:
-                                logger.info(
+                                controller_logger.info(
                                     f"FIND_MAX: Backoff to {best_concurrency} also unstable - stopping"
                                 )
 
                         if recovered:
                             continue
 
-                        logger.info(f"FIND_MAX: Stopping - {step_result.stop_reason}")
+                        controller_logger.info(
+                            f"FIND_MAX: Stopping - {step_result.stop_reason}"
+                        )
                         break
 
                     # Increase concurrency for next step
@@ -2447,7 +2451,7 @@ class TestExecutor:
                     )
                 else:
                     final_reason = "Reached max workers"
-                logger.info(
+                controller_logger.info(
                     f"✅ FIND_MAX complete: Best concurrency = {best_concurrency} workers @ {best_qps:.1f} QPS"
                 )
                 self._find_max_controller_state["completed"] = True
@@ -2465,7 +2469,7 @@ class TestExecutor:
                 )
 
                 # Stop all workers
-                logger.info("Stopping workers...")
+                controller_logger.info("Stopping workers...")
                 self._stop_event.set()
                 await _fmc_stop_all_workers(timeout_seconds=2.0)
 
@@ -2720,9 +2724,7 @@ class TestExecutor:
                     int(updated),
                 )
         except Exception as e:
-            logger.warning(
-                "Failed to update QUERY_TAG on pool connections: %s", str(e)
-            )
+            logger.warning("Failed to update QUERY_TAG on pool connections: %s", str(e))
 
     async def _controlled_worker(
         self,
@@ -4707,7 +4709,7 @@ class TestExecutor:
             start_time=self.start_time or datetime.now(UTC),
             end_time=self.end_time,
             duration_seconds=duration,
-            total_threads=self.scenario.total_threads,
+            concurrent_connections=self.scenario.total_threads,
             total_operations=self.metrics.total_operations,
             read_operations=self.metrics.read_metrics.count,
             write_operations=self.metrics.write_metrics.count,

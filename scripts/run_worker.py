@@ -13,12 +13,17 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from backend.config import settings
 from backend.connectors import snowflake_pool
 from backend.core import results_store
 from backend.core.test_executor import TestExecutor
+from backend.core.test_log_stream import (
+    CURRENT_TEST_ID,
+    CURRENT_WORKER_ID,
+    TestLogQueueHandler,
+)
 from backend.core.test_registry import registry
 from backend.models import Metrics, TableType, TestScenario, TestStatus
 
@@ -545,8 +550,13 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
         logger.info(
             "[benchmark] Pool sizing: total_connections=%d, initial_target=%d, per_worker_cap=%d, "
             "max_workers=%d, initial_pool=%d, overflow=%d, load_mode=%s",
-            total_connections, initial_target, per_worker_cap,
-            max_workers, initial_pool, overflow, load_mode,
+            total_connections,
+            initial_target,
+            per_worker_cap,
+            max_workers,
+            initial_pool,
+            overflow,
+            load_mode,
         )
         bench_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="sf-bench"
@@ -666,6 +676,67 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
 
         task.add_done_callback(_done)
 
+    test_id_str = str(executor.test_id)
+    CURRENT_TEST_ID.set(test_id_str)
+    CURRENT_WORKER_ID.set(cfg.worker_id)
+    log_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+    log_handler = TestLogQueueHandler(test_id=test_id_str, queue=log_queue)
+    logging.getLogger().addHandler(log_handler)
+
+    async def _drain_log_queue() -> None:
+        while True:
+            try:
+                batch: list[dict[str, Any]] = []
+                try:
+                    while len(batch) < 100:
+                        event = log_queue.get_nowait()
+                        batch.append(event)
+                except asyncio.QueueEmpty:
+                    pass
+
+                if batch:
+                    try:
+                        await results_store.insert_test_logs(rows=batch)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to persist %d logs for worker %s: %s",
+                            len(batch),
+                            cfg.worker_id,
+                            exc,
+                        )
+
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                remaining: list[dict[str, Any]] = []
+                try:
+                    while True:
+                        event = log_queue.get_nowait()
+                        remaining.append(event)
+                except asyncio.QueueEmpty:
+                    pass
+                if remaining:
+                    try:
+                        await results_store.insert_test_logs(rows=remaining)
+                    except Exception:
+                        pass
+                raise
+
+    log_drain_task = asyncio.create_task(
+        _drain_log_queue(), name=f"log-drain-{cfg.worker_id}"
+    )
+    _track_task(log_drain_task)
+
+    async def _stop_log_streaming() -> None:
+        if log_drain_task is not None:
+            log_drain_task.cancel()
+            try:
+                await log_drain_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        logging.getLogger().removeHandler(log_handler)
+
     def _metrics_callback(metrics: Metrics) -> None:
         nonlocal current_phase
         custom = dict(metrics.custom_metrics or {})
@@ -749,23 +820,30 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
 
             if now - last_heartbeat_wait >= 1.0:
                 last_heartbeat_wait = now
-                await _safe_heartbeat("READY")  # Stay READY until orchestrator sets RUNNING
+                await _safe_heartbeat(
+                    "READY"
+                )  # Stay READY until orchestrator sets RUNNING
             await asyncio.sleep(0.2)
 
     if run_status_status in {"COMPLETED", "FAILED", "CANCELLED"}:
         logger.warning("Run already terminal (%s); exiting", run_status_status)
         await _safe_heartbeat("COMPLETED")
+        await _stop_log_streaming()
         return 0
 
     logger.info("Calling _wait_for_start (timeout=120s)...")
     if not await _wait_for_start(timeout_seconds=120):
         if terminal_status in {"COMPLETED", "FAILED", "CANCELLED"}:
-            logger.warning("_wait_for_start returned False, terminal_status=%s", terminal_status)
+            logger.warning(
+                "_wait_for_start returned False, terminal_status=%s", terminal_status
+            )
             await _safe_heartbeat("COMPLETED")
+            await _stop_log_streaming()
             return 0
         last_error = "Timeout waiting for START"
         logger.error("_wait_for_start timed out!")
         await _safe_heartbeat("DEAD")
+        await _stop_log_streaming()
         return 3
 
     logger.info("_wait_for_start returned True - starting benchmark execution!")
@@ -873,7 +951,9 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
             for t in tasks:
                 t.cancel()
 
-    logger.info("Scaling to initial target=%d workers (phase=%s)", current_target, current_phase)
+    logger.info(
+        "Scaling to initial target=%d workers (phase=%s)", current_target, current_phase
+    )
     await _scale_to(current_target, warmup=(current_phase == "WARMUP"))
     logger.info("Initial scale complete, entering main event loop")
 
@@ -950,12 +1030,21 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
 
                     if event_type == "STOP":
                         stop_requested = True
-                        exit_status = TestStatus.CANCELLED
+                        # Natural completion (duration_elapsed) = COMPLETED
+                        # User cancellation or other reasons = CANCELLED
+                        reason = event_data.get("reason", "")
+                        exit_status = (
+                            TestStatus.COMPLETED
+                            if reason == "duration_elapsed"
+                            else TestStatus.CANCELLED
+                        )
                         drain_timeout = _coerce_float(
                             event_data.get("drain_timeout_seconds"), default=120.0
                         )
                         logger.info(
-                            "STOP received (drain_timeout=%.1fs)", drain_timeout
+                            "STOP received (reason=%s, drain_timeout=%.1fs)",
+                            reason or "unknown",
+                            drain_timeout,
                         )
                         break  # Exit event loop immediately on STOP
                     elif event_type == "SET_PHASE":
@@ -1067,6 +1156,7 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
                 await metrics_task
             except asyncio.CancelledError:
                 pass
+        await _stop_log_streaming()
 
     executor.status = exit_status
     executor.end_time = datetime.now(UTC)

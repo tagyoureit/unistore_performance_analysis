@@ -96,8 +96,12 @@ window.DashboardMixins.state = function (opts) {
     logs: [],
     _logSeen: {},
     logMaxLines: 1000,
+    logLevelFilter: "INFO",
+    logVerboseMode: false,
+    logWorkerFilter: "",
     logTargets: [],
     logTargetsLoading: false,
+    logSelectedTargetId: null,
     logSelectedTestId: null,
     _logPollIntervalId: null,
     warehouseTs: [],
@@ -110,11 +114,16 @@ window.DashboardMixins.state = function (opts) {
     warehouseTsRetryIntervalMs: 10000,
     warehouseTsRetryTimerId: null,
     warehouseQueueMode: "avg", // 'avg' | 'total'
+    showWarmup: false, // Toggle for including warmup phase in charts
+    metricsWarmupEndElapsed: null, // Global warmup end from /metrics API (for all charts)
+    _metricsSnapshots: [], // Raw metrics snapshots for re-rendering with warmup toggle
+    warehouseTsWarmupEndElapsed: null, // Seconds where warmup ends (for annotation)
     overheadTs: [],
     overheadTsLoading: false,
     overheadTsError: null,
     overheadTsAvailable: false,
     overheadTsLoaded: false,
+    overheadTsWarmupEndElapsed: null, // Seconds where warmup ends (for annotation)
     warehouseDetails: null,
     warehouseDetailsLoading: false,
     warehouseDetailsError: null,
@@ -157,5 +166,10 @@ window.DashboardMixins.state = function (opts) {
     _enrichmentPollIntervalId: null,
     _processingLogIntervalId: null,
     _processingLogStartMs: null,
+    // Floating toolbar visibility state
+    floatingToolbarVisible: false,
+    chartsInView: false,
+    latencyInView: false,
+    _floatingToolbarObserver: null,
   };
 };

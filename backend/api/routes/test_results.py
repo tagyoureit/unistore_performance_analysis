@@ -117,9 +117,16 @@ async def _fetch_run_status(pool: Any, run_id: str) -> dict[str, Any] | None:
     )
     if not rows:
         return None
-    run_id_val, status, phase, start_time, end_time, find_max_state, cancellation_reason, elapsed_secs = (
-        rows[0]
-    )
+    (
+        run_id_val,
+        status,
+        phase,
+        start_time,
+        end_time,
+        find_max_state,
+        cancellation_reason,
+        elapsed_secs,
+    ) = rows[0]
     return {
         "run_id": str(run_id_val or ""),
         "status": str(status or "").upper() or None,
@@ -127,7 +134,9 @@ async def _fetch_run_status(pool: Any, run_id: str) -> dict[str, Any] | None:
         "start_time": start_time,
         "end_time": end_time,
         "find_max_state": find_max_state,
-        "cancellation_reason": str(cancellation_reason) if cancellation_reason else None,
+        "cancellation_reason": str(cancellation_reason)
+        if cancellation_reason
+        else None,
         "elapsed_seconds": float(elapsed_secs) if elapsed_secs is not None else None,
     }
 
@@ -1229,6 +1238,50 @@ async def run_from_template(template_id: str) -> RunTemplateResponse:
         raise http_exception("create run from template", e)
 
 
+@router.post(
+    "/from-template/{template_id}/autoscale",
+    response_model=RunTemplateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def run_from_template_autoscale(template_id: str) -> RunTemplateResponse:
+    """Create a new autoscale run from template via OrchestratorService.
+
+    Legacy endpoint retained for UI compatibility. FIXED scaling mode is rejected.
+    """
+    try:
+        template = await registry._load_template(template_id)
+        template_config = dict(template.get("config") or {})
+        scaling_cfg = dict(template_config.get("scaling") or {})
+        scaling_mode = str(scaling_cfg.get("mode") or "").strip().upper()
+        if scaling_mode == "FIXED":
+            raise HTTPException(
+                status_code=400,
+                detail="FIXED scaling mode is not allowed for autoscale endpoint",
+            )
+
+        template_name = str(template.get("template_name") or "")
+        scenario = registry._scenario_from_template_config(
+            template_name, template_config
+        )
+        run_id = await orchestrator.create_run(
+            template_id=str(template.get("template_id") or template_id),
+            template_config=template_config,
+            scenario=scenario,
+        )
+        return RunTemplateResponse(
+            test_id=run_id,
+            dashboard_url=f"/dashboard/{run_id}",
+        )
+    except HTTPException:
+        raise
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise http_exception("create autoscale run from template", e)
+
+
 @router.post("/{test_id}/start-autoscale", status_code=status.HTTP_202_ACCEPTED)
 async def start_autoscale_test(test_id: str) -> dict[str, Any]:
     """Start a prepared run via OrchestratorService.
@@ -1771,12 +1824,18 @@ async def get_test(test_id: str) -> dict[str, Any]:
             return_exceptions=True,
         )
 
-        rows = initial_results[0] if not isinstance(initial_results[0], Exception) else []
+        rows = (
+            initial_results[0] if not isinstance(initial_results[0], Exception) else []
+        )
         prefetched_run_status = (
-            initial_results[1] if not isinstance(initial_results[1], Exception) else None
+            initial_results[1]
+            if not isinstance(initial_results[1], Exception)
+            else None
         )
         prefetched_enrichment = (
-            initial_results[2] if not isinstance(initial_results[2], Exception) else (None, None)
+            initial_results[2]
+            if not isinstance(initial_results[2], Exception)
+            else (None, None)
         )
 
         if rows:
@@ -1892,9 +1951,7 @@ async def get_test(test_id: str) -> dict[str, Any]:
                         + (running.scenario.warmup_seconds or 0)
                     ),
                     "created_at": running.created_at.isoformat(),
-                    "concurrent_connections": int(
-                        running.scenario.total_threads or 0
-                    ),
+                    "concurrent_connections": int(running.scenario.total_threads or 0),
                     "ops_per_sec": 0.0,
                     "p50_latency": 0.0,
                     "p95_latency": 0.0,
@@ -3101,6 +3158,7 @@ async def get_test_logs(
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     child_test_id: str | None = Query(None),
+    target_id: str | None = Query(None),
 ) -> dict[str, Any]:
     """
     Fetch persisted per-test logs (and in-memory logs for running tests).
@@ -3115,9 +3173,11 @@ async def get_test_logs(
         run_id = run_rows[0][0] if run_rows else None
         is_parent = bool(run_id) and str(run_id) == str(test_id)
 
-        workers: list[dict[str, Any]] = []
+        targets: list[dict[str, Any]] = []
         selected_test_id = test_id
+        selected_target_id = str(target_id) if target_id else None
         if is_parent:
+            worker_targets: dict[str, dict[str, Any]] = {}
             child_rows = await pool.execute_query(
                 f"""
                 SELECT TEST_ID, TEST_CONFIG
@@ -3127,6 +3187,19 @@ async def get_test_logs(
                 ORDER BY TEST_ID ASC
                 """,
                 params=[test_id, test_id],
+            )
+            metrics_rows = await pool.execute_query(
+                f"""
+                SELECT DISTINCT
+                    TEST_ID,
+                    WORKER_ID,
+                    WORKER_GROUP_ID,
+                    WORKER_GROUP_COUNT
+                FROM {prefix}.WORKER_METRICS_SNAPSHOTS
+                WHERE RUN_ID = ?
+                ORDER BY TEST_ID ASC
+                """,
+                params=[test_id],
             )
 
             def _parse_test_config(raw: Any) -> dict[str, Any]:
@@ -3153,46 +3226,231 @@ async def get_test_logs(
                     ),
                 }
 
+            def _default_worker_label(
+                worker_id: str | None, group_id: int | None, test_id_val: Any
+            ) -> str:
+                if worker_id:
+                    return worker_id
+                if group_id is not None:
+                    return f"worker-{group_id}"
+                return str(test_id_val)
+
+            def _upsert_worker_target(
+                *,
+                test_id_val: Any,
+                worker_id_val: str | None,
+                group_id_val: int | None,
+                group_count_val: int | None,
+            ) -> None:
+                test_key = str(test_id_val)
+                existing = worker_targets.get(test_key, {})
+                worker_id_norm = str(worker_id_val) if worker_id_val else None
+                group_id_norm = int(group_id_val) if group_id_val is not None else None
+                group_count_norm = (
+                    int(group_count_val) if group_count_val is not None else None
+                )
+                worker_id_final = worker_id_norm or existing.get("worker_id")
+                group_id_final = (
+                    group_id_norm
+                    if group_id_norm is not None
+                    else existing.get("worker_group_id")
+                )
+                group_count_final = (
+                    group_count_norm
+                    if group_count_norm is not None
+                    else existing.get("worker_group_count")
+                )
+                label = _default_worker_label(
+                    worker_id_final, group_id_final, test_id_val
+                )
+                if (
+                    group_count_final
+                    and group_id_final is not None
+                    and group_count_final > 1
+                ):
+                    label = f"{label} (group {group_id_final + 1}/{group_count_final})"
+                worker_targets[test_key] = {
+                    "target_id": f"worker:{test_key}",
+                    "test_id": test_key,
+                    "worker_id": worker_id_final,
+                    "worker_group_id": int(group_id_final or 0),
+                    "worker_group_count": int(group_count_final or 1),
+                    "label": label,
+                    "kind": "worker",
+                }
+
             for child_id, child_cfg in child_rows:
                 ctx = _extract_worker_context(_parse_test_config(child_cfg))
-                worker_id = ctx.get("worker_id")
-                group_id = int(ctx.get("worker_group_id") or 0)
-                group_count = int(ctx.get("worker_group_count") or 1)
-                label = worker_id or str(child_id)
-                if group_count > 1:
-                    label = f"{label} (group {group_id + 1}/{group_count})"
-                workers.append(
-                    {
-                        "test_id": str(child_id),
-                        "worker_id": worker_id,
-                        "worker_group_id": group_id,
-                        "worker_group_count": group_count,
-                        "label": label,
-                    }
+                _upsert_worker_target(
+                    test_id_val=child_id,
+                    worker_id_val=ctx.get("worker_id"),
+                    group_id_val=ctx.get("worker_group_id"),
+                    group_count_val=ctx.get("worker_group_count"),
                 )
 
-            if child_test_id and any(w["test_id"] == child_test_id for w in workers):
+            for (
+                metrics_test_id,
+                metrics_worker_id,
+                metrics_group_id,
+                metrics_group_count,
+            ) in metrics_rows:
+                _upsert_worker_target(
+                    test_id_val=metrics_test_id,
+                    worker_id_val=str(metrics_worker_id) if metrics_worker_id else None,
+                    group_id_val=metrics_group_id,
+                    group_count_val=metrics_group_count,
+                )
+
+            for source in ["ORCHESTRATOR", "CONTROLLER", "UNKNOWN"]:
+                targets.append(
+                    {
+                        "target_id": f"parent:{source}",
+                        "test_id": str(test_id),
+                        "worker_id": source,
+                        "worker_group_id": 0,
+                        "worker_group_count": 1,
+                        "label": source,
+                        "kind": "parent",
+                    }
+                )
+            targets.append(
+                {
+                    "target_id": "all",
+                    "test_id": str(test_id),
+                    "worker_id": None,
+                    "worker_group_id": 0,
+                    "worker_group_count": 1,
+                    "label": "All",
+                    "kind": "all",
+                }
+            )
+
+            worker_items = list(worker_targets.values())
+            worker_items.sort(
+                key=lambda item: (
+                    int(item.get("worker_group_id") or 0),
+                    str(item.get("worker_id") or ""),
+                    str(item.get("test_id") or ""),
+                )
+            )
+            targets.extend(worker_items)
+
+            selected_target = None
+            if selected_target_id:
+                selected_target = next(
+                    (t for t in targets if t.get("target_id") == selected_target_id),
+                    None,
+                )
+
+            if selected_target:
+                if selected_target.get("kind") == "worker":
+                    selected_test_id = selected_target.get("test_id") or test_id
+                else:
+                    selected_test_id = test_id
+            elif child_test_id and any(
+                t.get("test_id") == child_test_id for t in worker_targets.values()
+            ):
                 selected_test_id = child_test_id
-            elif workers:
-                selected_test_id = workers[0]["test_id"]
             else:
                 selected_test_id = test_id
 
         # Prefer in-memory logs for running/prepared tests so refreshes don't lose context.
-        running = await registry.get(selected_test_id)
-        if running is not None and running.log_buffer:
-            logs = list(running.log_buffer)
-            logs.sort(key=lambda r: int(r.get("seq") or 0))
+        selected_kind = None
+        if selected_target_id:
+            selected_kind = next(
+                (
+                    t.get("kind")
+                    for t in targets
+                    if t.get("target_id") == selected_target_id
+                ),
+                None,
+            )
+        if selected_kind != "all":
+            running = await registry.get(selected_test_id)
+            if running is not None and running.log_buffer:
+                logs = list(running.log_buffer)
+                logs.sort(key=lambda r: int(r.get("seq") or 0))
+                return {
+                    "test_id": test_id,
+                    "selected_test_id": selected_test_id,
+                    "targets": targets,
+                    "workers": targets,
+                    "logs": logs[offset : offset + limit],
+                }
+        if is_parent and selected_kind == "all":
+            test_ids = [str(test_id)]
+            for item in targets:
+                if item.get("kind") == "worker":
+                    tid = str(item.get("test_id") or "")
+                    if tid and tid not in test_ids:
+                        test_ids.append(tid)
+            if not test_ids:
+                return {
+                    "test_id": test_id,
+                    "selected_test_id": selected_test_id,
+                    "targets": targets,
+                    "workers": targets,
+                    "logs": [],
+                }
+            placeholders = ", ".join(["?"] * len(test_ids))
+            query = f"""
+            SELECT
+                LOG_ID,
+                TEST_ID,
+                WORKER_ID,
+                SEQ,
+                TIMESTAMP,
+                LEVEL,
+                LOGGER,
+                MESSAGE,
+                EXCEPTION
+            FROM {prefix}.TEST_LOGS
+            WHERE TEST_ID IN ({placeholders})
+            ORDER BY TIMESTAMP ASC, SEQ ASC
+            LIMIT ? OFFSET ?
+            """
+            rows = await pool.execute_query(query, params=[*test_ids, limit, offset])
+            logs: list[dict[str, Any]] = []
+            for row in rows:
+                (
+                    log_id,
+                    test_id_db,
+                    worker_id,
+                    seq,
+                    ts,
+                    level,
+                    logger_name,
+                    message,
+                    exc,
+                ) = row
+                logs.append(
+                    {
+                        "kind": "log",
+                        "log_id": log_id,
+                        "test_id": test_id_db,
+                        "worker_id": str(worker_id) if worker_id else None,
+                        "seq": int(seq or 0),
+                        "timestamp": ts.isoformat()
+                        if hasattr(ts, "isoformat")
+                        else str(ts),
+                        "level": level,
+                        "logger": logger_name,
+                        "message": message,
+                        "exception": exc,
+                    }
+                )
             return {
                 "test_id": test_id,
                 "selected_test_id": selected_test_id,
-                "workers": workers,
-                "logs": logs[offset : offset + limit],
+                "targets": targets,
+                "workers": targets,
+                "logs": logs,
             }
         query = f"""
         SELECT
             LOG_ID,
             TEST_ID,
+            WORKER_ID,
             SEQ,
             TIMESTAMP,
             LEVEL,
@@ -3211,6 +3469,7 @@ async def get_test_logs(
             (
                 log_id,
                 test_id_db,
+                worker_id,
                 seq,
                 ts,
                 level,
@@ -3223,6 +3482,7 @@ async def get_test_logs(
                     "kind": "log",
                     "log_id": log_id,
                     "test_id": test_id_db,
+                    "worker_id": str(worker_id) if worker_id else None,
                     "seq": int(seq or 0),
                     "timestamp": ts.isoformat()
                     if hasattr(ts, "isoformat")
@@ -3237,7 +3497,8 @@ async def get_test_logs(
         return {
             "test_id": test_id,
             "selected_test_id": selected_test_id,
-            "workers": workers,
+            "targets": targets,
+            "workers": targets,
             "logs": logs,
         }
     except Exception as e:
@@ -3314,6 +3575,8 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                         active_connections: int
                         target_workers: int
                         custom_metrics: list[Any]
+                        has_warmup: bool
+                        has_measurement: bool
 
                     buckets: dict[float, _Bucket] = {}
                     for (
@@ -3329,7 +3592,9 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                         phase,
                     ) in worker_rows:
                         phase_value = str(phase or "").strip().upper()
-                        if phase_value and phase_value != "MEASUREMENT":
+                        is_warmup = phase_value == "WARMUP"
+                        is_measurement = phase_value == "MEASUREMENT"
+                        if phase_value and phase_value not in ("WARMUP", "MEASUREMENT"):
                             continue
                         try:
                             # Aggregate to whole-second buckets for history charts.
@@ -3348,8 +3613,14 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                                 active_connections=0,
                                 target_workers=0,
                                 custom_metrics=[],
+                                has_warmup=is_warmup,
+                                has_measurement=is_measurement,
                             )
                             buckets[bucket] = agg
+                        if is_warmup:
+                            agg.has_warmup = True
+                        if is_measurement:
+                            agg.has_measurement = True
                         if timestamp and agg.timestamp and timestamp < agg.timestamp:
                             agg.timestamp = timestamp
                         agg.elapsed_seconds = max(
@@ -3359,8 +3630,12 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                         agg.p50_latency_ms.append(float(p50 or 0))
                         agg.p95_latency_ms.append(float(p95 or 0))
                         agg.p99_latency_ms.append(float(p99 or 0))
-                        agg.active_connections += int(active_connections or 0)
-                        agg.target_workers += int(target_connections or 0)
+                        agg.active_connections = max(
+                            agg.active_connections, int(active_connections or 0)
+                        )
+                        agg.target_workers = max(
+                            agg.target_workers, int(target_connections or 0)
+                        )
                         if custom_metrics:
                             agg.custom_metrics.append(custom_metrics)
 
@@ -3435,6 +3710,7 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                             "warehouse": _sum_dicts(warehouse_list),
                             "resources": _avg_dicts(resources_list),
                         }
+                        is_warmup_bucket = agg.has_warmup
                         aggregated_rows.append(
                             (
                                 agg.timestamp,
@@ -3446,23 +3722,42 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                                 agg.active_connections,
                                 agg.target_workers,
                                 custom_agg,
+                                is_warmup_bucket,
                             )
                         )
-                    rows = sorted(aggregated_rows, key=lambda item: item[0] or "")
+                    rows = sorted(aggregated_rows, key=lambda item: item[1] or 0)
 
         snapshots = []
+        warmup_end_elapsed_seconds: float | None = None
         for row in rows:
-            (
-                timestamp,
-                elapsed,
-                ops_per_sec,
-                p50,
-                p95,
-                p99,
-                active_connections,
-                target_workers,
-                custom_metrics,
-            ) = row
+            is_warmup = False
+            if len(row) == 10:
+                (
+                    timestamp,
+                    elapsed,
+                    ops_per_sec,
+                    p50,
+                    p95,
+                    p99,
+                    active_connections,
+                    target_workers,
+                    custom_metrics,
+                    is_warmup,
+                ) = row
+                if not is_warmup and warmup_end_elapsed_seconds is None:
+                    warmup_end_elapsed_seconds = float(elapsed or 0)
+            else:
+                (
+                    timestamp,
+                    elapsed,
+                    ops_per_sec,
+                    p50,
+                    p95,
+                    p99,
+                    active_connections,
+                    target_workers,
+                    custom_metrics,
+                ) = row
 
             # Optional: attach Snowflake server-side concurrency series (captured in
             # METRICS_SNAPSHOTS.CUSTOM_METRICS by the executor).
@@ -3593,6 +3888,7 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                     "resources_cgroup_memory_percent": _to_float(
                         resources.get("cgroup_memory_percent")
                     ),
+                    "warmup": bool(is_warmup),
                 }
             )
 
@@ -3601,6 +3897,7 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
             "snapshots": snapshots,
             "count": len(snapshots),
             "latency_aggregation_method": latency_aggregation_method,
+            "warmup_end_elapsed_seconds": warmup_end_elapsed_seconds,
         }
     except Exception as e:
         raise http_exception("get test metrics", e)
@@ -3835,24 +4132,30 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
 
         if is_parent:
             query = f"""
-            WITH tr AS (
+            WITH query_bounds AS (
+                -- Get first query time (warmup or measurement) and last measurement query time
+                -- Also get measurement start time for warmup boundary
                 SELECT
-                    MIN(START_TIME) AS MIN_START,
-                    MAX(DATEADD('second', COALESCE(DURATION_SECONDS, 0), START_TIME)) AS MAX_END
-                FROM {prefix}.TEST_RESULTS
-                WHERE RUN_ID = ?
-                  AND TEST_ID <> ?
+                    MIN(DATE_TRUNC('second', qe.START_TIME)) AS FIRST_QUERY_SECOND,
+                    MAX(DATE_TRUNC('second', qe.START_TIME)) AS LAST_QUERY_SECOND,
+                    MIN(CASE WHEN COALESCE(qe.WARMUP, FALSE) = FALSE THEN DATE_TRUNC('second', qe.START_TIME) END) AS FIRST_MEASUREMENT_SECOND
+                FROM {prefix}.QUERY_EXECUTIONS qe
+                JOIN {prefix}.TEST_RESULTS t ON t.TEST_ID = qe.TEST_ID
+                WHERE t.RUN_ID = ?
+                  AND t.TEST_ID <> ?
             ),
             seconds AS (
                 SELECT
-                    DATEADD('second', g.SEQ, DATE_TRUNC('second', tr.MIN_START)) AS SECOND,
-                    g.SEQ AS ELAPSED_SECONDS
-                FROM tr
+                    DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) AS SECOND,
+                    g.SEQ AS ELAPSED_SECONDS,
+                    CASE WHEN DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) < qb.FIRST_MEASUREMENT_SECOND THEN TRUE ELSE FALSE END AS IS_WARMUP,
+                    DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.FIRST_MEASUREMENT_SECOND) AS WARMUP_END_ELAPSED
+                FROM query_bounds qb
                 JOIN (
                     SELECT SEQ4() AS SEQ
                     FROM TABLE(GENERATOR(ROWCOUNT => 86400))
                 ) g
-                  ON g.SEQ <= DATEDIFF('second', tr.MIN_START, tr.MAX_END)
+                  ON g.SEQ <= DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.LAST_QUERY_SECOND)
             ),
             child_ids AS (
                 SELECT TEST_ID
@@ -3899,35 +4202,42 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                 COALESCE(
                     COALESCE(wh.TOTAL_QUEUE_PROVISIONING_MS, 0) / NULLIF(wh.QUERIES_STARTED, 0),
                     0
-                ) AS AVG_QUEUE_PROVISIONING_MS
+                ) AS AVG_QUEUE_PROVISIONING_MS,
+                s.IS_WARMUP,
+                s.WARMUP_END_ELAPSED
             FROM seconds s
             LEFT JOIN wh_data wh ON wh.SECOND = s.SECOND
             LEFT JOIN poller_clusters pc ON pc.SECOND = s.SECOND
             ORDER BY s.SECOND ASC
             """
             rows = await pool.execute_query(
-                query, params=[test_id, test_id, test_id, test_id, test_id]
+                query,
+                params=[test_id, test_id, test_id, test_id, test_id],
             )
         else:
             query = f"""
-            WITH tr AS (
+            WITH query_bounds AS (
+                -- Get first query time (warmup or measurement) and last query time
+                -- Also get measurement start time for warmup boundary
                 SELECT
-                    TEST_ID,
-                    DATE_TRUNC('second', START_TIME) AS START_SECOND,
-                    COALESCE(DURATION_SECONDS, DATEDIFF('second', START_TIME, END_TIME)) AS DURATION_SECONDS
-                FROM {prefix}.TEST_RESULTS
+                    MIN(DATE_TRUNC('second', START_TIME)) AS FIRST_QUERY_SECOND,
+                    MAX(DATE_TRUNC('second', START_TIME)) AS LAST_QUERY_SECOND,
+                    MIN(CASE WHEN COALESCE(WARMUP, FALSE) = FALSE THEN DATE_TRUNC('second', START_TIME) END) AS FIRST_MEASUREMENT_SECOND
+                FROM {prefix}.QUERY_EXECUTIONS
                 WHERE TEST_ID = ?
             ),
             seconds AS (
                 SELECT
-                    DATEADD('second', g.SEQ, tr.START_SECOND) AS SECOND,
-                    g.SEQ AS ELAPSED_SECONDS
-                FROM tr
+                    DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) AS SECOND,
+                    g.SEQ AS ELAPSED_SECONDS,
+                    CASE WHEN DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) < qb.FIRST_MEASUREMENT_SECOND THEN TRUE ELSE FALSE END AS IS_WARMUP,
+                    DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.FIRST_MEASUREMENT_SECOND) AS WARMUP_END_ELAPSED
+                FROM query_bounds qb
                 JOIN (
                     SELECT SEQ4() AS SEQ
                     FROM TABLE(GENERATOR(ROWCOUNT => 86400))
                 ) g
-                  ON g.SEQ <= COALESCE(tr.DURATION_SECONDS, 0)
+                  ON g.SEQ <= DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.LAST_QUERY_SECOND)
             ),
             realtime_clusters AS (
                 SELECT
@@ -3957,7 +4267,9 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                 COALESCE(
                     COALESCE(wt.TOTAL_QUEUE_PROVISIONING_MS, 0) / NULLIF(wt.QUERIES_STARTED, 0),
                     0
-                ) AS AVG_QUEUE_PROVISIONING_MS
+                ) AS AVG_QUEUE_PROVISIONING_MS,
+                s.IS_WARMUP,
+                s.WARMUP_END_ELAPSED
             FROM seconds s
             LEFT JOIN {prefix}.V_WAREHOUSE_TIMESERIES wt
               ON wt.TEST_ID = ?
@@ -3970,6 +4282,7 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
 
         points: list[dict[str, Any]] = []
         has_data = False
+        warmup_end_elapsed: int | None = None
         for row in rows:
             (
                 ts,
@@ -3981,13 +4294,18 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                 total_provisioning_ms,
                 avg_overload_ms,
                 avg_provisioning_ms,
+                is_warmup,
+                warmup_end,
             ) = row
+
+            if warmup_end_elapsed is None and warmup_end is not None:
+                warmup_end_elapsed = int(warmup_end)
 
             active_clusters_i = int(active_clusters or 0)
             realtime_clusters_i = int(realtime_clusters or 0)
-            # Prefer poller data (realtime_clusters) when available - it's from SHOW WAREHOUSES
-            # and is accurate. Fall back to query-derived active_clusters only if no poller data.
-            best_clusters = realtime_clusters_i if realtime_clusters_i > 0 else active_clusters_i
+            best_clusters = (
+                realtime_clusters_i if realtime_clusters_i > 0 else active_clusters_i
+            )
             queries_started_i = int(queries_started or 0)
             total_overload_f = _to_float_or_none(total_overload_ms) or 0.0
             total_provisioning_f = _to_float_or_none(total_provisioning_ms) or 0.0
@@ -4013,6 +4331,7 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                     "avg_queue_overload_ms": _to_float_or_none(avg_overload_ms) or 0.0,
                     "avg_queue_provisioning_ms": _to_float_or_none(avg_provisioning_ms)
                     or 0.0,
+                    "warmup": bool(is_warmup),
                 }
             )
 
@@ -4021,6 +4340,7 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
             "test_id": test_id,
             "available": available,
             "points": points if available else [],
+            "warmup_end_elapsed_seconds": warmup_end_elapsed,
         }
     except Exception as e:
         logger.debug("Failed to load warehouse timeseries for %s: %s", test_id, e)
@@ -4053,24 +4373,30 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
 
         if is_parent:
             query = f"""
-            WITH tr AS (
+            WITH query_bounds AS (
+                -- Get first query time (warmup or measurement) and last query time
+                -- Also get measurement start time for warmup boundary
                 SELECT
-                    MIN(START_TIME) AS MIN_START,
-                    MAX(DATEADD('second', COALESCE(DURATION_SECONDS, 0), START_TIME)) AS MAX_END
-                FROM {prefix}.TEST_RESULTS
-                WHERE RUN_ID = ?
-                  AND TEST_ID <> ?
+                    MIN(DATE_TRUNC('second', qe.START_TIME)) AS FIRST_QUERY_SECOND,
+                    MAX(DATE_TRUNC('second', qe.START_TIME)) AS LAST_QUERY_SECOND,
+                    MIN(CASE WHEN COALESCE(qe.WARMUP, FALSE) = FALSE THEN DATE_TRUNC('second', qe.START_TIME) END) AS FIRST_MEASUREMENT_SECOND
+                FROM {prefix}.QUERY_EXECUTIONS qe
+                JOIN {prefix}.TEST_RESULTS t ON t.TEST_ID = qe.TEST_ID
+                WHERE t.RUN_ID = ?
+                  AND t.TEST_ID <> ?
             ),
             seconds AS (
                 SELECT
-                    DATEADD('second', g.SEQ, DATE_TRUNC('second', tr.MIN_START)) AS SECOND,
-                    g.SEQ AS ELAPSED_SECONDS
-                FROM tr
+                    DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) AS SECOND,
+                    g.SEQ AS ELAPSED_SECONDS,
+                    CASE WHEN DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) < qb.FIRST_MEASUREMENT_SECOND THEN TRUE ELSE FALSE END AS IS_WARMUP,
+                    DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.FIRST_MEASUREMENT_SECOND) AS WARMUP_END_ELAPSED
+                FROM query_bounds qb
                 JOIN (
                     SELECT SEQ4() AS SEQ
                     FROM TABLE(GENERATOR(ROWCOUNT => 86400))
                 ) g
-                  ON g.SEQ <= DATEDIFF('second', tr.MIN_START, tr.MAX_END)
+                  ON g.SEQ <= DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.LAST_QUERY_SECOND)
             ),
             per_second AS (
                 SELECT
@@ -4083,12 +4409,12 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                     ) AS P50_OVERHEAD_MS,
                     AVG(qe.APP_ELAPSED_MS) AS AVG_APP_MS,
                     AVG(qe.SF_TOTAL_ELAPSED_MS) AS AVG_SF_TOTAL_MS,
-                    AVG(qe.SF_EXECUTION_MS) AS AVG_SF_EXEC_MS
+                    AVG(qe.SF_EXECUTION_MS) AS AVG_SF_EXEC_MS,
+                    MAX(CASE WHEN COALESCE(qe.WARMUP, FALSE) THEN 1 ELSE 0 END) AS HAS_WARMUP_QUERIES
                 FROM {prefix}.QUERY_EXECUTIONS qe
                 JOIN {prefix}.TEST_RESULTS tr ON tr.TEST_ID = qe.TEST_ID
                 WHERE tr.RUN_ID = ?
                   AND tr.TEST_ID <> ?
-                  AND COALESCE(qe.WARMUP, FALSE) = FALSE
                   AND qe.SUCCESS = TRUE
                 GROUP BY DATE_TRUNC('second', qe.START_TIME)
             ),
@@ -4096,6 +4422,8 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                 SELECT
                     s.SECOND,
                     s.ELAPSED_SECONDS,
+                    s.IS_WARMUP,
+                    s.WARMUP_END_ELAPSED,
                     COALESCE(ps.TOTAL_QUERIES, 0) AS TOTAL_QUERIES,
                     COALESCE(ps.ENRICHED_QUERIES, 0) AS ENRICHED_QUERIES,
                     ps.AVG_OVERHEAD_MS,
@@ -4118,31 +4446,37 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                 P50_OVERHEAD_MS IS NULL AND (PREV_P50_OVERHEAD IS NOT NULL OR NEXT_P50_OVERHEAD IS NOT NULL) AS INTERPOLATED,
                 AVG_APP_MS,
                 AVG_SF_TOTAL_MS,
-                AVG_SF_EXEC_MS
+                AVG_SF_EXEC_MS,
+                IS_WARMUP,
+                WARMUP_END_ELAPSED
             FROM with_lag
             ORDER BY SECOND ASC
             """
             params = [test_id, test_id, test_id, test_id]
         else:
             query = f"""
-            WITH tr AS (
+            WITH query_bounds AS (
+                -- Get first query time (warmup or measurement) and last query time
+                -- Also get measurement start time for warmup boundary
                 SELECT
-                    TEST_ID,
-                    DATE_TRUNC('second', START_TIME) AS START_SECOND,
-                    COALESCE(DURATION_SECONDS, DATEDIFF('second', START_TIME, END_TIME)) AS DURATION_SECONDS
-                FROM {prefix}.TEST_RESULTS
+                    MIN(DATE_TRUNC('second', START_TIME)) AS FIRST_QUERY_SECOND,
+                    MAX(DATE_TRUNC('second', START_TIME)) AS LAST_QUERY_SECOND,
+                    MIN(CASE WHEN COALESCE(WARMUP, FALSE) = FALSE THEN DATE_TRUNC('second', START_TIME) END) AS FIRST_MEASUREMENT_SECOND
+                FROM {prefix}.QUERY_EXECUTIONS
                 WHERE TEST_ID = ?
             ),
             seconds AS (
                 SELECT
-                    DATEADD('second', g.SEQ, tr.START_SECOND) AS SECOND,
-                    g.SEQ AS ELAPSED_SECONDS
-                FROM tr
+                    DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) AS SECOND,
+                    g.SEQ AS ELAPSED_SECONDS,
+                    CASE WHEN DATEADD('second', g.SEQ, qb.FIRST_QUERY_SECOND) < qb.FIRST_MEASUREMENT_SECOND THEN TRUE ELSE FALSE END AS IS_WARMUP,
+                    DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.FIRST_MEASUREMENT_SECOND) AS WARMUP_END_ELAPSED
+                FROM query_bounds qb
                 JOIN (
                     SELECT SEQ4() AS SEQ
                     FROM TABLE(GENERATOR(ROWCOUNT => 86400))
                 ) g
-                  ON g.SEQ <= COALESCE(tr.DURATION_SECONDS, 0)
+                  ON g.SEQ <= DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.LAST_QUERY_SECOND)
             ),
             per_second AS (
                 SELECT
@@ -4158,7 +4492,6 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                     AVG(qe.SF_EXECUTION_MS) AS AVG_SF_EXEC_MS
                 FROM {prefix}.QUERY_EXECUTIONS qe
                 WHERE qe.TEST_ID = ?
-                  AND COALESCE(qe.WARMUP, FALSE) = FALSE
                   AND qe.SUCCESS = TRUE
                 GROUP BY DATE_TRUNC('second', qe.START_TIME)
             ),
@@ -4166,6 +4499,8 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                 SELECT
                     s.SECOND,
                     s.ELAPSED_SECONDS,
+                    s.IS_WARMUP,
+                    s.WARMUP_END_ELAPSED,
                     COALESCE(ps.TOTAL_QUERIES, 0) AS TOTAL_QUERIES,
                     COALESCE(ps.ENRICHED_QUERIES, 0) AS ENRICHED_QUERIES,
                     ps.AVG_OVERHEAD_MS,
@@ -4188,7 +4523,9 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                 P50_OVERHEAD_MS IS NULL AND (PREV_P50_OVERHEAD IS NOT NULL OR NEXT_P50_OVERHEAD IS NOT NULL) AS INTERPOLATED,
                 AVG_APP_MS,
                 AVG_SF_TOTAL_MS,
-                AVG_SF_EXEC_MS
+                AVG_SF_EXEC_MS,
+                IS_WARMUP,
+                WARMUP_END_ELAPSED
             FROM with_lag
             ORDER BY SECOND ASC
             """
@@ -4200,6 +4537,7 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
         has_data = False
         total_enriched = 0
         total_queries = 0
+        warmup_end_elapsed: int | None = None
 
         for row in rows:
             (
@@ -4213,7 +4551,12 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                 avg_app,
                 avg_sf_total,
                 avg_sf_exec,
+                is_warmup,
+                warmup_end,
             ) = row
+
+            if warmup_end_elapsed is None and warmup_end is not None:
+                warmup_end_elapsed = int(warmup_end)
 
             total_q_i = int(total_q or 0)
             enriched_q_i = int(enriched_q or 0)
@@ -4237,6 +4580,7 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
                     "avg_app_ms": _to_float_or_none(avg_app),
                     "avg_sf_total_ms": _to_float_or_none(avg_sf_total),
                     "avg_sf_exec_ms": _to_float_or_none(avg_sf_exec),
+                    "warmup": bool(is_warmup),
                 }
             )
 
@@ -4253,6 +4597,7 @@ async def get_overhead_timeseries(test_id: str) -> dict[str, Any]:
             "total_enriched": total_enriched,
             "enrichment_ratio_pct": enrichment_ratio_pct,
             "points": points if has_data else [],
+            "warmup_end_elapsed_seconds": warmup_end_elapsed,
         }
     except Exception as e:
         logger.debug("Failed to load overhead timeseries for %s: %s", test_id, e)

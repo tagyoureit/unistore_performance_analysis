@@ -430,12 +430,32 @@
             x-show="logTargets && logTargets.length"
             style="margin-bottom: 0.75rem;"
         >
-            <label class="form-label">Worker Logs</label>
-            <select class="form-select" x-model="logSelectedTestId" @change="onLogTargetChange()">
-                <template x-for="worker in logTargets" :key="worker.test_id">
-                    <option :value="worker.test_id" x-text="worker.label || worker.test_id"></option>
+            <label class="form-label">Source</label>
+            <select class="form-select" x-model="logSelectedTargetId" @change="onLogTargetChange()">
+                <template x-for="target in logTargets" :key="target.target_id || target.test_id">
+                    <option
+                        :value="target.target_id || target.test_id"
+                        x-text="target.label || target.worker_id || target.test_id"
+                    ></option>
                 </template>
             </select>
+        </div>
+
+        <div class="log-controls">
+            <div class="log-control">
+                <label class="form-label">Level</label>
+                <select class="form-select" x-model="logLevelFilter">
+                    <template x-for="opt in logLevelOptions()" :key="opt.value">
+                        <option :value="opt.value" x-text="opt.label"></option>
+                    </template>
+                </select>
+            </div>
+            <div class="log-control log-control-toggle">
+                <label class="form-label">
+                    <input type="checkbox" class="form-checkbox" x-model="logVerboseMode">
+                    Verbose mode
+                </label>
+            </div>
         </div>
 
         <div
@@ -445,7 +465,29 @@
             Test failed. See logs below.
         </div>
 
-        <pre class="log-output" x-text="logsText() || 'No logs yet.'"></pre>
+        <div class="log-output">
+            <template x-if="filteredLogs().length === 0">
+                <div class="log-empty">No logs yet.</div>
+            </template>
+            <template x-for="log in filteredLogs()" :key="log.log_id">
+                <div class="log-line">
+                    <span class="log-ts" x-text="formatLogTimestamp(log.timestamp)"></span>
+                    <span class="log-level" :class="logLineLevelClass(log.level)" x-text="(log.level || 'INFO').toUpperCase()"></span>
+                    <button
+                        type="button"
+                        :class="logWorkerBadgeClass(log.worker_id)"
+                        @click="setLogWorkerFilter(_normalizeWorkerId(log.worker_id))"
+                        x-text="_normalizeWorkerId(log.worker_id)"
+                    ></button>
+                    <span class="log-logger" x-text="formatLogLogger(log.logger)"></span>
+                    <span class="log-sep">-</span>
+                    <span class="log-message" x-text="log.message"></span>
+                    <template x-if="log.exception">
+                        <pre class="log-exception" x-text="log.exception"></pre>
+                    </template>
+                </div>
+            </template>
+        </div>
     </div>
 </div>
 {% endblock %}

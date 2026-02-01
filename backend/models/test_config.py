@@ -190,7 +190,10 @@ class TestScenario(BaseModel):
     # Concurrency settings
     # Note: "total_threads" is the new canonical name; "concurrent_connections" is kept as alias
     total_threads: int = Field(
-        10, ge=1, alias="concurrent_connections", description="Number of concurrent threads"
+        10,
+        ge=1,
+        alias="concurrent_connections",
+        description="Number of concurrent threads",
     )
     # Load mode
     load_mode: str = Field(
@@ -209,7 +212,10 @@ class TestScenario(BaseModel):
     )
     # Note: "min_threads_per_worker" is the new canonical name; "min_connections" is kept as alias
     min_threads_per_worker: int = Field(
-        1, ge=1, alias="min_connections", description="Starting/min threads per worker when load_mode=QPS"
+        1,
+        ge=1,
+        alias="min_connections",
+        description="Starting/min threads per worker when load_mode=QPS",
     )
 
     # Worker group sharding (multi-process / multi-worker)

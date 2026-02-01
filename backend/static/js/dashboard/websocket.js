@@ -20,6 +20,9 @@ window.DashboardMixins.websocket = {
     this.websocket.onopen = () => {
       this._debugLog("WS", "CONNECTED");
       this.testRunning = true;
+      if (typeof this.stopMultiNodeLogPolling === "function") {
+        this.stopMultiNodeLogPolling();
+      }
     };
 
     this.websocket.onmessage = (event) => {

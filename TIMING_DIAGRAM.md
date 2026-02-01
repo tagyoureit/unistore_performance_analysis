@@ -1,6 +1,6 @@
 # Visual Timing Diagram: Worker Startup to First Query
 
-```
+```text
 TIME →
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -336,13 +336,13 @@ WORKER TASK EXECUTION (PARALLEL) - First Iteration
 ════════════════════════════════════════════════════════════════════════════════
 END OF FIRST QUERY EXECUTION
 ════════════════════════════════════════════════════════════════════════════════
-```
+```text
 
 ---
 
 ## SUMMARY: Latency Breakdown (After _wait_for_start() returns)
 
-```
+```text
 ┌────────────────────────────────────────────────────┬──────────┬──────────┐
 │ Operation                                          │ Type     │ Timing   │
 ├────────────────────────────────────────────────────┼──────────┼──────────┤
@@ -357,7 +357,8 @@ END OF FIRST QUERY EXECUTION
 └────────────────────────────────────────────────────┴──────────┴──────────┘
 ```
 
-### Breakdown:
+## Breakdown
+
 - **Fast operations (CPU):** ~14ms
 - **Slow operations (required SF queries):** ~200-400ms
   - Heartbeat RUNNING: 100-200ms
@@ -371,7 +372,8 @@ They are **NOT** in the path after `_wait_for_start()` returns!
 The overhead after `_wait_for_start()` is only **~213-313ms** before the first query.
 
 The 7-8 seconds must be in:
-1. **Pool initialization** (15-20s) - but this was moved BEFORE `_wait_for_start()` on line 620
+1. **Pool initialization** (15-20s) - but this was moved BEFORE
+   `_wait_for_start()` on line 620
 2. **The `_wait_for_start()` loop itself** - waiting for orchestrator to set RUNNING
 3. **Before line 620** - if there's slow setup code earlier in the function
 

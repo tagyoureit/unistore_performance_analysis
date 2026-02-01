@@ -30,6 +30,8 @@ may show 0 during certain phases.
 - Multi-step investigations combining code + docs
 - Summarizing implementation patterns specific to this project
 
+EXCEPTION: If subagents are not available (ie in Cursor), notify user they are not available but do not prompt to continue without them, just proceed.
+
 ### Context Management Goals
 
 - Main conversation should focus on decisions, direction, and implementation

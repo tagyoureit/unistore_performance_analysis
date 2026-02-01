@@ -30,7 +30,7 @@ The 7-8 seconds must be **BEFORE** `_wait_for_start()` returns (likely in the `_
 [Line 2928] ⚡ result, info = await pool.execute_query_with_info(...)  # 1-100ms+ (FIRST QUERY)
 ```
 
-**Total time from line 770 to first query: ~213-313ms**
+### Total time from line 770 to first query: ~213-313ms
 
 ---
 
@@ -49,11 +49,14 @@ The 7-8 seconds must be **BEFORE** `_wait_for_start()` returns (likely in the `_
 ## Where Are The 7-8 Seconds?
 
 ### ✅ Already Optimized (Lines 620-638)
-**Pool initialization moved BEFORE _wait_for_start()**
+
+#### Pool initialization moved before _wait_for_start()
+
 - Creates 100 connections: 15-20 seconds
 - ✅ This runs BEFORE waiting, so it doesn't block warmup
 
 ### 🔍 Most Likely: _wait_for_start() Loop (Lines 693-769)
+
 ```python
 async def _wait_for_start(timeout_seconds: int = 120) -> bool:
     while True:
@@ -63,7 +66,9 @@ async def _wait_for_start(timeout_seconds: int = 120) -> bool:
         # Exit when RUN_STATUS.status = 'RUNNING'
 ```
 
-**This loop can take 0-120 seconds** depending on how long the orchestrator takes to:
+**This loop can take 0-120 seconds** depending on how long the orchestrator
+takes to:
+
 1. Start all workers
 2. Initialize its own state
 3. Set RUN_STATUS to 'RUNNING'
@@ -71,6 +76,7 @@ async def _wait_for_start(timeout_seconds: int = 120) -> bool:
 **This is coordination delay, not a bug.**
 
 ### 🔍 Also Check: Executor Setup (Lines 641-648)
+
 ```python
 ok = await executor.setup()
     ↓
@@ -82,6 +88,7 @@ ok = await executor.setup()
 ```
 
 **Typically 100-500ms** but could be longer if:
+
 - Multiple tables
 - No value pools (full profiling)
 - Slow network

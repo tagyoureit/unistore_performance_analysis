@@ -263,7 +263,14 @@ async def dashboard_test(request: Request, test_id: str):
         return RedirectResponse(url=history_url, status_code=302)
 
     status = str(getattr(running, "status", "") or "").upper()
-    live_statuses = {"PREPARED", "READY", "PENDING", "RUNNING", "CANCELLING", "STARTING"}
+    live_statuses = {
+        "PREPARED",
+        "READY",
+        "PENDING",
+        "RUNNING",
+        "CANCELLING",
+        "STARTING",
+    }
     if status not in live_statuses:
         if request.headers.get("HX-Request") == "true":
             resp = HTMLResponse("")
@@ -693,7 +700,9 @@ async def _fetch_run_status(run_id: str) -> dict[str, Any] | None:
             "workers_active": workers_active,
             "workers_completed": workers_completed,
             "find_max_state": find_max_state,
-            "cancellation_reason": str(cancellation_reason) if cancellation_reason else None,
+            "cancellation_reason": str(cancellation_reason)
+            if cancellation_reason
+            else None,
             "elapsed_seconds": float(elapsed_seconds)
             if elapsed_seconds is not None
             else None,
@@ -702,9 +711,59 @@ async def _fetch_run_status(run_id: str) -> dict[str, Any] | None:
         return None
 
 
+async def _fetch_run_test_ids(run_id: str) -> list[str]:
+    try:
+        pool = snowflake_pool.get_default_pool()
+        rows = await pool.execute_query(
+            f"""
+            SELECT TEST_ID
+            FROM {settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}.TEST_RESULTS
+            WHERE RUN_ID = ?
+            ORDER BY TEST_ID ASC
+            """,
+            params=[run_id],
+        )
+        test_ids = [str(row[0]) for row in rows if row and row[0]]
+        if str(run_id) not in test_ids:
+            test_ids.insert(0, str(run_id))
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for test_id in test_ids:
+            if test_id in seen:
+                continue
+            seen.add(test_id)
+            ordered.append(test_id)
+        return ordered
+    except Exception:
+        return [str(run_id)]
+
+
+async def _fetch_warehouse_context(test_id: str) -> tuple[str | None, str | None]:
+    try:
+        pool = snowflake_pool.get_default_pool()
+        rows = await pool.execute_query(
+            f"""
+            SELECT WAREHOUSE, TABLE_TYPE
+            FROM {settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}.TEST_RESULTS
+            WHERE TEST_ID = ?
+            LIMIT 1
+            """,
+            params=[test_id],
+        )
+        if not rows:
+            return None, None
+        warehouse_raw = rows[0][0] if rows[0] else None
+        table_type_raw = rows[0][1] if rows[0] else None
+        warehouse = str(warehouse_raw).strip() if warehouse_raw else None
+        table_type = str(table_type_raw).strip().lower() if table_type_raw else None
+        return warehouse or None, table_type or None
+    except Exception:
+        return None, None
+
+
 async def _fetch_parent_enrichment_status(run_id: str) -> str | None:
     """Fetch enrichment status for a test run.
-    
+
     Enrichment is done centrally by the orchestrator and updates ONLY the parent
     row (where TEST_ID = RUN_ID). So we check the parent row first - it's the
     authoritative source. This matches the HTTP /enrichment-status endpoint logic.
@@ -749,6 +808,68 @@ async def _fetch_parent_enrichment_status(run_id: str) -> str | None:
                 return "PENDING"
             return parent_status
         return None
+    except Exception:
+        return None
+
+
+async def _fetch_enrichment_progress(run_id: str) -> dict[str, Any] | None:
+    try:
+        pool = snowflake_pool.get_default_pool()
+        prefix = f"{settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}"
+        rows = await pool.execute_query(
+            f"""
+            SELECT RUN_ID, STATUS, ENRICHMENT_STATUS, ENRICHMENT_ERROR
+            FROM {prefix}.TEST_RESULTS
+            WHERE TEST_ID = ?
+            """,
+            params=[run_id],
+        )
+        if not rows:
+            return None
+        run_id_val, status_db, enrichment_status_db, enrichment_error_db = rows[0]
+        test_status = str(status_db or "").upper()
+        is_parent_run = bool(run_id_val) and str(run_id_val) == str(run_id)
+
+        if is_parent_run:
+            (
+                agg_status,
+                agg_error,
+            ) = await test_results._aggregate_parent_enrichment_status(
+                pool=pool, run_id=str(run_id)
+            )
+            (
+                total_queries,
+                enriched_queries,
+                enrichment_ratio,
+            ) = await test_results._aggregate_parent_enrichment_stats(
+                pool=pool, run_id=str(run_id)
+            )
+            enrichment_status = agg_status or str(enrichment_status_db or "").upper()
+            enrichment_error = agg_error or enrichment_error_db
+        else:
+            status_info = await results_store.get_enrichment_status(test_id=run_id)
+            if status_info is None:
+                return None
+            enrichment_status = str(status_info.get("enrichment_status") or "").upper()
+            enrichment_error = status_info.get("enrichment_error")
+            total_queries = status_info.get("total_queries", 0)
+            enriched_queries = status_info.get("enriched_queries", 0)
+            enrichment_ratio = status_info.get("enrichment_ratio", 0.0)
+
+        is_complete = enrichment_status in ("COMPLETED", "SKIPPED") or (
+            enrichment_ratio >= 0.90 and total_queries > 0
+        )
+        return {
+            "test_id": run_id,
+            "test_status": test_status,
+            "enrichment_status": enrichment_status or None,
+            "enrichment_error": enrichment_error,
+            "total_queries": int(total_queries or 0),
+            "enriched_queries": int(enriched_queries or 0),
+            "enrichment_ratio_pct": round(enrichment_ratio * 100, 1),
+            "is_complete": is_complete,
+            "can_retry": (test_status == "COMPLETED" and enrichment_status == "FAILED"),
+        }
     except Exception:
         return None
 
@@ -1136,7 +1257,9 @@ async def _aggregate_multi_worker_metrics(parent_run_id: str) -> dict[str, Any]:
     }
 
 
-async def _fetch_logs_since_seq(test_id: str, since_seq: int, limit: int = 100) -> list[dict[str, Any]]:
+async def _fetch_logs_since_seq(
+    test_id: str, since_seq: int, limit: int = 100
+) -> list[dict[str, Any]]:
     """
     Fetch logs from TEST_LOGS table for a given test since a sequence number.
     Returns logs ordered by sequence ascending.
@@ -1148,6 +1271,7 @@ async def _fetch_logs_since_seq(test_id: str, since_seq: int, limit: int = 100) 
         SELECT
             LOG_ID,
             TEST_ID,
+            WORKER_ID,
             SEQ,
             TIMESTAMP,
             LEVEL,
@@ -1163,21 +1287,96 @@ async def _fetch_logs_since_seq(test_id: str, since_seq: int, limit: int = 100) 
         rows = await pool.execute_query(query, params=[test_id, since_seq, limit])
         logs = []
         for row in rows:
-            log_id, tid, seq, ts, level, logger_name, message, exception = row
-            logs.append({
-                "kind": "log",
-                "log_id": str(log_id) if log_id else None,
-                "test_id": str(tid) if tid else test_id,
-                "seq": int(seq) if seq is not None else 0,
-                "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts) if ts else None,
-                "level": str(level) if level else "INFO",
-                "logger": str(logger_name) if logger_name else "",
-                "message": str(message) if message else "",
-                "exception": str(exception) if exception else None,
-            })
+            log_id, tid, worker_id, seq, ts, level, logger_name, message, exception = (
+                row
+            )
+            logs.append(
+                {
+                    "kind": "log",
+                    "log_id": str(log_id) if log_id else None,
+                    "test_id": str(tid) if tid else test_id,
+                    "worker_id": str(worker_id) if worker_id else None,
+                    "seq": int(seq) if seq is not None else 0,
+                    "timestamp": ts.isoformat()
+                    if hasattr(ts, "isoformat")
+                    else str(ts)
+                    if ts
+                    else None,
+                    "level": str(level) if level else "INFO",
+                    "logger": str(logger_name) if logger_name else "",
+                    "message": str(message) if message else "",
+                    "exception": str(exception) if exception else None,
+                }
+            )
         return logs
     except Exception as e:
         logger.debug(f"Failed to fetch logs for test {test_id}: {e}")
+        return []
+
+
+async def _fetch_logs_for_tests(
+    test_ids: list[str], last_seq_by_test: dict[str, int]
+) -> list[dict[str, Any]]:
+    if not test_ids:
+        return []
+    try:
+        pool = snowflake_pool.get_default_pool()
+        prefix = f"{settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}"
+        clauses: list[str] = []
+        params: list[Any] = []
+        for test_id in test_ids:
+            since_seq = int(last_seq_by_test.get(test_id, 0))
+            clauses.append("(TEST_ID = ? AND SEQ > ?)")
+            params.extend([test_id, since_seq])
+        if not clauses:
+            return []
+        query = f"""
+        SELECT
+            LOG_ID,
+            TEST_ID,
+            WORKER_ID,
+            SEQ,
+            TIMESTAMP,
+            LEVEL,
+            LOGGER,
+            MESSAGE,
+            EXCEPTION
+        FROM {prefix}.TEST_LOGS
+        WHERE {" OR ".join(clauses)}
+        ORDER BY TIMESTAMP ASC, SEQ ASC
+        """
+        rows = await pool.execute_query(query, params=params)
+        logs = []
+        for row in rows:
+            log_id, tid, worker_id, seq, ts, level, logger_name, message, exception = (
+                row
+            )
+            test_key = str(tid) if tid else None
+            if test_key:
+                last_seq_by_test[test_key] = max(
+                    last_seq_by_test.get(test_key, 0), int(seq or 0)
+                )
+            logs.append(
+                {
+                    "kind": "log",
+                    "log_id": str(log_id) if log_id else None,
+                    "test_id": str(tid) if tid else None,
+                    "worker_id": str(worker_id) if worker_id else None,
+                    "seq": int(seq) if seq is not None else 0,
+                    "timestamp": ts.isoformat()
+                    if hasattr(ts, "isoformat")
+                    else str(ts)
+                    if ts
+                    else None,
+                    "level": str(level) if level else "INFO",
+                    "logger": str(logger_name) if logger_name else "",
+                    "message": str(message) if message else "",
+                    "exception": str(exception) if exception else None,
+                }
+            )
+        return logs
+    except Exception as e:
+        logger.debug(f"Failed to fetch logs for tests {test_ids}: {e}")
         return []
 
 
@@ -1193,6 +1392,10 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
     poll_interval = 1.0
     last_sent_phase: str | None = None  # Track phase to ensure PROCESSING is shown
     last_log_seq: int = 0  # Track last log sequence to fetch only new logs
+    last_log_seq_by_test: dict[str, int] = {str(test_id): 0}
+    known_test_ids: list[str] = [str(test_id)]
+    warehouse_name: str | None = None
+    warehouse_table_type: str | None = None
     while True:
         recv_task = asyncio.create_task(websocket.receive())
         sleep_task = asyncio.create_task(asyncio.sleep(poll_interval))
@@ -1301,14 +1504,43 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         )
         if find_max_state is not None:
             payload["find_max"] = find_max_state
-        
-        # Fetch new logs since last sequence
-        new_logs = await _fetch_logs_since_seq(test_id, last_log_seq, limit=100)
+
+        known_test_ids = await _fetch_run_test_ids(test_id)
+        for tid in known_test_ids:
+            last_log_seq_by_test.setdefault(tid, 0)
+
+        # Fetch new logs since last sequence (all child tests)
+        new_logs = await _fetch_logs_for_tests(known_test_ids, last_log_seq_by_test)
         if new_logs:
             payload["logs"] = new_logs
-            # Update last_log_seq to the highest seq we received
-            last_log_seq = max(log.get("seq", 0) for log in new_logs)
-        
+            last_log_seq = max(last_log_seq, last_log_seq_by_test.get(str(test_id), 0))
+
+        phase_upper = str(phase or "").upper()
+        if status_upper == "COMPLETED" or phase_upper == "PROCESSING":
+            enrichment_progress = await _fetch_enrichment_progress(test_id)
+            if enrichment_progress:
+                payload["enrichment_progress"] = enrichment_progress
+
+        if warehouse_name is None:
+            warehouse_name, warehouse_table_type = await _fetch_warehouse_context(
+                test_id
+            )
+        is_postgres_table = warehouse_table_type in (
+            "postgres",
+            "snowflake_postgres",
+        )
+        if (
+            warehouse_name
+            and not is_postgres_table
+            and phase_upper in {"WARMUP", "MEASUREMENT"}
+        ):
+            config = await results_store.fetch_warehouse_config_snapshot(warehouse_name)
+            if config:
+                payload["warehouse_details"] = {
+                    "test_id": test_id,
+                    "warehouse": config,
+                }
+
         await websocket.send_json({"event": "RUN_UPDATE", "data": payload})
         last_sent_phase = phase  # Track what we sent
         # Only break when phase reaches COMPLETED (cleanup finished).

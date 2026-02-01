@@ -16,6 +16,9 @@ from typing import Any, Optional
 from uuid import uuid4
 
 CURRENT_TEST_ID: ContextVar[Optional[str]] = ContextVar("CURRENT_TEST_ID", default=None)
+CURRENT_WORKER_ID: ContextVar[Optional[str]] = ContextVar(
+    "CURRENT_WORKER_ID", default=None
+)
 
 
 class TestLogQueueHandler(logging.Handler):
@@ -66,6 +69,14 @@ class TestLogQueueHandler(logging.Handler):
                 except Exception:
                     exc_text = None
 
+            worker_id = getattr(record, "worker_id", None)
+            if worker_id is None:
+                worker_id = CURRENT_WORKER_ID.get()
+            if worker_id is not None:
+                worker_id = str(worker_id).strip()
+            if not worker_id:
+                worker_id = None
+
             event: dict[str, Any] = {
                 "kind": "log",
                 "log_id": str(uuid4()),
@@ -76,6 +87,7 @@ class TestLogQueueHandler(logging.Handler):
                 "logger": str(record.name),
                 "message": msg,
                 "exception": exc_text,
+                "worker_id": worker_id,
             }
 
             def _put() -> None:

@@ -5,9 +5,10 @@
  * Debug logging is controlled by ?debug=true URL parameter.
  * Logs are prefixed with [TEST] for easy filtering.
  */
-window.DashboardMixins = window.DashboardMixins || {};
+const root = typeof window === "undefined" ? globalThis : window;
+root.DashboardMixins = root.DashboardMixins || {};
 
-window.DashboardMixins.testActions = {
+root.DashboardMixins.testActions = {
   async startTest() {
     if (!this.testId) return;
     try {

@@ -29,7 +29,7 @@ class RunActionResponse(BaseModel):
     status: str
 
 
-@router.post("", response_model=RunCreateResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=RunCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_run(request: RunCreateRequest) -> RunCreateResponse:
     """
     Create a new orchestrator-backed run (PREPARED).

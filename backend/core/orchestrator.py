@@ -19,7 +19,11 @@ from backend.core.results_store import (
     update_enrichment_status,
     update_test_overhead_percentiles,
 )
-from backend.core.test_log_stream import CURRENT_TEST_ID, TestLogQueueHandler
+from backend.core.test_log_stream import (
+    CURRENT_TEST_ID,
+    CURRENT_WORKER_ID,
+    TestLogQueueHandler,
+)
 from backend.models.test_config import TableType, TestScenario
 
 logger = logging.getLogger(__name__)
@@ -249,7 +253,9 @@ class OrchestratorService:
         min_threads_per_worker = int(
             _coerce_optional_int(scaling_cfg.get("min_connections")) or 1
         )
-        max_threads_per_worker = _coerce_optional_int(scaling_cfg.get("max_connections"))
+        max_threads_per_worker = _coerce_optional_int(
+            scaling_cfg.get("max_connections")
+        )
 
         if min_workers < 1:
             raise ValueError("min_workers must be >= 1")
@@ -261,7 +267,10 @@ class OrchestratorService:
             raise ValueError("max_threads_per_worker must be >= 1 or null")
         if max_workers is not None and min_workers > max_workers:
             raise ValueError("min_workers must be <= max_workers")
-        if max_threads_per_worker is not None and min_threads_per_worker > max_threads_per_worker:
+        if (
+            max_threads_per_worker is not None
+            and min_threads_per_worker > max_threads_per_worker
+        ):
             raise ValueError("min_threads_per_worker must be <= max_threads_per_worker")
         if scaling_mode == "FIXED":
             if scaling_cfg.get("min_workers") is None:
@@ -396,9 +405,7 @@ class OrchestratorService:
             },
         }
         if per_worker_threads is not None:
-            scenario_config["scaling"]["per_worker_connections"] = (
-                per_worker_threads
-            )
+            scenario_config["scaling"]["per_worker_connections"] = per_worker_threads
             scenario_config["scaling"]["per_worker_capacity"] = per_worker_threads
 
         prefix = f"{settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}"
@@ -474,7 +481,9 @@ class OrchestratorService:
             logger.debug("Incremented usage count for template %s", template_id)
         except Exception as e:
             # Log but don't fail the run creation if usage tracking fails
-            logger.warning("Failed to increment usage count for template %s: %s", template_id, e)
+            logger.warning(
+                "Failed to increment usage count for template %s: %s", template_id, e
+            )
 
         return run_id
 
@@ -585,6 +594,7 @@ class OrchestratorService:
 
         # Set the contextvar so logs are captured for this test
         CURRENT_TEST_ID.set(run_id)
+        CURRENT_WORKER_ID.set("ORCHESTRATOR")
 
         # Start background task to drain log queue and persist to Snowflake
         drain_task = asyncio.create_task(
@@ -842,7 +852,9 @@ class OrchestratorService:
         max_workers = _coerce_optional_int(
             scaling_cfg.get("max_workers"), allow_unbounded=True
         )
-        min_threads_per_worker = _coerce_optional_int(scaling_cfg.get("min_connections")) or 1
+        min_threads_per_worker = (
+            _coerce_optional_int(scaling_cfg.get("min_connections")) or 1
+        )
         max_threads_per_worker = _coerce_optional_int(
             scaling_cfg.get("max_connections"), allow_unbounded=True
         )
@@ -895,11 +907,13 @@ class OrchestratorService:
         max_concurrency = max(find_max_start, max_concurrency)
         if effective_max_threads_per_worker is not None:
             max_concurrency = min(
-                max_concurrency, int(effective_max_threads_per_worker) * worker_group_count
+                max_concurrency,
+                int(effective_max_threads_per_worker) * worker_group_count,
             )
         if max_workers is not None and effective_max_threads_per_worker is not None:
             max_concurrency = min(
-                max_concurrency, int(max_workers) * int(effective_max_threads_per_worker)
+                max_concurrency,
+                int(max_workers) * int(effective_max_threads_per_worker),
             )
         bounded_max_configured = scaling_mode == "BOUNDED" and (
             max_workers is not None or max_threads_per_worker is not None
@@ -1147,17 +1161,20 @@ class OrchestratorService:
 
         async def _run_enrichment(test_id: str) -> None:
             """Run enrichment in background after test completion.
-            
+
             Note: QUERY_HISTORY enrichment only works for Snowflake table types.
             Postgres tests skip enrichment since pg_stat_statements only provides
             aggregated stats, not per-query execution history.
             """
             # Check if this is a Postgres test (no QUERY_HISTORY available)
-            table_type_str = str(
-                ctx.scenario_config.get("table_type", "")
-            ).strip().upper()
+            scenario_config = (
+                ctx.scenario_config
+                if ctx is not None and isinstance(ctx.scenario_config, dict)
+                else {}
+            )
+            table_type_str = str(scenario_config.get("table_type", "")).strip().upper()
             is_postgres_test = table_type_str in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
-            
+
             try:
                 if is_postgres_test:
                     logger.info(
@@ -1183,7 +1200,7 @@ class OrchestratorService:
                         test_id=test_id, status="COMPLETED", error=None
                     )
                     logger.info("Enrichment completed for run %s", test_id)
-                
+
                 # Transition phase from PROCESSING to COMPLETED and set END_TIME.
                 # END_TIME is set here (not when status→COMPLETED) so elapsed time
                 # includes the full PROCESSING phase (enrichment).
@@ -1376,7 +1393,9 @@ class OrchestratorService:
                 if status == "STARTING" and workers_ready >= worker_group_count:
                     logger.info(
                         "All %d workers READY for run %s - transitioning to %s",
-                        workers_ready, run_id, initial_phase,
+                        workers_ready,
+                        run_id,
+                        initial_phase,
                     )
                     # Note: START_TIME was already set in start_run() to include PREPARING phase
                     await self._pool.execute_query(
@@ -1487,7 +1506,9 @@ class OrchestratorService:
                             "timestamp": datetime.now(UTC).isoformat(),
                         },
                     )
-                    cancellation_msg = f"Worker failure: {dead_workers} worker(s) stopped responding"
+                    cancellation_msg = (
+                        f"Worker failure: {dead_workers} worker(s) stopped responding"
+                    )
                     await self._pool.execute_query(
                         f"""
                         UPDATE {prefix}.RUN_STATUS
@@ -2057,27 +2078,33 @@ class OrchestratorService:
                             if stdout_data:
                                 logger.info(
                                     "Worker %d stdout for %s:\n%s",
-                                    i, run_id, stdout_data.decode()[-4000:]
+                                    i,
+                                    run_id,
+                                    stdout_data.decode()[-4000:],
                                 )
                             if stderr_data:
                                 stderr_str = stderr_data.decode()
                                 if len(stderr_str) > 8000:
                                     logger.warning(
                                         "Worker %d stderr for %s (first 4000 chars):\n%s",
-                                        i, run_id, stderr_str[:4000]
+                                        i,
+                                        run_id,
+                                        stderr_str[:4000],
                                     )
                                     logger.warning(
                                         "Worker %d stderr for %s (last 4000 chars):\n%s",
-                                        i, run_id, stderr_str[-4000:]
+                                        i,
+                                        run_id,
+                                        stderr_str[-4000:],
                                     )
                                 else:
                                     logger.warning(
                                         "Worker %d stderr for %s:\n%s",
-                                        i, run_id, stderr_str
+                                        i,
+                                        run_id,
+                                        stderr_str,
                                     )
-                            logger.info(
-                                "Worker %d exit code: %s", i, proc.returncode
-                            )
+                            logger.info("Worker %d exit code: %s", i, proc.returncode)
                         logger.info(
                             "All workers exited for run %s, poll loop ending", run_id
                         )

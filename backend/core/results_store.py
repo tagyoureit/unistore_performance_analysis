@@ -1008,7 +1008,7 @@ async def insert_test_logs(
     Bulk insert log rows into TEST_RESULTS.TEST_LOGS.
 
     Expected keys per row:
-    - log_id, test_id, seq, timestamp, level, logger, message, exception
+    - log_id, test_id, seq, timestamp, level, logger, message, exception, worker_id
     """
     if not rows:
         return
@@ -1017,6 +1017,7 @@ async def insert_test_logs(
     cols = [
         "LOG_ID",
         "TEST_ID",
+        "WORKER_ID",
         "SEQ",
         "TIMESTAMP",
         "LEVEL",
@@ -1032,6 +1033,7 @@ async def insert_test_logs(
         return [
             r.get("log_id"),
             r.get("test_id"),
+            r.get("worker_id"),
             r.get("seq"),
             r.get("timestamp"),
             r.get("level"),
@@ -1265,7 +1267,9 @@ async def enrich_query_executions_from_query_history(
     pool = snowflake_pool.get_default_pool()
     prefix = _results_prefix()
 
-    time_range = await _get_test_time_range(pool, prefix, test_id=test_id, run_id=run_id)
+    time_range = await _get_test_time_range(
+        pool, prefix, test_id=test_id, run_id=run_id
+    )
     if time_range is None:
         return 0
     start_dt, end_dt = time_range
@@ -1406,16 +1410,16 @@ async def get_enrichment_stats(
 ) -> EnrichmentStats:
     """
     Get enrichment stats for a test or run.
-    
+
     Args:
         test_id: Query by specific TEST_ID (single worker)
         run_id: Query by RUN_ID (all workers in a run via JOIN)
-    
+
     If run_id is provided, queries all QUERY_EXECUTIONS for workers in that run.
     """
     pool = snowflake_pool.get_default_pool()
     prefix = _results_prefix()
-    
+
     if run_id:
         rows = await pool.execute_query(
             f"""
@@ -1560,7 +1564,7 @@ async def update_test_overhead_percentiles(
     """
     Compute overhead percentiles from QUERY_EXECUTIONS.APP_OVERHEAD_MS and store
     them on TEST_RESULTS (one-row summary table).
-    
+
     For run_id, updates all worker rows in the run.
     """
     pool = snowflake_pool.get_default_pool()

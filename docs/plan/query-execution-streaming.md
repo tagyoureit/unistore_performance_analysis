@@ -76,7 +76,8 @@ The system enforces `warehouse_name != SNOWFLAKE_WAREHOUSE` to isolate benchmark
 │    • OR buffer >= 1000 records                                  │
 │    • OR shutdown signal received                                │
 │                                                                 │
-│  On flush failure: raise → worker catches → test fails          │
+│  On flush failure: back off recording → benchmark continues     │
+│  → mark run partial                                             │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
                                │
@@ -107,9 +108,9 @@ Responsibilities:
 - Buffer management (unbounded deque, with back-pressure threshold)
 - Background flush task (5s interval or 1000 records)
 - Batched INSERTs (500 rows per statement)
-- Sampling logic (100% errors, 100% warmup, configurable % for measurement)
-- Failure propagation (raises exception → test fails)
-- Graceful shutdown with p99-based timeout
+- Sampling logic (100% errors, 100% warmup, constant % for measurement)
+- Failure handling (back off recording; benchmark continues)
+- Graceful shutdown with flush-latency-based timeout
 
 ```python
 class QueryExecutionStreamer:
@@ -131,8 +132,8 @@ class QueryExecutionStreamer:
         """Start background flush task."""
         ...
 
-    async def shutdown(self, p99_ms: float) -> None:
-        """Flush remaining buffer. Timeout = 2x p99 latency."""
+    async def shutdown(self, flush_p99_ms: float) -> None:
+        """Flush remaining buffer. Timeout = 2x flush p99 (min 30s)."""
         ...
 ```
 
@@ -150,41 +151,31 @@ class QueryExecutionStreamer:
 |-------------|-------------|-----------|
 | Errors (`success=False`) | 100% (never drop) | Errors are rare and critical |
 | Warmup queries | 100% (never drop) | Low volume, needed for diagnostics |
-| Measurement queries | Configurable % | Statistical accuracy maintained |
+| Measurement queries | Configurable % (constant per run) | Statistical accuracy maintained |
 
-### Sample Rate Calculation (OPEN DECISION)
+### Phase Classification (DECIDED)
 
-Options under consideration:
+- Phase is captured at query submit time using the latest `RUN_CONTROL_EVENTS.SEQUENCE_ID`.
+- Sampling decisions use the captured phase (warmup is always 100%).
 
-**Option A: Per-Worker QPS Threshold**
-```python
-worker_qps = metrics_collector.current_qps()
-sample_rate = min(1.0, TARGET_SAMPLES_PER_SEC / worker_qps)
-```
-- Pro: Simple, no coordination
-- Con: Different workers may have different rates
+### Sample Rate Calculation (DECIDED)
 
-**Option B: Target QPS from Template Config**
+Use template target QPS to compute a constant per-run sample rate:
+
 ```python
 target_total_qps = template_config.get("target_qps")
 num_workers = template_config.get("num_workers")
 expected_per_worker = target_total_qps / num_workers
 sample_rate = min(1.0, TARGET_SAMPLES_PER_SEC / expected_per_worker)
 ```
-- Pro: Consistent across workers
-- Con: Actual QPS may differ from target
+- Computed once at run start and applied for the full run
+- Stored on `TEST_RESULTS.SAMPLE_RATE` for downstream scaling
+- Avoids per-worker or time-varying rates
 
-**Option C: Buffer Pressure (Adaptive)**
-```python
-if buffer_growth_rate > flush_rate:
-    sample_rate = flush_rate / buffer_growth_rate
-```
-- Pro: Self-adjusting
-- Con: More complex, varies during test
+### Standard Tables Note (DECIDED)
 
-**Option D: Hybrid (Config + Adaptive Floor)**
-- Start with config-based rate
-- Reduce further if buffer pressure builds
+- Target full capture with no sampling on standard tables once ingest headroom is proven.
+- Fixed sampling remains the initial guardrail; revisit after capacity validation.
 
 ### Metadata Tracking
 
@@ -196,6 +187,12 @@ SAMPLE_RATE FLOAT,              -- e.g., 0.10 for 10%
 TOTAL_QUERIES_ISSUED NUMBER,    -- Actual count before sampling
 SAMPLED_QUERIES_STORED NUMBER   -- Count after sampling
 ```
+
+### Ingest Backoff Policy (DECIDED)
+
+- Benchmark execution is primary; never throttle benchmark to protect recording.
+- If ingest pressure threatens benchmark or control-plane bottlenecks appear, back off recording immediately.
+- When backoff triggers, mark results as partial and surface the condition in summaries/charts.
 
 ## Downstream Impact Analysis
 
@@ -216,6 +213,11 @@ SAMPLED_QUERIES_STORED NUMBER   -- Count after sampling
 | Live dashboard p50/p95/p99 | Uses `WORKER_METRICS_SNAPSHOTS` (in-memory aggregates) |
 | Parent run aggregates | Uses `WORKER_METRICS_SNAPSHOTS` |
 | Real-time WebSocket updates | Uses in-memory metrics |
+
+### Time Bucketing (DECIDED)
+
+- Use Snowflake server time for per-second bucketization to avoid worker clock skew.
+- Record server timestamp at insert time and use it for charts and time-series calculations.
 
 ### Query Adjustments Required
 
@@ -238,6 +240,16 @@ SELECT
     SUM(CASE WHEN SUCCESS = TRUE THEN 1 ELSE 0 END) / tr.SAMPLE_RATE AS estimated_success
 ```
 
+### Output Calculations Impact (Summary)
+
+- **Live dashboard charts**: Unchanged; live p50/p95/p99 and QPS use in-memory metrics.
+- **Post-test p50/p95/p99 and latency**: Calculated from sampled measurement rows. No scaling is applied to percentile values; accuracy depends on sample size.
+- **Per-second latency charts**: Buckets use server time; buckets with low sample counts are noisier.
+- **QPS and success counts**: Scale measurement query counts by `1 / sample_rate`.
+- **Error rates**: Errors are exact (100% retained). Success counts are scaled.
+- **Warmup metrics**: Unchanged (100% retained).
+- **Recording backoff**: If backoff triggers, post-test stats are partial and must be flagged as incomplete.
+
 ## Design Decisions
 
 ### Decided
@@ -249,21 +261,25 @@ SELECT
 | Connection pool | Control pool | Already separated from benchmark warehouse |
 | Primary key | `EXECUTION_ID` (UUID) | Already generated and unique |
 | Flush interval | 5 seconds | Balance latency vs write overhead |
-| Batch trigger | 1000 records | ~100 QPS/worker × 10s buffer |
+| Batch trigger | 1000 records | Headroom above 5s interval; caps buffer to ~10s at 100 QPS/worker |
 | Batch INSERT size | 500 rows | Proven chunk size |
-| Failure behavior | Fail the test | Data integrity is critical |
-| Shutdown timeout | 2× p99 latency (min 30s) | Based on observed query performance |
+| Failure behavior | Back off recording; benchmark continues | Protect benchmark from ingest bottlenecks |
+| Shutdown timeout | 2× flush p99 (min 30s) | Aligns drain timeout with insert latency |
 | Error sampling | Never drop | Errors are rare and critical |
 | Warmup sampling | Never drop | Needed for diagnostics |
-| Buffer back-pressure | Fail at 100k records | Detect if writes can't keep up |
+| Sample rate calculation | Template target QPS (constant per run) | Consistent across workers and stable scaling |
+| Standard tables | Target full capture; fixed sampling is temporary | Remove sampling after headroom validation |
+| Phase classification | At query submit time | Prevents phase boundary drift |
+| Time authority | Snowflake server time | Consistent cross-worker bucketization |
+| Benchmark priority | Never throttle benchmark for recording | Preserve benchmark fidelity |
+| Flush interval bias | Prefer lower interval if no benchmark impact | Minimize ingest lag |
+| Control warehouse scaling | Auto-scale configured in backend | Avoid manual tuning |
+| Buffer back-pressure | Back off recording at 100k records | Protect benchmark under ingest pressure |
 | UI indication | Show sample rate in summary + chart indicators | User needs to know data is sampled |
 | Enrichment | Still attempt | Accept 3-70% match rate depending on workload |
 
 ### Open
-
-| Decision | Options | Notes |
-|----------|---------|-------|
-| Sample rate calculation | A/B/C/D (see above) | Need to determine how workers know when to sample |
+None.
 
 ## Implementation Plan
 
@@ -273,7 +289,7 @@ SELECT
    - `backend/core/query_execution_streamer.py`
    - Buffer management, flush task, batched INSERTs
    - Sampling logic
-   - Failure propagation
+   - Failure handling/backoff
    - Graceful shutdown
 
 2. **Convert `QUERY_EXECUTIONS` to hybrid**
@@ -335,7 +351,7 @@ SELECT
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | Hybrid table write contention | Low | Medium | Row-level locking, proven with WORKER_HEARTBEATS |
-| Buffer overflow under extreme load | Low | High | Back-pressure threshold fails test early |
+| Buffer overflow under extreme load | Low | High | Back-pressure threshold backs off recording |
 | Sampling affects percentile accuracy | Low | Medium | 30k+ samples provide <3% error |
 | Enrichment match rate drops further | Medium | Low | Already lossy (50-70%), acceptable |
 | Downstream queries break | Medium | Medium | Comprehensive test coverage |

@@ -156,10 +156,4 @@ CREATE HYBRID TABLE IF NOT EXISTS WORKER_HEARTBEATS (
 
 -- Add CANCELLATION_REASON column to RUN_STATUS (if not exists)
 -- This column stores the reason when a test is cancelled or fails abnormally.
-BEGIN
-    ALTER TABLE RUN_STATUS ADD COLUMN cancellation_reason TEXT;
-EXCEPTION
-    WHEN OTHER THEN
-        -- Column already exists, ignore error
-        NULL;
-END;
+ALTER TABLE RUN_STATUS ADD COLUMN IF NOT EXISTS CANCELLATION_REASON TEXT;

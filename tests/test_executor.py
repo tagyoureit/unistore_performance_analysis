@@ -64,7 +64,7 @@ def test_executor_creation():
         print("✅ TestExecutor created")
         print(f"   Scenario: {executor.scenario.name}")
         print(f"   Duration: {executor.scenario.duration_seconds}s")
-        print(f"   Connections: {executor.scenario.concurrent_connections}")
+        print(f"   Connections: {executor.scenario.total_threads}")
         print(f"   Workload: {executor.scenario.workload_type}")
         print(f"   Test ID: {executor.test_id}")
 

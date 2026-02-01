@@ -559,14 +559,14 @@ async with self._metrics_lock:
 
 ---
 
-## TOTAL LATENCY BREAKDOWN (After _wait_for_start() returns):
+## TOTAL LATENCY BREAKDOWN (After _wait_for_start() returns)
 
-### Fast Operations (CPU only, <5ms total):
+### Fast Operations (CPU only, <5ms total)
 - Logging, variable assignments, function definitions: **~3ms**
 - Worker task creation (100 workers @ 0.1ms each): **~10ms**
-- **Total CPU time: ~13ms**
+- Total CPU time: **~13ms**
 
-### Slow Operations (I/O, 200-400ms total):
+### Slow Operations (I/O, 200-400ms total)
 1. **Heartbeat RUNNING** (line 772): **100-200ms**
    - Query: `INSERT INTO WORKER_HEARTBEATS ...`
    - Can we eliminate? **NO** - orchestrator needs to know workers started
@@ -578,9 +578,9 @@ async with self._metrics_lock:
 
 3. **First benchmark query** (line 2928): **1-100ms+** (varies by query)
 
-### **ANSWER TO "WHERE ARE THE 7-8 SECONDS?"**
+### Answer to "Where Are the 7-8 Seconds?"
 
-The 7-8 seconds are **NOT** in the path after `_wait_for_start()` returns! 
+The 7-8 seconds are **NOT** in the path after `_wait_for_start()` returns!
 
 They are in the **BEFORE** section:
 1. **Pool initialization** (15-20s) - ✅ **Already fixed** (moved before _wait_for_start)
@@ -594,20 +594,20 @@ After `_wait_for_start()` returns, the **actual overhead is only ~200-400ms**:
 
 ---
 
-## POTENTIAL OPTIMIZATIONS (Post-_wait_for_start):
+## POTENTIAL OPTIMIZATIONS (Post-_wait_for_start)
 
-### ❌ **Cannot Eliminate:**
+### ❌ **Cannot Eliminate**
 1. **Heartbeat RUNNING** - Orchestrator relies on this to know workers started
 2. **Insert TEST_RESULTS** - Core result tracking requirement
 3. **Worker task spawning** - Necessary to start actual work
 
-### ✅ **Possible Optimization:**
+### ✅ **Possible Optimization**
 **Batch TEST_RESULTS insert with first metrics snapshot** (save ~100-200ms)
 - Currently: Sequential operations
   - Heartbeat RUNNING (line 772)
   - Insert TEST_RESULTS (lines 779-800)
   - Start workers (line 877)
-- Alternative: 
+- Alternative:
   - Heartbeat RUNNING
   - Start workers (line 877) - DO NOT WAIT
   - Insert TEST_RESULTS in background - workers already running
@@ -615,7 +615,7 @@ After `_wait_for_start()` returns, the **actual overhead is only ~200-400ms**:
 - **Risk:** If TEST_RESULTS insert fails, workers already running
 - **Mitigation:** TEST_RESULTS failures are already handled (line 797-800)
 
-### 🔍 **Investigation Needed:**
+### 🔍 **Investigation Needed**
 **Where exactly are the 7-8 seconds?**
 
 If pool init is already moved before _wait_for_start(), the overhead should be:
@@ -640,17 +640,17 @@ If pool init is already moved before _wait_for_start(), the overhead should be:
 
 ---
 
-## KEY FINDINGS:
+## KEY FINDINGS
 
-### ✅ **Already Optimized:**
+### ✅ **Already Optimized**
 - Pool initialization moved before _wait_for_start() (lines 620-638)
 - This **saves 15-20 seconds** of warmup time
 
-### ⚠️ **Still Potentially Slow:**
+### ⚠️ **Still Potentially Slow**
 - Table profiling (100-500ms) - but mostly optimized with value pools
 - Heartbeat + TEST_RESULTS inserts (~200-400ms) - required, but could be parallelized
 
-### 🎯 **The Real Question:**
+### 🎯 **The Real Question**
 **If pool init is before _wait_for_start() and post-wait overhead is only ~400ms, where are the 7-8 seconds?**
 
 Possible answers:

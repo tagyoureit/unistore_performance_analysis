@@ -107,7 +107,7 @@ async def test_query_tag_phase_separation():
             results = cursor.fetchall()
             cursor.close()
 
-        await pool.close()
+        await pool.close_all()
 
         if not results:
             pytest.skip(
@@ -124,7 +124,7 @@ async def test_query_tag_phase_separation():
         print("=" * 60)
 
         for row in results:
-            query_tag, count, phase = row[0], row[1], row[2]
+            _, count, phase = row[0], row[1], row[2]
             print(f"  {phase}: {count} queries")
             if phase == "WARMUP":
                 warmup_count += count

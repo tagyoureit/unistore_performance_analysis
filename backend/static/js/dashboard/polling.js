@@ -137,6 +137,8 @@ window.DashboardMixins.polling = {
   startEnrichmentPolling() {
     if (this._enrichmentPollIntervalId) return;
     if (this._destroyed) return;
+    const wsOpen = this.websocket && this.websocket.readyState === 1;
+    if (this.mode === "live" && wsOpen) return;
     this.pollEnrichmentStatus();
     this._enrichmentPollIntervalId = setInterval(() => {
       if (this._destroyed) {
@@ -151,6 +153,57 @@ window.DashboardMixins.polling = {
     if (this._enrichmentPollIntervalId) {
       clearInterval(this._enrichmentPollIntervalId);
       this._enrichmentPollIntervalId = null;
+    }
+  },
+
+  applyEnrichmentProgress(data) {
+    if (!data || typeof data !== "object") return;
+    const prevStatus = this.enrichmentProgress?.enrichment_status;
+    this.enrichmentProgress = data;
+    if (!this.templateInfo || typeof this.templateInfo !== "object") {
+      this.templateInfo = {};
+    }
+    if ("enrichment_status" in data) {
+      this.templateInfo.enrichment_status = data.enrichment_status;
+    }
+    if ("enrichment_error" in data) {
+      this.templateInfo.enrichment_error = data.enrichment_error;
+    }
+    if (typeof data.enrichment_ratio_pct === "number") {
+      this.templateInfo.sf_enrichment_ratio_pct = data.enrichment_ratio_pct;
+    }
+    if (data.total_queries != null) {
+      this.templateInfo.sf_enrichment_total_queries = data.total_queries;
+    }
+    if (data.enriched_queries != null) {
+      this.templateInfo.sf_enrichment_enriched_queries = data.enriched_queries;
+    }
+    if (typeof data.can_retry === "boolean") {
+      this.templateInfo.can_retry_enrichment = data.can_retry;
+    }
+
+    const status = String(data.enrichment_status || "").toUpperCase();
+    const isComplete =
+      data.is_complete === true || status === "COMPLETED" || status === "SKIPPED";
+    if (status && status !== "PENDING") {
+      this.stopEnrichmentPolling();
+    }
+    if (isComplete && status === "COMPLETED" && prevStatus !== "COMPLETED") {
+      if (typeof this.loadTestInfo === "function") {
+        this.loadTestInfo();
+      }
+      this.phase = "COMPLETED";
+      if (typeof this.stopElapsedTimer === "function") {
+        this.stopElapsedTimer();
+      }
+      if (window.toast && typeof window.toast.success === "function") {
+        const ratio = Number.isFinite(Number(data.enrichment_ratio_pct))
+          ? data.enrichment_ratio_pct
+          : 0;
+        window.toast.success(
+          `Enrichment completed (${ratio}% queries enriched)`,
+        );
+      }
     }
   },
 

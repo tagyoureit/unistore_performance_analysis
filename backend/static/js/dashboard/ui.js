@@ -157,4 +157,55 @@ window.DashboardMixins.ui = {
       },
     });
   },
+
+  initFloatingToolbar() {
+    if (this.mode !== "history") return;
+
+    const SCROLL_THRESHOLD = 300;
+    
+    const handleScroll = () => {
+      this.floatingToolbarVisible = window.scrollY > SCROLL_THRESHOLD;
+    };
+
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    this._floatingToolbarScrollHandler = handleScroll;
+    handleScroll();
+
+    const chartsSection = document.querySelector('[data-section="charts"]');
+    const latencySection = document.querySelector('[data-section="latency"]');
+
+    if (chartsSection || latencySection) {
+      const observerCallback = (entries) => {
+        for (const entry of entries) {
+          const section = entry.target.dataset.section;
+          if (section === "charts") {
+            this.chartsInView = entry.isIntersecting;
+          } else if (section === "latency") {
+            this.latencyInView = entry.isIntersecting;
+          }
+        }
+      };
+
+      const observer = new IntersectionObserver(observerCallback, {
+        root: null,
+        rootMargin: "0px",
+        threshold: 0,
+      });
+
+      if (chartsSection) observer.observe(chartsSection);
+      if (latencySection) observer.observe(latencySection);
+      this._floatingToolbarObserver = observer;
+    }
+  },
+
+  destroyFloatingToolbar() {
+    if (this._floatingToolbarScrollHandler) {
+      window.removeEventListener("scroll", this._floatingToolbarScrollHandler);
+      this._floatingToolbarScrollHandler = null;
+    }
+    if (this._floatingToolbarObserver) {
+      this._floatingToolbarObserver.disconnect();
+      this._floatingToolbarObserver = null;
+    }
+  },
 };

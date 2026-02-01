@@ -38,6 +38,9 @@ window.DashboardMixins.timeseries = {
       }
       this.warehouseTs = data && Array.isArray(data.points) ? data.points : [];
       this.warehouseTsAvailable = !!(data && data.available);
+      this.warehouseTsWarmupEndElapsed = data && data.warmup_end_elapsed_seconds != null
+        ? Number(data.warmup_end_elapsed_seconds)
+        : null;
 
       if (this.debug) {
         this._debugCharts("loadWarehouseTimeseries: before init", {
@@ -94,7 +97,13 @@ window.DashboardMixins.timeseries = {
         (window.Chart && Chart.getChart ? Chart.getChart(canvas) : null));
     if (!canvas || !chart) return;
 
-    const points = Array.isArray(this.warehouseTs) ? this.warehouseTs : [];
+    const allPoints = Array.isArray(this.warehouseTs) ? this.warehouseTs : [];
+    const warmupEnd = this.warehouseTsWarmupEndElapsed;
+    const showWarmup = this.showWarmup;
+
+    const points = showWarmup
+      ? allPoints
+      : allPoints.filter((p) => !p || !p.warmup);
 
     const labels = [];
     const clusters = [];
@@ -103,9 +112,10 @@ window.DashboardMixins.timeseries = {
 
     for (const p of points) {
       if (!p) continue;
-      // Use elapsed_seconds for labels to avoid browser-specific parsing issues
-      // with microsecond timestamps (e.g., "2026-01-08T18:24:28.734695").
-      const secs = Number(p.elapsed_seconds || 0);
+      let secs = Number(p.elapsed_seconds || 0);
+      if (!showWarmup && warmupEnd != null) {
+        secs = secs - warmupEnd;
+      }
       const ts = `${this.formatSecondsTenths(secs)}s`;
       labels.push(ts);
 
@@ -130,6 +140,32 @@ window.DashboardMixins.timeseries = {
         ? "Queued time (ms, total per second)"
         : "Queued time (ms, avg per query / second)";
     chart.options.scales.yQueue.title.text = yTitle;
+
+    if (showWarmup && warmupEnd != null && warmupEnd > 0) {
+      const warmupLabel = `${this.formatSecondsTenths(warmupEnd)}s`;
+      const warmupIndex = labels.indexOf(warmupLabel);
+      if (!chart.options.plugins.annotation) {
+        chart.options.plugins.annotation = { annotations: {} };
+      }
+      chart.options.plugins.annotation.annotations.warmupLine = {
+        type: "line",
+        xMin: warmupIndex >= 0 ? warmupIndex : warmupEnd,
+        xMax: warmupIndex >= 0 ? warmupIndex : warmupEnd,
+        borderColor: "rgba(255, 165, 0, 0.8)",
+        borderWidth: 2,
+        borderDash: [6, 4],
+        label: {
+          display: true,
+          content: "Warmup End",
+          position: "start",
+          backgroundColor: "rgba(255, 165, 0, 0.8)",
+          color: "#fff",
+          font: { size: 10 },
+        },
+      };
+    } else if (chart.options.plugins.annotation?.annotations?.warmupLine) {
+      delete chart.options.plugins.annotation.annotations.warmupLine;
+    }
 
     chart.update();
   },
@@ -161,6 +197,9 @@ window.DashboardMixins.timeseries = {
       }
       this.overheadTs = data && Array.isArray(data.points) ? data.points : [];
       this.overheadTsAvailable = !!(data && data.available);
+      this.overheadTsWarmupEndElapsed = data && data.warmup_end_elapsed_seconds != null
+        ? Number(data.warmup_end_elapsed_seconds)
+        : null;
 
       this.initCharts({ onlyOverhead: true });
       this.renderOverheadTimeseriesChart();
@@ -183,7 +222,13 @@ window.DashboardMixins.timeseries = {
         (window.Chart && Chart.getChart ? Chart.getChart(canvas) : null));
     if (!canvas || !chart) return;
 
-    const points = Array.isArray(this.overheadTs) ? this.overheadTs : [];
+    const allPoints = Array.isArray(this.overheadTs) ? this.overheadTs : [];
+    const warmupEnd = this.overheadTsWarmupEndElapsed;
+    const showWarmup = this.showWarmup;
+
+    const points = showWarmup
+      ? allPoints
+      : allPoints.filter((p) => !p || !p.warmup);
 
     const labels = [];
     const overheadData = [];
@@ -193,7 +238,10 @@ window.DashboardMixins.timeseries = {
 
     for (const p of points) {
       if (!p) continue;
-      const secs = Number(p.elapsed_seconds || 0);
+      let secs = Number(p.elapsed_seconds || 0);
+      if (!showWarmup && warmupEnd != null) {
+        secs = secs - warmupEnd;
+      }
       labels.push(`${this.formatSecondsTenths(secs)}s`);
 
       const overhead = p.p50_overhead_ms != null ? Number(p.p50_overhead_ms) : null;
@@ -209,6 +257,41 @@ window.DashboardMixins.timeseries = {
     chart.data.datasets[2].data = sfTotalData;
     chart.data.datasets[3].data = enrichedCountData;
 
+    if (showWarmup && warmupEnd != null && warmupEnd > 0) {
+      const warmupLabel = `${this.formatSecondsTenths(warmupEnd)}s`;
+      const warmupIndex = labels.indexOf(warmupLabel);
+      if (!chart.options.plugins.annotation) {
+        chart.options.plugins.annotation = { annotations: {} };
+      }
+      chart.options.plugins.annotation.annotations.warmupLine = {
+        type: "line",
+        xMin: warmupIndex >= 0 ? warmupIndex : warmupEnd,
+        xMax: warmupIndex >= 0 ? warmupIndex : warmupEnd,
+        borderColor: "rgba(255, 165, 0, 0.8)",
+        borderWidth: 2,
+        borderDash: [6, 4],
+        label: {
+          display: true,
+          content: "Warmup End",
+          position: "start",
+          backgroundColor: "rgba(255, 165, 0, 0.8)",
+          color: "#fff",
+          font: { size: 10 },
+        },
+      };
+    } else if (chart.options.plugins.annotation?.annotations?.warmupLine) {
+      delete chart.options.plugins.annotation.annotations.warmupLine;
+    }
+
     chart.update();
+  },
+
+  toggleShowWarmup() {
+    this.showWarmup = !this.showWarmup;
+    this.renderWarehouseTimeseriesChart();
+    this.renderOverheadTimeseriesChart();
+    if (typeof this.renderHistoricalCharts === "function") {
+      this.renderHistoricalCharts();
+    }
   },
 };

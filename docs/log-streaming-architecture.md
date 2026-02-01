@@ -55,11 +55,13 @@ intercepts log records and converts them to structured events.
     "logger": str,        # Module path (e.g., "backend.core.orchestrator")
     "message": str,       # Log message (truncated to 20K chars)
     "exception": str,     # Formatted traceback if present
+    "worker_id": str,     # CONTROLLER, ORCHESTRATOR, worker-id, or UNKNOWN
 }
 ```
 
 **Key Behaviors**:
 - Uses `CURRENT_TEST_ID` contextvar for per-test isolation (`test_log_stream.py:18`)
+- Uses `CURRENT_WORKER_ID` contextvar and `record.worker_id` to label sources
 - Non-blocking: drops logs if queue full (`test_log_stream.py:84-86`)
 - Message truncation: 20,000 char limit (`test_log_stream.py:59-60`)
 
@@ -89,6 +91,7 @@ Logs are persisted to `TEST_RESULTS.TEST_LOGS` table:
 |--------|------|-------------|
 | LOG_ID | VARCHAR | UUID for deduplication |
 | TEST_ID | VARCHAR | Parent test run ID |
+| WORKER_ID | VARCHAR | CONTROLLER, ORCHESTRATOR, or worker identifier |
 | SEQ | INTEGER | Sequence number |
 | TIMESTAMP | TIMESTAMP_NTZ | Event timestamp |
 | LEVEL | VARCHAR | Log level |
@@ -134,15 +137,16 @@ Endpoint: `GET /api/tests/{test_id}/logs`
 
 **Location**: `backend/templates/pages/dashboard.html:425-449`
 
-The UI displays logs in a `<pre>` element with:
-- Worker selector dropdown (for multi-node runs)
-- Monospace font, dark theme
-- Auto-scroll behavior
-- Max 1000 lines displayed
+The UI displays logs with:
+- Worker test selector dropdown (for multi-worker runs)
+- Source filter (worker/controller/orchestrator), level filter, and verbose toggle
+- Worker badges that can be clicked to filter
+- Monospace font, dark theme, max 1000 lines displayed
 
-**Log formatting** (`backend/static/js/dashboard/logs.js:92-104`):
+**Log formatting** (`backend/static/js/dashboard/logs.js`):
 ```javascript
-`${timestamp} ${LEVEL}${logger} - ${message}${exception}`
+// Filters apply before rendering.
+const logs = this.filteredLogs();
 ```
 
 ## Rate Limiting & Batching Summary
@@ -158,47 +162,15 @@ The UI displays logs in a `<pre>` element with:
 | WebSocket Send | Polling interval | 1 second |
 | Frontend Buffer | Display limit | 1000 lines |
 
-## Current Limitations
+## Remaining Limitations
 
-### 1. No Worker ID in Log Events
+### 1. Single Log Stream
 
-**Problem**: Log events don't include the worker ID that generated them.
-
-**Impact**: 
-- Cannot filter logs by worker in UI
-- Logs from multiple workers are interleaved without clear attribution
-- Difficult to debug worker-specific issues
-
-**Location**: `test_log_stream.py:69-79` - missing `worker_id` field
-
-### 2. No Log Level Filtering in UI
-
-**Problem**: UI shows all log levels without filtering controls.
+**Problem**: All workers share a single log queue and stream per test.
 
 **Impact**:
-- Users see verbose DEBUG logs alongside important ERRORs
-- No way to focus on specific severity levels
-- Information overload during debugging
-
-**Location**: `dashboard.html:425-449` - no filter controls
-
-### 3. Verbose Logger Names
-
-**Problem**: Logger names are full module paths (e.g., `backend.core.orchestrator`).
-
-**Impact**:
-- Takes up horizontal space in log display
-- Not immediately useful for worker identification
-- Inconsistent with worker-centric mental model
-
-### 4. Single Log Stream
-
-**Problem**: All workers share a single log queue and stream.
-
-**Impact**:
-- Logs from different workers are interleaved
-- No per-worker log isolation
-- Difficult to track worker-specific sequences of events
+- Logs from different workers can still interleave
+- No per-worker log tabs (planned follow-up)
 
 ## Related Documents
 

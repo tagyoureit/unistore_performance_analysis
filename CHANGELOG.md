@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard log panel now supports source badges, level filtering, and a
+  verbose logger toggle.
 - feat(orchestrator): persist run creation in `RUN_STATUS` and parent
   `TEST_RESULTS` with scenario config snapshots.
 - feat(api): add `/api/runs` endpoints for orchestrator run creation/start/stop.
@@ -90,10 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- fix(ws): stream all live log updates over WebSocket (no server limit) and
+  drop live HTTP log fetches while keeping enrichment/warehouse updates streaming.
 - perf(api): parallelize initial queries in `GET /api/tests/{test_id}` endpoint.
-  TEST_RESULTS, RUN_STATUS, and enrichment status now fetch concurrently in Phase 1
-  (previously sequential, adding ~1.5-3s latency). Also made `update_parent_run_aggregate()`
-  fire-and-forget to avoid blocking the API response.
+  TEST_RESULTS, RUN_STATUS, and enrichment status now fetch concurrently in
+  Phase 1 (previously sequential, adding ~1.5-3s latency). Also made
+  `update_parent_run_aggregate()` fire-and-forget to avoid blocking the API
+  response.
 - fix(ws): derive WebSocket elapsed timing in Snowflake (TIMESTAMPDIFF +
   duration_seconds) to avoid timezone drift and post-completion growth.
 - fix(ui): gate live WebSocket to measurement/STOPPING and prefer
@@ -117,6 +122,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so PREPARING/WARMUP display correctly.
 - Multi-node live dashboard run logs now support per-node selection via a dropdown
   instead of showing an empty aggregate log view.
+- fix(ui): add an "All" option and ensure worker IDs populate the unified
+  run log source dropdown spanning parent sources and worker logs.
+- fix(ui): keep live run log polling active through PREPARING and PROCESSING
+  so new worker sources appear while the WebSocket is active.
 - Autoscale runs now prepare without autostart, returning to the live dashboard
   and starting only when the user clicks Start.
 - Autoscale worker launch now uses async subprocesses to avoid blocking the
@@ -154,6 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Persist `WORKER_ID` on `TEST_LOGS` entries and include it in log streaming.
 - refactor(terminology): rename "node" to "worker" across API, UI, and docs to
   align with project nomenclature decision. Changes include:
   - API endpoint `/api/tests/{test_id}/node-metrics` → `/worker-metrics`

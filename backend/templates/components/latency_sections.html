@@ -11,35 +11,8 @@
    - templateInfo, metrics
 #}
 
-<div x-show="mode === 'history'" style="display:flex; justify-content: flex-end; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
-    <div style="font-weight: 600;">Latency view:</div>
-    <button
-        type="button"
-        class="btn btn-sm"
-        :class="latencyView === 'sf_execution' ? 'btn-primary' : 'btn-secondary'"
-        @click="setLatencyView('sf_execution')"
-        :disabled="!sfLatencyAvailable()"
-        :title="sfLatencyAvailable() ? 'Server-side SQL execution time (Snowflake QUERY_HISTORY.EXECUTION_TIME). Excludes client/network.' : sfLatencyDisabledReason()"
-    >
-        SQL execution (Snowflake)
-    </button>
-    <button
-        type="button"
-        class="btn btn-sm"
-        :class="latencyView === 'end_to_end' ? 'btn-primary' : 'btn-secondary'"
-        @click="setLatencyView('end_to_end')"
-        title="End-to-end latency measured by the benchmark app (includes client/network/connector + Snowflake + result transfer)."
-    >
-        End-to-end (app)
-    </button>
-    <div
-        x-show="latencyView === 'sf_execution' && !sfLatencyAvailable()"
-        style="color: #6b7280;"
-        :title="sfLatencyDisabledReason()"
-    >
-        Available after processing
-    </div>
-</div>
+<!-- Latency section wrapper for floating toolbar visibility detection -->
+<div data-section="latency">
 
 <div
     x-show="mode === 'history' && latencyView === 'sf_execution' && sfEnrichmentLowWarning()"
@@ -594,4 +567,5 @@
     </table>
 </div>
 
+</div><!-- end data-section="latency" wrapper -->
 

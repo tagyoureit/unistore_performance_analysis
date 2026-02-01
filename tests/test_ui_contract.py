@@ -68,6 +68,7 @@ class TestFetchRunStatus:
                         3,  # workers_active
                         1,  # workers_completed
                         find_max_state,  # find_max_state
+                        None,  # cancellation_reason
                         300.0,  # elapsed_seconds
                     )
                 ]
@@ -123,6 +124,7 @@ class TestFetchRunStatus:
                         1,
                         0,
                         None,  # find_max_state is NULL
+                        None,  # cancellation_reason
                         120.0,  # elapsed_seconds
                     )
                 ]
@@ -155,6 +157,7 @@ class TestFetchRunStatus:
                         1,
                         1,
                         0,
+                        None,
                         None,
                         0.0,
                     )
