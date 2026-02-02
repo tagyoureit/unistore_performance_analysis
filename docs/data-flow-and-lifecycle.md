@@ -595,9 +595,9 @@ Note: For very high-concurrency workloads, QUERY_HISTORY enrichment can be
 sampled (<1% enriched). This behavior varies significantly by table type:
 
 - **Standard tables**: All queries logged to QUERY_HISTORY (full enrichment expected)
-- **Hybrid tables**: Short-running queries (<500ms) that operate exclusively on hybrid 
-  tables are NOT logged to QUERY_HISTORY. Only queries that take >500ms, fail, involve 
-  transactions, or are run from Snowsight/SnowSQL generate QUERY_HISTORY records. 
+- **Hybrid tables**: Short-running queries (<500ms) that operate exclusively on hybrid
+  tables are NOT logged to QUERY_HISTORY. Only queries that take >500ms, fail, involve
+  transactions, or are run from Snowsight/SnowSQL generate QUERY_HISTORY records.
   Fast point lookups and inserts are typically sampled, not fully logged.
 - **Interactive tables**: Similar to hybrid tables (uses same Unistore engine)
 - **Postgres / Snowflake-Postgres**: Enrichment is **skipped entirely**. PostgreSQL's
@@ -611,7 +611,7 @@ stops early if:
 - Timeout reached
 
 For hybrid/interactive workloads with predominantly fast queries, expect low enrichment
-ratios. For Postgres tests, enrichment status will show "SKIPPED". In both cases, 
+ratios. For Postgres tests, enrichment status will show "SKIPPED". In both cases,
 prefer app-captured metrics (APP_ELAPSED_MS, APP_P95_MS, etc.).
 
 ### Future Enhancement: T-Digest Sketches

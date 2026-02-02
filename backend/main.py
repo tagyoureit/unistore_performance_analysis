@@ -1100,13 +1100,13 @@ async def _aggregate_multi_worker_metrics(parent_run_id: str) -> dict[str, Any]:
         "sf_bench": _sum_dicts(sf_bench_list),
         "resources": _avg_dicts(resources_list),
     }
+    # Warehouse MCW data comes ONLY from orchestrator's WAREHOUSE_POLL_SNAPSHOTS
     poller_snapshot = await results_store.fetch_latest_warehouse_poll_snapshot(
         run_id=parent_run_id
     )
     if poller_snapshot is not None:
         custom_metrics_out["warehouse"] = poller_snapshot
-    else:
-        custom_metrics_out["warehouse"] = _sum_dicts(warehouse_list)
+    # If no snapshot available yet, warehouse key is simply not set (don't sum worker data)
     if find_max_controller is not None:
         custom_metrics_out["find_max_controller"] = find_max_controller
     if qps_controller is not None:
@@ -1397,6 +1397,49 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
     known_test_ids: list[str] = [str(test_id)]
     warehouse_name: str | None = None
     warehouse_table_type: str | None = None
+    loop = asyncio.get_running_loop()
+    last_poll_at: dict[str, float] = {}
+    pending_tasks: dict[str, asyncio.Task[Any]] = {}
+    cached_run_status: dict[str, Any] | None = None
+    cached_parent_status: str | None = None
+    cached_test_ids: list[str] = list(known_test_ids)
+    cached_enrichment_status: str | None = None
+    cached_enrichment_progress: dict[str, Any] | None = None
+    cached_warehouse_details: dict[str, Any] | None = None
+    warehouse_details_payload: dict[str, Any] | None = None
+    logs_buffer: list[dict[str, Any]] = []
+
+    RUN_STATUS_TTL_TRANSITION = 1.0
+    RUN_STATUS_TTL_ACTIVE = 2.0
+    RUN_STATUS_TTL_TERMINAL = 5.0
+    PARENT_STATUS_TTL = 5.0
+    TEST_IDS_TTL = 10.0
+    LOGS_TTL = 3.0
+    ENRICHMENT_STATUS_TTL = 5.0
+    ENRICHMENT_PROGRESS_TTL = 5.0
+    WAREHOUSE_CONTEXT_TTL = 10.0
+    WAREHOUSE_DETAILS_TTL = 30.0
+
+    def _should_poll(key: str, ttl: float, now: float) -> bool:
+        last = last_poll_at.get(key)
+        return last is None or now - last >= ttl
+
+    def _start_task(key: str, coro: Any) -> None:
+        if key in pending_tasks:
+            return
+        pending_tasks[key] = asyncio.create_task(coro)
+
+    def _consume_task(key: str, now: float) -> tuple[Any | None, bool]:
+        task = pending_tasks.get(key)
+        if not task or not task.done():
+            return None, False
+        pending_tasks.pop(key, None)
+        last_poll_at[key] = now
+        try:
+            return task.result(), True
+        except Exception:
+            return None, True
+
     while True:
         recv_task = asyncio.create_task(websocket.receive())
         sleep_task = asyncio.create_task(asyncio.sleep(poll_interval))
@@ -1415,16 +1458,66 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         if websocket.client_state != WebSocketState.CONNECTED:
             break
 
-        run_status = await _fetch_run_status(test_id)
+        now = loop.time()
+        run_status_result, run_status_done = _consume_task("run_status", now)
+        if run_status_done and run_status_result is not None:
+            cached_run_status = run_status_result
+
+        parent_status_result, parent_status_done = _consume_task("parent_status", now)
+        if parent_status_done and parent_status_result:
+            cached_parent_status = parent_status_result
+
+        test_ids_result, test_ids_done = _consume_task("test_ids", now)
+        if test_ids_done and test_ids_result:
+            cached_test_ids = test_ids_result
+
+        logs_result, logs_done = _consume_task("logs", now)
+        if logs_done:
+            logs_buffer = logs_result or []
+
+        enrichment_status_result, enrichment_status_done = _consume_task(
+            "enrichment_status", now
+        )
+        if enrichment_status_done and enrichment_status_result:
+            cached_enrichment_status = enrichment_status_result
+
+        enrichment_progress_result, enrichment_progress_done = _consume_task(
+            "enrichment_progress", now
+        )
+        if enrichment_progress_done and enrichment_progress_result:
+            cached_enrichment_progress = enrichment_progress_result
+
+        warehouse_context_result, warehouse_context_done = _consume_task(
+            "warehouse_context", now
+        )
+        if warehouse_context_done and isinstance(warehouse_context_result, tuple):
+            context_warehouse, context_table_type = warehouse_context_result
+            if context_warehouse or context_table_type:
+                warehouse_name = context_warehouse
+                warehouse_table_type = context_table_type
+
+        warehouse_details_result, warehouse_details_done = _consume_task(
+            "warehouse_details", now
+        )
+        if warehouse_details_done and warehouse_details_result:
+            cached_warehouse_details = warehouse_details_result
+            warehouse_details_payload = {
+                "test_id": test_id,
+                "warehouse": warehouse_details_result,
+            }
+
+        run_status = cached_run_status
         status = run_status.get("status") if run_status else None
-        status = status or await _get_parent_test_status(test_id) or "RUNNING"
+        if not status:
+            status = cached_parent_status
+        status = status or "RUNNING"
         status_upper = str(status or "").upper()
         live_snapshot = await live_metrics_cache.get_run_snapshot(run_id=test_id)
-        cached_test_ids: list[str] | None = None
+        snapshot_test_ids: list[str] | None = None
         if live_snapshot:
             metrics = dict(live_snapshot.metrics)
             workers = list(live_snapshot.workers)
-            cached_test_ids = list(live_snapshot.test_ids)
+            snapshot_test_ids = list(live_snapshot.test_ids)
         else:
             metrics = await _aggregate_multi_worker_metrics(test_id)
             metrics = metrics or {}
@@ -1443,7 +1536,7 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         if status_upper == "STOPPING":
             phase = "PROCESSING"
         if status_upper == "COMPLETED":
-            enrichment_status = await _fetch_parent_enrichment_status(test_id)
+            enrichment_status = cached_enrichment_status
             # Treat None as PENDING to handle race condition where RUN_STATUS is
             # updated before TEST_RESULTS.ENRICHMENT_STATUS is set
             if enrichment_status in ("PENDING", None):
@@ -1496,10 +1589,12 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         if run_status and run_status.get("cancellation_reason"):
             payload["cancellation_reason"] = run_status.get("cancellation_reason")
         custom_metrics = metrics.get("custom_metrics")
-        if isinstance(custom_metrics, dict):
-            warehouse = custom_metrics.get("warehouse")
-            if isinstance(warehouse, dict):
-                payload["warehouse"] = warehouse
+        # Warehouse MCW data comes from orchestrator's WAREHOUSE_POLL_SNAPSHOTS, not workers
+        warehouse_snapshot = await results_store.fetch_latest_warehouse_poll_snapshot(
+            run_id=test_id
+        )
+        if warehouse_snapshot:
+            payload["warehouse"] = warehouse_snapshot
         if elapsed_seconds is not None:
             payload["elapsed"] = float(elapsed_seconds)
             timing = {"elapsed_display_seconds": round(float(elapsed_seconds), 1)}
@@ -1516,41 +1611,88 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         if cached_test_ids:
             known_test_ids = cached_test_ids
         else:
-            known_test_ids = await _fetch_run_test_ids(test_id)
+            known_test_ids = [str(test_id)]
+        if snapshot_test_ids:
+            known_test_ids = snapshot_test_ids
         for tid in known_test_ids:
             last_log_seq_by_test.setdefault(tid, 0)
 
         # Fetch new logs since last sequence (all child tests)
-        new_logs = await _fetch_logs_for_tests(known_test_ids, last_log_seq_by_test)
+        new_logs = logs_buffer
+        logs_buffer = []
         if new_logs:
             payload["logs"] = new_logs
             last_log_seq = max(last_log_seq, last_log_seq_by_test.get(str(test_id), 0))
 
         phase_upper = str(phase or "").upper()
         if status_upper == "COMPLETED" or phase_upper == "PROCESSING":
-            enrichment_progress = await _fetch_enrichment_progress(test_id)
+            enrichment_progress = cached_enrichment_progress
             if enrichment_progress:
                 payload["enrichment_progress"] = enrichment_progress
-
-        if warehouse_name is None:
-            warehouse_name, warehouse_table_type = await _fetch_warehouse_context(
-                test_id
-            )
         is_postgres_table = warehouse_table_type in (
             "postgres",
             "snowflake_postgres",
         )
+        if warehouse_details_payload:
+            payload["warehouse_details"] = warehouse_details_payload
+            warehouse_details_payload = None
+
+        is_terminal_status = status_upper in {
+            "STOPPED",
+            "FAILED",
+            "CANCELLED",
+            "COMPLETED",
+        }
+        is_transition_status = status_upper in {
+            "STARTING",
+            "READY",
+            "STOPPING",
+            "CANCELLING",
+        } or phase_upper in {"PREPARING", "PROCESSING"}
+        run_status_ttl = (
+            RUN_STATUS_TTL_TRANSITION
+            if is_transition_status
+            else RUN_STATUS_TTL_TERMINAL
+            if is_terminal_status
+            else RUN_STATUS_TTL_ACTIVE
+        )
+        if _should_poll("run_status", run_status_ttl, now):
+            _start_task("run_status", _fetch_run_status(test_id))
+        if (run_status is None or not run_status.get("status")) and _should_poll(
+            "parent_status", PARENT_STATUS_TTL, now
+        ):
+            _start_task("parent_status", _get_parent_test_status(test_id))
+        if _should_poll("test_ids", TEST_IDS_TTL, now):
+            _start_task("test_ids", _fetch_run_test_ids(test_id))
+        if known_test_ids and _should_poll("logs", LOGS_TTL, now):
+            _start_task(
+                "logs", _fetch_logs_for_tests(known_test_ids, last_log_seq_by_test)
+            )
+        if status_upper == "COMPLETED" and _should_poll(
+            "enrichment_status", ENRICHMENT_STATUS_TTL, now
+        ):
+            _start_task("enrichment_status", _fetch_parent_enrichment_status(test_id))
+        if (
+            status_upper == "COMPLETED" or phase_upper == "PROCESSING"
+        ) and _should_poll("enrichment_progress", ENRICHMENT_PROGRESS_TTL, now):
+            _start_task("enrichment_progress", _fetch_enrichment_progress(test_id))
+        if warehouse_name is None and _should_poll(
+            "warehouse_context", WAREHOUSE_CONTEXT_TTL, now
+        ):
+            _start_task("warehouse_context", _fetch_warehouse_context(test_id))
         if (
             warehouse_name
             and not is_postgres_table
             and phase_upper in {"WARMUP", "MEASUREMENT"}
+            and (
+                cached_warehouse_details is None
+                or _should_poll("warehouse_details", WAREHOUSE_DETAILS_TTL, now)
+            )
         ):
-            config = await results_store.fetch_warehouse_config_snapshot(warehouse_name)
-            if config:
-                payload["warehouse_details"] = {
-                    "test_id": test_id,
-                    "warehouse": config,
-                }
+            _start_task(
+                "warehouse_details",
+                results_store.fetch_warehouse_config_snapshot(warehouse_name),
+            )
 
         await websocket.send_json({"event": "RUN_UPDATE", "data": payload})
         last_sent_phase = phase  # Track what we sent

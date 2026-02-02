@@ -491,33 +491,49 @@ def _normalize_template_config(cfg: Any) -> dict[str, Any]:
     if not isinstance(guardrails_cfg, dict):
         guardrails_cfg = {}
 
-    # Get max_cpu_percent from guardrails or legacy field
-    max_cpu_raw = guardrails_cfg.get("max_cpu_percent")
-    if max_cpu_raw is None:
-        max_cpu_raw = out.get("autoscale_max_cpu_percent")
-    max_cpu = _coerce_int(max_cpu_raw or 80, label="guardrails.max_cpu_percent")
+    # Check if guardrails are explicitly disabled
+    guardrails_enabled = guardrails_cfg.get("enabled")
+    if guardrails_enabled is None:
+        guardrails_enabled = True  # Default to enabled for backward compatibility
 
-    # Get max_memory_percent from guardrails or legacy field
-    max_mem_raw = guardrails_cfg.get("max_memory_percent")
-    if max_mem_raw is None:
-        max_mem_raw = out.get("autoscale_max_memory_percent")
-    max_mem = _coerce_int(max_mem_raw or 85, label="guardrails.max_memory_percent")
+    if guardrails_enabled:
+        # Get max_cpu_percent from guardrails or legacy field
+        max_cpu_raw = guardrails_cfg.get("max_cpu_percent")
+        if max_cpu_raw is None:
+            max_cpu_raw = out.get("autoscale_max_cpu_percent")
+        max_cpu = _coerce_int(max_cpu_raw or 80, label="guardrails.max_cpu_percent")
 
-    # Validate guardrails for non-FIXED modes
-    if autoscale_enabled:
-        if max_cpu <= 0 or max_cpu > 100:
-            raise ValueError("guardrails.max_cpu_percent must be within (0, 100]")
-        if max_mem <= 0 or max_mem > 100:
-            raise ValueError("guardrails.max_memory_percent must be within (0, 100]")
+        # Get max_memory_percent from guardrails or legacy field
+        max_mem_raw = guardrails_cfg.get("max_memory_percent")
+        if max_mem_raw is None:
+            max_mem_raw = out.get("autoscale_max_memory_percent")
+        max_mem = _coerce_int(max_mem_raw or 85, label="guardrails.max_memory_percent")
 
-    # Store both new and legacy formats for compatibility
-    out["guardrails"] = {
-        "max_cpu_percent": int(max_cpu),
-        "max_memory_percent": int(max_mem),
-    }
-    # Keep legacy fields for backward compatibility
-    out["autoscale_max_cpu_percent"] = int(max_cpu)
-    out["autoscale_max_memory_percent"] = int(max_mem)
+        # Validate guardrails for non-FIXED modes
+        if autoscale_enabled:
+            if max_cpu <= 0 or max_cpu > 100:
+                raise ValueError("guardrails.max_cpu_percent must be within (0, 100]")
+            if max_mem <= 0 or max_mem > 100:
+                raise ValueError("guardrails.max_memory_percent must be within (0, 100]")
+
+        # Store both new and legacy formats for compatibility
+        out["guardrails"] = {
+            "enabled": True,
+            "max_cpu_percent": int(max_cpu),
+            "max_memory_percent": int(max_mem),
+        }
+        # Keep legacy fields for backward compatibility
+        out["autoscale_max_cpu_percent"] = int(max_cpu)
+        out["autoscale_max_memory_percent"] = int(max_mem)
+    else:
+        # Guardrails disabled - set to None so orchestrator skips checks
+        out["guardrails"] = {
+            "enabled": False,
+            "max_cpu_percent": None,
+            "max_memory_percent": None,
+        }
+        out["autoscale_max_cpu_percent"] = None
+        out["autoscale_max_memory_percent"] = None
 
     return out
 

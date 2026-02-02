@@ -1,6 +1,6 @@
 {
   "system": {
-    "exclude_path": "rules/**,skills/**,AGENTS.md,RULES_INDEX.md,PROJECT.md,*_ANALYSIS.md"
+    "exclude_path": "rules/**,skills/**,AGENTS.md,RULES_INDEX.md,PROJECT.md,*_ANALYSIS.md,docs/plan/**,docs/failed-timer-learnings.md,docs/metrics-streaming-debug.md,docs/log-streaming-architecture.md"
   },
   "plugins": {
     "first-line-heading": {

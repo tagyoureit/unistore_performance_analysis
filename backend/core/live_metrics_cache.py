@@ -197,10 +197,12 @@ def _aggregate_workers(
     phases: list[str] = []
     app_ops_list: list[dict[str, Any]] = []
     sf_bench_list: list[dict[str, Any]] = []
-    warehouse_list: list[dict[str, Any]] = []
     resources_list: list[dict[str, Any]] = []
     find_max_controller: dict[str, Any] | None = None
     qps_controller: dict[str, Any] | None = None
+    # NOTE: Warehouse MCW data (started_clusters) is NOT aggregated from workers.
+    # It's polled by the orchestrator only and fetched from WAREHOUSE_POLL_SNAPSHOTS
+    # at the API layer. See main.py where RUN_UPDATE payloads are built.
 
     worker_rows: list[dict[str, Any]] = []
 
@@ -256,9 +258,7 @@ def _aggregate_workers(
         sf_bench = custom_metrics.get("sf_bench")
         if isinstance(sf_bench, dict):
             sf_bench_list.append(sf_bench)
-        warehouse = custom_metrics.get("warehouse")
-        if isinstance(warehouse, dict):
-            warehouse_list.append(warehouse)
+        # NOTE: Warehouse MCW data is NOT collected from workers - see comment above.
         resources = custom_metrics.get("resources")
         if isinstance(resources, dict):
             resources_list.append(resources)
@@ -311,7 +311,8 @@ def _aggregate_workers(
         "app_ops_breakdown": _sum_dicts(app_ops_list),
         "sf_bench": _sum_dicts(sf_bench_list),
         "resources": _avg_dicts(resources_list),
-        "warehouse": _sum_dicts(warehouse_list),
+        # NOTE: warehouse is NOT included here - it's fetched from WAREHOUSE_POLL_SNAPSHOTS
+        # at the API layer (main.py) since it's orchestrator-level data, not worker-level.
     }
     if find_max_controller is not None:
         custom_metrics_out["find_max_controller"] = find_max_controller

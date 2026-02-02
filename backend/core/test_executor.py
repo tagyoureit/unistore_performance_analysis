@@ -157,9 +157,8 @@ class TestExecutor:
         # Per-test query tag for benchmark sessions (populated by TestRegistry when using
         # template runs / per-test pools).
         self._benchmark_query_tag: str | None = None
-        self._warehouse_status: dict[str, Any] = {}
-        self._last_warehouse_status_mono: float | None = None
-        self._warehouse_status_task: asyncio.Task | None = None
+        # NOTE: Warehouse MCW status (started_clusters, running, queued) is polled by the
+        # orchestrator only, not by workers. See orchestrator.py _poll_warehouse().
         # Best-effort server-side query state sampling (running/queued) for this test.
         self._warehouse_query_status: dict[str, Any] = {}
         self._last_warehouse_query_status_mono: float | None = None
@@ -4274,45 +4273,17 @@ class TestExecutor:
                         # Best-effort: ignore individual pool stat failures.
                         continue
 
-                # Schedule Snowflake telemetry sampling out-of-band so the metrics loop remains
-                # low-latency (critical for stable QPS control).
+                # Schedule Snowflake query-status telemetry sampling out-of-band so the metrics
+                # loop remains low-latency (critical for stable QPS control).
+                #
+                # NOTE: Warehouse MCW status (started_clusters) is polled by the orchestrator
+                # only via _poll_warehouse() and stored in WAREHOUSE_POLL_SNAPSHOTS.
+                # Workers should NOT poll SHOW WAREHOUSES - it's benchmark-level data.
                 #
                 # Notes:
                 # - We use a dedicated telemetry pool so sampling can't be starved by
                 #   overlapping results persistence queries under load.
                 # - We never await these calls here; they update in-memory status when finished.
-                if self._benchmark_warehouse_name:
-                    last = self._last_warehouse_status_mono
-                    due = last is None or (now_mono - float(last)) >= 5.0
-                    task = self._warehouse_status_task
-                    if due and (task is None or task.done()):
-
-                        async def _sample_warehouse_status(warehouse_name: str) -> None:
-                            try:
-                                rows = await snowflake_pool.get_telemetry_pool().execute_query(
-                                    f"SHOW WAREHOUSES LIKE '{warehouse_name}'"
-                                )
-                                if rows:
-                                    row = rows[0]
-                                    started = int(row[6]) if row[6] else 0
-                                    running = int(row[7]) if row[7] else 0
-                                    queued = int(row[8]) if row[8] else 0
-                                    self._warehouse_status = {
-                                        "warehouse": str(warehouse_name),
-                                        "started_clusters": started,
-                                        "running": running,
-                                        "queued": queued,
-                                    }
-                            except Exception:
-                                pass
-
-                        self._last_warehouse_status_mono = now_mono
-                        self._warehouse_status_task = asyncio.create_task(
-                            _sample_warehouse_status(
-                                str(self._benchmark_warehouse_name)
-                            )
-                        )
-
                 if self._benchmark_warehouse_name and self._benchmark_query_tag:
                     last = self._last_warehouse_query_status_mono
                     due = last is None or (now_mono - float(last)) >= 5.0
@@ -4606,8 +4577,8 @@ class TestExecutor:
                         custom["find_max_controller"] = dict(
                             self._find_max_controller_state
                         )
-                    if self._warehouse_status:
-                        custom["warehouse"] = dict(self._warehouse_status)
+                    # NOTE: Warehouse MCW status (started_clusters) is NOT included here.
+                    # It's polled by the orchestrator only and stored in WAREHOUSE_POLL_SNAPSHOTS.
                     if self._warehouse_query_status:
                         custom["sf_bench"] = dict(self._warehouse_query_status)
 

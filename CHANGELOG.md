@@ -238,6 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - perf(ws): serve live metrics from the in-memory cache fed by worker POSTs to
   restore 1s dashboard updates and reduce Snowflake polling.
+- perf(ws): tier non-critical polling (logs, enrichment, warehouse) and document
+  cadences to preserve 1s live dashboard updates.
 - Skip table profiling when AI value pools exist. Previously, `profile_snowflake_table()`
   ran expensive DESCRIBE + MIN/MAX queries even when pre-computed value pools were
   already available from template preparation.

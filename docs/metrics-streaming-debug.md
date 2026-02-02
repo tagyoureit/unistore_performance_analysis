@@ -96,6 +96,31 @@ with focus on phase transitions and common debugging scenarios.
 - Workers also POST 1s snapshots to `/api/runs/{run_id}/metrics/live`.
 - The WebSocket prefers the in-memory cache and falls back to Snowflake if empty.
 
+## WebSocket Polling Cadence (Tiered)
+
+The WebSocket loop still ticks every 1s, but slower Snowflake queries are polled
+on longer intervals and cached. This keeps the UI cadence close to 1s while
+reducing per-tick query cost.
+
+### Live View (Dashboard)
+
+- 1s: in-memory live metrics cache (QPS, latency, connections, workers, resources)
+- 1s: RUN_STATUS during transitions (PREPARING, STOPPING, PROCESSING)
+- 2s: RUN_STATUS during steady RUNNING
+- 5s: RUN_STATUS once terminal (COMPLETED, FAILED, CANCELLED, STOPPED)
+- 3s: TEST_LOGS batches
+- 10s: TEST_RESULTS child test IDs (log sources)
+- 5s: enrichment status and progress while PROCESSING or COMPLETED
+- 10s: warehouse context (name + table type) until available
+- 30s: SHOW WAREHOUSES config snapshot
+
+### UI Impact
+
+- Charts and KPI cards update on the 1s WebSocket tick.
+- Logs can lag by up to 3s.
+- Enrichment progress can lag by up to 5s.
+- Warehouse details can appear a few seconds after run start.
+
 ## Key Code Locations
 
 | Component | File | Line(s) | Description |
@@ -124,7 +149,7 @@ GROUP BY PHASE
 ORDER BY MIN(TIMESTAMP);
 ```
 
-**Expected**: 
+**Expected**:
 - PREPARING rows with QPS=0
 - WARMUP rows with QPS>0 (if workers started executing)
 

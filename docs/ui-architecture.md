@@ -486,7 +486,7 @@ on cold warehouse resume.
 
 The `get_test()` endpoint uses a two-phase parallelization strategy:
 
-**Phase 1: Initial Parallel Fetch**
+#### Phase 1: Initial Parallel Fetch
 
 The main TEST_RESULTS query, RUN_STATUS, and enrichment status are fetched
 concurrently. Previously these were sequential, adding ~1.5-3s of round-trip time.
@@ -504,7 +504,7 @@ initial_results = await asyncio.gather(
 Additionally, `update_parent_run_aggregate()` is now fire-and-forget via
 `asyncio.create_task()` to avoid blocking the API response.
 
-**Phase 2: Supplementary Parallel Fetch**
+#### Phase 2: Supplementary Parallel Fetch
 
 ```python
 # backend/api/routes/test_results.py - Phase 2
