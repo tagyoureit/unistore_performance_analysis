@@ -85,6 +85,8 @@ window.DashboardMixins.state = function (opts) {
     },
     sfRunningBreakdown: "read_write", // 'read_write' | 'by_kind'
     opsSecBreakdown: "read_write", // 'read_write' | 'by_kind'
+    _sfRunningHasBreakdown: true, // Set to false when breakdown data not available
+    _opsSecHasBreakdown: true, // Set to false when breakdown data not available
     latencyView: "end_to_end", // 'end_to_end' | 'sf_execution'
     latencyViewUserSelected: false,
     latencyAggregationMethod: null,

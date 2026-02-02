@@ -42,6 +42,7 @@ CREATE HYBRID TABLE IF NOT EXISTS RUN_STATUS (
     -- Timing (Authoritative)
     start_time TIMESTAMP_NTZ,
     end_time TIMESTAMP_NTZ,
+    warmup_start_time TIMESTAMP_NTZ,
     warmup_end_time TIMESTAMP_NTZ,
     
     -- Worker Orchestration
@@ -157,3 +158,8 @@ CREATE HYBRID TABLE IF NOT EXISTS WORKER_HEARTBEATS (
 -- Add CANCELLATION_REASON column to RUN_STATUS (if not exists)
 -- This column stores the reason when a test is cancelled or fails abnormally.
 ALTER TABLE RUN_STATUS ADD COLUMN IF NOT EXISTS CANCELLATION_REASON TEXT;
+
+-- Add WARMUP_START_TIME column to RUN_STATUS (if not exists)
+-- This tracks when warmup actually begins (after workers are READY), distinct from START_TIME
+-- which includes PREPARING phase. Required for accurate warmup duration calculation.
+ALTER TABLE RUN_STATUS ADD COLUMN IF NOT EXISTS WARMUP_START_TIME TIMESTAMP_NTZ;

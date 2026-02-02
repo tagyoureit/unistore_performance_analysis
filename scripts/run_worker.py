@@ -14,10 +14,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
+from urllib.request import Request, urlopen
 
 from backend.config import settings
 from backend.connectors import snowflake_pool
 from backend.core import results_store
+from backend.core.query_execution_streamer import QueryExecutionStreamer
 from backend.core.test_executor import TestExecutor
 from backend.core.test_log_stream import (
     CURRENT_TEST_ID,
@@ -166,6 +168,31 @@ def _normalize_phase(phase: str | None) -> str | None:
     return None
 
 
+def _build_live_metrics_url(run_id: str) -> str:
+    base = str(getattr(settings, "LIVE_METRICS_POST_URL", "") or "").strip()
+    if base:
+        return f"{base.rstrip('/')}/api/runs/{run_id}/metrics/live"
+    host = str(settings.APP_HOST or "127.0.0.1").strip()
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    port = int(settings.APP_PORT or 8000)
+    return f"http://{host}:{port}/api/runs/{run_id}/metrics/live"
+
+
+def _post_live_metrics_sync(
+    url: str, payload: dict[str, Any], *, timeout_seconds: float
+) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout_seconds) as resp:
+        resp.read()
+
+
 async def _fetch_run_status(run_id: str) -> dict[str, Any] | None:
     pool = snowflake_pool.get_default_pool()
     rows = await pool.execute_query(
@@ -267,6 +294,11 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     )
     health = ConnectionHealthTracker(timeout_seconds=60.0)
     last_error: str | None = None
+    live_metrics_url = _build_live_metrics_url(cfg.run_id)
+    live_post_lock = asyncio.Lock()
+    live_post_timeout = float(
+        getattr(settings, "LIVE_METRICS_POST_TIMEOUT_SECONDS", 0.5) or 0.5
+    )
 
     pool = snowflake_pool.get_default_pool()
     try:
@@ -473,6 +505,20 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     executor._benchmark_query_tag = benchmark_query_tag_warmup
     executor._benchmark_query_tag_running = benchmark_query_tag_running  # type: ignore[attr-defined]
 
+    # Initialize query execution streamer for continuous persistence.
+    # Uses the control pool (default pool) to stream records to Snowflake.
+    # IMPORTANT: Use cfg.run_id (orchestrator run ID) not executor.test_id,
+    # so the dashboard can find the records by run_id.
+    query_streamer = QueryExecutionStreamer(
+        pool=snowflake_pool.get_default_pool(),
+        test_id=cfg.run_id,
+        flush_interval_seconds=30.0,
+        flush_threshold_records=5000,
+        batch_insert_size=2000,
+    )
+    executor.set_query_execution_streamer(query_streamer)
+    await query_streamer.start()
+
     table_type = str(template_config.get("table_type") or "STANDARD").strip().upper()
     is_postgres = table_type in {
         TableType.POSTGRES.value.upper(),
@@ -659,6 +705,7 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     await _safe_heartbeat("READY")  # Signal orchestrator that pool init is complete
 
     terminal_status: str | None = None
+    stop_requested = False
 
     background_tasks: set[asyncio.Task] = set()
 
@@ -682,6 +729,20 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     log_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
     log_handler = TestLogQueueHandler(test_id=test_id_str, queue=log_queue)
     logging.getLogger().addHandler(log_handler)
+
+    async def _post_live_metrics(payload: dict[str, Any]) -> None:
+        if live_post_lock.locked():
+            return
+        async with live_post_lock:
+            try:
+                await asyncio.to_thread(
+                    _post_live_metrics_sync,
+                    live_metrics_url,
+                    payload,
+                    timeout_seconds=live_post_timeout,
+                )
+            except Exception:
+                return
 
     async def _drain_log_queue() -> None:
         while True:
@@ -756,6 +817,17 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
                 )
             )
         )
+        live_payload = {
+            "test_id": str(executor.test_id),
+            "worker_id": cfg.worker_id,
+            "worker_group_id": int(cfg.worker_group_id),
+            "worker_group_count": int(cfg.worker_group_count),
+            "phase": _normalize_phase(current_phase),
+            "status": "DRAINING" if stop_requested else "RUNNING",
+            "target_connections": int(current_target),
+            "metrics": metrics.model_dump(mode="json"),
+        }
+        _track_task(asyncio.create_task(_post_live_metrics(live_payload)))
 
     executor.set_metrics_callback(_metrics_callback)
     metrics_task = asyncio.create_task(executor._collect_metrics())
@@ -960,7 +1032,6 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     last_heartbeat = time.monotonic()
     last_reconcile = time.monotonic()
     last_event_poll = 0.0
-    stop_requested = False
     drain_timeout = 120.0
     exit_status = TestStatus.COMPLETED
 
@@ -1175,42 +1246,22 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     # _mark_run_completed(), not by workers. This avoids race conditions when
     # multiple workers complete around the same time.
 
-    should_enrich = bool(getattr(scenario, "collect_query_history", False))
-    persisted_rows: list[dict[str, Any]] = []
+    # Shutdown the query execution streamer (flushes remaining buffer to Snowflake).
+    # This replaces the previous bulk-insert-at-shutdown approach.
     try:
-        records = executor.get_query_execution_records()
-        if records:
-            persist_all = should_enrich
-            selected = records if persist_all else [r for r in records if r.warmup]
-            if selected:
-                persisted_rows = [
-                    {
-                        "execution_id": r.execution_id,
-                        "query_id": r.query_id,
-                        "query_text": r.query_text,
-                        "start_time": r.start_time.isoformat(),
-                        "end_time": r.end_time.isoformat(),
-                        "duration_ms": r.duration_ms,
-                        "rows_affected": r.rows_affected,
-                        "bytes_scanned": r.bytes_scanned,
-                        "warehouse": r.warehouse,
-                        "success": r.success,
-                        "error": r.error,
-                        "connection_id": r.connection_id,
-                        "custom_metadata": r.custom_metadata,
-                        "query_kind": r.query_kind,
-                        "worker_id": r.worker_id,
-                        "warmup": r.warmup,
-                        "app_elapsed_ms": r.app_elapsed_ms,
-                    }
-                    for r in selected
-                ]
-                await results_store.insert_query_executions(
-                    test_id=str(executor.test_id), rows=persisted_rows
-                )
-                health.record_success()
+        flush_p99 = query_streamer.stats.get("flush_p99_ms")
+        await query_streamer.shutdown(flush_p99_ms=flush_p99)
+        logger.info(
+            "QueryExecutionStreamer shutdown: %s",
+            {
+                "total_flushed": query_streamer.stats.get("total_records_flushed"),
+                "dropped_batches": query_streamer.stats.get("dropped_batches"),
+                "run_partial": query_streamer.run_partial,
+            },
+        )
+        health.record_success()
     except Exception as exc:
-        logger.warning("Failed to persist QUERY_EXECUTIONS: %s", exc)
+        logger.warning("Failed to shutdown QueryExecutionStreamer: %s", exc)
 
     # NOTE: Enrichment (QUERY_HISTORY matching) is handled centrally by the
     # orchestrator as a background task after all workers complete. Worker just

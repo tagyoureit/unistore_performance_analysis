@@ -8,8 +8,10 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from backend.api.error_handling import http_exception
+from backend.core.live_metrics_cache import live_metrics_cache
 from backend.core.orchestrator import orchestrator
 from backend.core.test_registry import registry
+from backend.models.metrics import Metrics
 
 router = APIRouter()
 
@@ -27,6 +29,17 @@ class RunCreateResponse(BaseModel):
 class RunActionResponse(BaseModel):
     run_id: str
     status: str
+
+
+class LiveMetricsUpdate(BaseModel):
+    test_id: str
+    worker_id: str
+    worker_group_id: int
+    worker_group_count: int
+    phase: str | None = None
+    status: str | None = None
+    target_connections: int | None = None
+    metrics: Metrics
 
 
 @router.post("/", response_model=RunCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -105,3 +118,27 @@ async def stop_run(run_id: str) -> RunActionResponse:
         raise HTTPException(status_code=404, detail="Run not found")
     except Exception as e:
         raise http_exception("stop run", e)
+
+
+@router.post(
+    "/{run_id}/metrics/live",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def ingest_live_metrics(run_id: str, payload: LiveMetricsUpdate) -> None:
+    """
+    Ingest live per-worker metrics into the in-memory cache.
+    """
+    try:
+        await live_metrics_cache.update(
+            run_id=run_id,
+            test_id=payload.test_id,
+            worker_id=payload.worker_id,
+            worker_group_id=payload.worker_group_id,
+            worker_group_count=payload.worker_group_count,
+            phase=payload.phase,
+            status=payload.status,
+            target_connections=payload.target_connections,
+            metrics=payload.metrics,
+        )
+    except Exception as e:
+        raise http_exception("ingest live metrics", e)

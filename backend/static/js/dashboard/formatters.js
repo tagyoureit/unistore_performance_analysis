@@ -5,6 +5,15 @@
 window.DashboardMixins = window.DashboardMixins || {};
 
 window.DashboardMixins.formatters = {
+  formatMsPrecise(value) {
+    // Show exact milliseconds with commas for readability
+    if (value == null) return "";
+    const ms = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(ms)) return "";
+    // Format with commas and 2 decimal places
+    return `${ms.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ms`;
+  },
+
   formatSecondsTenths(value) {
     const n = typeof value === "number" ? value : Number(value);
     if (!Number.isFinite(n)) return "0";
@@ -35,9 +44,35 @@ window.DashboardMixins.formatters = {
 
   formatMsWithUnit(value) {
     if (value == null) return "N/A";
-    const n = typeof value === "number" ? value : Number(value);
-    if (!Number.isFinite(n)) return "N/A";
-    return `${n.toFixed(2)} ms`;
+    const ms = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(ms)) return "N/A";
+    
+    // For small values, show milliseconds
+    if (ms < 1000) {
+      return `${ms.toFixed(2)} ms`;
+    }
+    
+    // Convert to seconds
+    const totalSeconds = ms / 1000;
+    
+    // For values < 1 minute, show ss.ss s
+    if (totalSeconds < 60) {
+      return `${totalSeconds.toFixed(2)}s`;
+    }
+    
+    // For values < 1 hour, show Xm Ys format
+    if (totalSeconds < 3600) {
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes}m ${seconds.toFixed(2)}s`;
+    }
+    
+    // For values >= 1 hour, show Xh Ym Zs format
+    const hours = Math.floor(totalSeconds / 3600);
+    const remainingAfterHours = totalSeconds % 3600;
+    const minutes = Math.floor(remainingAfterHours / 60);
+    const seconds = remainingAfterHours % 60;
+    return `${hours}h ${minutes}m ${seconds.toFixed(2)}s`;
   },
 
   formatInt(value) {

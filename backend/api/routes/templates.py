@@ -622,7 +622,7 @@ async def list_templates():
     try:
         pool = snowflake_pool.get_default_pool()
 
-        query = """
+        query = f"""
         SELECT 
             TEMPLATE_ID,
             TEMPLATE_NAME,
@@ -634,7 +634,7 @@ async def list_templates():
             TAGS,
             USAGE_COUNT,
             LAST_USED_AT
-        FROM UNISTORE_BENCHMARK.TEST_RESULTS.TEST_TEMPLATES
+        FROM {_results_prefix()}.TEST_TEMPLATES
         ORDER BY UPDATED_AT DESC
         """
 
@@ -1935,7 +1935,7 @@ async def get_template(template_id: str):
             TAGS,
             USAGE_COUNT,
             LAST_USED_AT
-        FROM UNISTORE_BENCHMARK.TEST_RESULTS.TEST_TEMPLATES
+        FROM {_results_prefix()}.TEST_TEMPLATES
         WHERE TEMPLATE_ID = '{template_id}'
         """
 
@@ -2029,8 +2029,8 @@ async def create_template(template: TemplateCreate):
         #
         # Note: Snowflake can reject PARSE_JSON(?) inside a VALUES clause with qmark binding,
         # so we use INSERT ... SELECT ... instead.
-        query = """
-        INSERT INTO UNISTORE_BENCHMARK.TEST_RESULTS.TEST_TEMPLATES (
+        query = f"""
+        INSERT INTO {_results_prefix()}.TEST_TEMPLATES (
             TEMPLATE_ID, TEMPLATE_NAME, DESCRIPTION, CONFIG, CREATED_AT, UPDATED_AT, TAGS, USAGE_COUNT
         )
         SELECT
@@ -2125,7 +2125,7 @@ async def update_template(template_id: str, template: TemplateUpdate):
         params.append(datetime.now(UTC).isoformat())
 
         query = f"""
-        UPDATE UNISTORE_BENCHMARK.TEST_RESULTS.TEST_TEMPLATES
+        UPDATE {_results_prefix()}.TEST_TEMPLATES
         SET {", ".join(updates)}
         WHERE TEMPLATE_ID = ?
         """
@@ -2899,7 +2899,7 @@ async def use_template(template_id: str):
 
         now = datetime.now(UTC).isoformat()
         query = f"""
-        UPDATE UNISTORE_BENCHMARK.TEST_RESULTS.TEST_TEMPLATES
+        UPDATE {_results_prefix()}.TEST_TEMPLATES
         SET 
             USAGE_COUNT = USAGE_COUNT + 1,
             LAST_USED_AT = '{now}'

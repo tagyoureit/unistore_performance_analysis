@@ -352,7 +352,8 @@ async def _fetch_warehouse_metrics(*, pool: Any, test_id: str) -> dict[str, Any]
     """
     Fetch test-level warehouse queueing + MCW metrics.
 
-    For parent runs (multi-worker), aggregates from all child runs.
+    For parent runs (multi-worker), aggregates from all TEST_IDs in the run
+    (including the parent, since QUERY_EXECUTIONS stores data under run_id).
     """
     prefix = _prefix()
 
@@ -364,6 +365,9 @@ async def _fetch_warehouse_metrics(*, pool: Any, test_id: str) -> dict[str, Any]
     is_parent = bool(run_id) and str(run_id) == str(test_id)
 
     if is_parent:
+        # NOTE: QUERY_EXECUTIONS data is stored under run_id (parent TEST_ID),
+        # so we must include the parent in the query. V_WAREHOUSE_METRICS joins
+        # QUERY_EXECUTIONS, so the data lives under the parent TEST_ID.
         query = f"""
         SELECT
             MAX(CLUSTERS_USED) AS CLUSTERS_USED,
@@ -376,10 +380,9 @@ async def _fetch_warehouse_metrics(*, pool: Any, test_id: str) -> dict[str, Any]
             SELECT TEST_ID
             FROM {prefix}.TEST_RESULTS
             WHERE RUN_ID = ?
-              AND TEST_ID <> ?
         )
         """
-        rows = await pool.execute_query(query, params=[test_id, test_id])
+        rows = await pool.execute_query(query, params=[test_id])
     else:
         query = f"""
         SELECT
@@ -893,15 +896,14 @@ async def _fetch_app_latency_summary_for_run(
         MIN(IFF(QUERY_KIND = 'UPDATE', APP_ELAPSED_MS, NULL)) AS UPDATE_MIN_LATENCY_MS,
         MAX(IFF(QUERY_KIND = 'UPDATE', APP_ELAPSED_MS, NULL)) AS UPDATE_MAX_LATENCY_MS
     FROM {prefix}.QUERY_EXECUTIONS qe
-    JOIN {prefix}.TEST_RESULTS tr
-      ON tr.TEST_ID = qe.TEST_ID
-    WHERE tr.RUN_ID = ?
-      AND tr.TEST_ID <> ?
+    WHERE qe.TEST_ID IN (
+        SELECT TEST_ID FROM {prefix}.TEST_RESULTS WHERE RUN_ID = ?
+    )
       AND COALESCE(qe.WARMUP, FALSE) = FALSE
       AND qe.SUCCESS = TRUE
       AND qe.APP_ELAPSED_MS IS NOT NULL
     """
-    rows = await pool.execute_query(query, params=[parent_run_id, parent_test_id])
+    rows = await pool.execute_query(query, params=[parent_run_id])
     if not rows:
         return {}
 
@@ -966,15 +968,13 @@ async def _fetch_sf_execution_latency_summary_for_run(
         COUNT(qe.SF_EXECUTION_MS) AS enriched_queries,
         PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY qe.APP_ELAPSED_MS - qe.SF_TOTAL_ELAPSED_MS) AS p50_overhead_ms
     FROM {prefix}.QUERY_EXECUTIONS qe
-    JOIN {prefix}.TEST_RESULTS tr ON tr.TEST_ID = qe.TEST_ID
-    WHERE tr.RUN_ID = ?
-      AND tr.TEST_ID <> ?
+    WHERE qe.TEST_ID IN (
+        SELECT TEST_ID FROM {prefix}.TEST_RESULTS WHERE RUN_ID = ?
+    )
       AND COALESCE(qe.WARMUP, FALSE) = FALSE
       AND qe.SUCCESS = TRUE
     """
-    enrichment_rows = await pool.execute_query(
-        enrichment_query, params=[parent_run_id, parent_test_id]
-    )
+    enrichment_rows = await pool.execute_query(enrichment_query, params=[parent_run_id])
     total_queries = int(enrichment_rows[0][0] or 0) if enrichment_rows else 0
     enriched_queries = int(enrichment_rows[0][1] or 0) if enrichment_rows else 0
     p50_overhead_ms = (
@@ -1072,15 +1072,14 @@ async def _fetch_sf_execution_latency_summary_for_run(
         MIN(IFF(QUERY_KIND = 'UPDATE', SF_EXECUTION_MS, NULL)) AS SF_UPDATE_MIN_LATENCY_MS,
         MAX(IFF(QUERY_KIND = 'UPDATE', SF_EXECUTION_MS, NULL)) AS SF_UPDATE_MAX_LATENCY_MS
     FROM {prefix}.QUERY_EXECUTIONS qe
-    JOIN {prefix}.TEST_RESULTS tr
-      ON tr.TEST_ID = qe.TEST_ID
-    WHERE tr.RUN_ID = ?
-      AND tr.TEST_ID <> ?
+    WHERE qe.TEST_ID IN (
+        SELECT TEST_ID FROM {prefix}.TEST_RESULTS WHERE RUN_ID = ?
+    )
       AND COALESCE(qe.WARMUP, FALSE) = FALSE
       AND qe.SUCCESS = TRUE
       AND qe.SF_EXECUTION_MS IS NOT NULL
     """
-    rows = await pool.execute_query(query, params=[parent_run_id, parent_test_id])
+    rows = await pool.execute_query(query, params=[parent_run_id])
     if not rows:
         return {
             "sf_latency_available": False,
@@ -1155,9 +1154,9 @@ async def _fetch_sf_execution_latency_summary_for_run(
                 ORDER BY IFF(qe.QUERY_KIND = 'RANGE_SCAN', GREATEST(0, qe.APP_ELAPSED_MS - ?), NULL)
             ) AS EST_RANGE_SCAN_P50_MS
         FROM {prefix}.QUERY_EXECUTIONS qe
-        JOIN {prefix}.TEST_RESULTS tr ON tr.TEST_ID = qe.TEST_ID
-        WHERE tr.RUN_ID = ?
-          AND tr.TEST_ID <> ?
+        WHERE qe.TEST_ID IN (
+            SELECT TEST_ID FROM {prefix}.TEST_RESULTS WHERE RUN_ID = ?
+        )
           AND COALESCE(qe.WARMUP, FALSE) = FALSE
           AND qe.SUCCESS = TRUE
         """
@@ -1171,7 +1170,6 @@ async def _fetch_sf_execution_latency_summary_for_run(
                 overhead,
                 overhead,
                 parent_run_id,
-                parent_test_id,
             ],
         )
         if est_rows and est_rows[0]:
@@ -1630,21 +1628,42 @@ async def _fetch_error_rates(
     }
 
     if is_parent_run:
+        # Query executions may be stored under:
+        # 1. Worker TEST_IDs (old behavior): tr.TEST_ID <> parent TEST_ID
+        # 2. Parent TEST_ID (streaming mode): qe.TEST_ID = run_id directly
+        # We union both to handle either case.
         err_rows = await pool.execute_query(
             f"""
-            SELECT
-                qe.QUERY_KIND,
-                COUNT(*) AS N,
-                SUM(IFF(qe.SUCCESS, 0, 1)) AS ERR
-            FROM {prefix}.QUERY_EXECUTIONS qe
-            JOIN {prefix}.TEST_RESULTS tr
-              ON tr.TEST_ID = qe.TEST_ID
-            WHERE tr.RUN_ID = ?
-              AND tr.TEST_ID <> ?
-              AND COALESCE(qe.WARMUP, FALSE) = FALSE
-            GROUP BY qe.QUERY_KIND
+            SELECT QUERY_KIND, SUM(N) AS N, SUM(ERR) AS ERR
+            FROM (
+                -- Worker-linked executions (old behavior)
+                SELECT
+                    qe.QUERY_KIND,
+                    COUNT(*) AS N,
+                    SUM(IFF(qe.SUCCESS, 0, 1)) AS ERR
+                FROM {prefix}.QUERY_EXECUTIONS qe
+                JOIN {prefix}.TEST_RESULTS tr
+                  ON tr.TEST_ID = qe.TEST_ID
+                WHERE tr.RUN_ID = ?
+                  AND tr.TEST_ID <> ?
+                  AND COALESCE(qe.WARMUP, FALSE) = FALSE
+                GROUP BY qe.QUERY_KIND
+
+                UNION ALL
+
+                -- Parent-linked executions (streaming mode)
+                SELECT
+                    QUERY_KIND,
+                    COUNT(*) AS N,
+                    SUM(IFF(SUCCESS, 0, 1)) AS ERR
+                FROM {prefix}.QUERY_EXECUTIONS
+                WHERE TEST_ID = ?
+                  AND COALESCE(WARMUP, FALSE) = FALSE
+                GROUP BY QUERY_KIND
+            )
+            GROUP BY QUERY_KIND
             """,
-            params=[run_id, test_id],
+            params=[run_id, test_id, run_id],
         )
     else:
         err_rows = await pool.execute_query(
@@ -3710,7 +3729,10 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                             "warehouse": _sum_dicts(warehouse_list),
                             "resources": _avg_dicts(resources_list),
                         }
-                        is_warmup_bucket = agg.has_warmup
+                        # A bucket is warmup only if it has warmup data AND no measurement data.
+                        # This handles the case where elapsed_seconds resets when transitioning
+                        # to measurement phase, causing bucket overlap with warmup.
+                        is_warmup_bucket = agg.has_warmup and not agg.has_measurement
                         aggregated_rows.append(
                             (
                                 agg.timestamp,
@@ -4131,6 +4153,9 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
         is_parent = bool(run_id) and str(run_id) == str(test_id)
 
         if is_parent:
+            # NOTE: QUERY_EXECUTIONS data is stored under run_id (parent TEST_ID),
+            # so we must include the parent in the query. V_WAREHOUSE_TIMESERIES
+            # joins QUERY_EXECUTIONS, so the data lives under the parent TEST_ID.
             query = f"""
             WITH query_bounds AS (
                 -- Get first query time (warmup or measurement) and last measurement query time
@@ -4142,7 +4167,6 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                 FROM {prefix}.QUERY_EXECUTIONS qe
                 JOIN {prefix}.TEST_RESULTS t ON t.TEST_ID = qe.TEST_ID
                 WHERE t.RUN_ID = ?
-                  AND t.TEST_ID <> ?
             ),
             seconds AS (
                 SELECT
@@ -4157,11 +4181,10 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                 ) g
                   ON g.SEQ <= DATEDIFF('second', qb.FIRST_QUERY_SECOND, qb.LAST_QUERY_SECOND)
             ),
-            child_ids AS (
+            run_test_ids AS (
                 SELECT TEST_ID
                 FROM {prefix}.TEST_RESULTS
                 WHERE RUN_ID = ?
-                  AND TEST_ID <> ?
             ),
             wh_data AS (
                 SELECT
@@ -4171,7 +4194,7 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
                     SUM(wt.TOTAL_QUEUE_OVERLOAD_MS) AS TOTAL_QUEUE_OVERLOAD_MS,
                     SUM(wt.TOTAL_QUEUE_PROVISIONING_MS) AS TOTAL_QUEUE_PROVISIONING_MS
                 FROM {prefix}.V_WAREHOUSE_TIMESERIES wt
-                JOIN child_ids ci ON ci.TEST_ID = wt.TEST_ID
+                JOIN run_test_ids rti ON rti.TEST_ID = wt.TEST_ID
                 GROUP BY wt.SECOND
             ),
             poller_clusters AS (
@@ -4212,7 +4235,7 @@ async def get_warehouse_timeseries(test_id: str) -> dict[str, Any]:
             """
             rows = await pool.execute_query(
                 query,
-                params=[test_id, test_id, test_id, test_id, test_id],
+                params=[test_id, test_id, test_id],
             )
         else:
             query = f"""

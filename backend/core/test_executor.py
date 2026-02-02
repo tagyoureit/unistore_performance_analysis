@@ -16,9 +16,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
-from typing import Any, Callable, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, cast
 from uuid import uuid4
 import time
+
+if TYPE_CHECKING:
+    from backend.core.query_execution_streamer import QueryExecutionStreamer
+
 from backend.models import (
     TestScenario,
     TestResult,
@@ -208,9 +212,12 @@ class TestExecutor:
         self._custom_pos_by_worker: dict[int, int] = {}
 
         # Per-operation capture for QUERY_EXECUTIONS (optionally persisted).
-        self._query_execution_records: deque[_QueryExecutionRecord] = deque(
-            maxlen=200_000
-        )
+        # NOTE: deque is now unbounded - streaming handles persistence, deque is
+        # for backward compatibility with get_query_execution_records().
+        self._query_execution_records: deque[_QueryExecutionRecord] = deque()
+
+        # Optional streamer for continuous persistence (replaces bulk-at-shutdown).
+        self._query_execution_streamer: Optional["QueryExecutionStreamer"] = None
 
         # Latency samples by kind (non-warmup only, for summary columns).
         self._lat_by_kind_ms: dict[str, list[float]] = {
@@ -275,6 +282,45 @@ class TestExecutor:
 
         return type(exc).__name__
 
+    def set_query_execution_streamer(
+        self, streamer: Optional["QueryExecutionStreamer"]
+    ) -> None:
+        """
+        Set the query execution streamer for continuous persistence.
+
+        When set, records are streamed to Snowflake in the background instead of
+        being bulk-inserted at shutdown. The in-memory deque is still maintained
+        for backward compatibility with get_query_execution_records().
+
+        Args:
+            streamer: QueryExecutionStreamer instance or None to disable streaming.
+        """
+        self._query_execution_streamer = streamer
+
+    async def _append_query_execution_record(
+        self, record: _QueryExecutionRecord
+    ) -> None:
+        """
+        Append a query execution record to in-memory deque and optionally stream.
+
+        This method maintains backward compatibility by always appending to the
+        in-memory deque, while also streaming to Snowflake if a streamer is set.
+
+        NOTE: This method is intentionally non-blocking. Streaming is fire-and-forget
+        to avoid slowing down the hot query execution path.
+
+        Args:
+            record: The query execution record to append.
+        """
+        # Always append to in-memory deque for backward compatibility
+        self._query_execution_records.append(record)
+
+        # Stream if streamer is configured (fire-and-forget, non-blocking)
+        # Note: streamer.append() is safe - it only appends to a deque with a lock.
+        # Any errors are handled within the streamer's flush logic.
+        if self._query_execution_streamer is not None:
+            asyncio.create_task(self._query_execution_streamer.append(record))
+
     @staticmethod
     def _is_postgres_pool(pool) -> bool:
         """Check if a pool is a PostgreSQL connection pool."""
@@ -300,20 +346,35 @@ class TestExecutor:
     @staticmethod
     def _annotate_query_for_sf_kind(query: str, query_kind: str) -> str:
         """
-        Prefix a statement with a short SQL comment encoding the benchmark query kind.
+        Insert a short SQL comment encoding the benchmark query kind after the first keyword.
 
         This is used only for Snowflake server-side concurrency sampling (QUERY_HISTORY),
         so we can break RUNNING counts down by kind without relying on fragile SQL parsing.
+
+        NOTE: The marker is placed AFTER the first SQL keyword (SELECT/INSERT/UPDATE/DELETE)
+        because Snowflake strips leading comments from QUERY_TEXT in QUERY_HISTORY.
         """
         q = str(query or "")
         kind = str(query_kind or "").strip().upper()
         if not kind:
             return q
-        marker = f"/*UB_KIND={kind}*/ "
-        # Avoid double-tagging if the caller already annotated (or custom SQL includes it).
-        if q.lstrip().startswith("/*UB_KIND="):
+        marker = f"/*UB_KIND={kind}*/"
+        # Avoid double-tagging if the query already contains the marker.
+        if "UB_KIND=" in q:
             return q
-        return marker + q
+        # Insert marker after the first SQL keyword to avoid Snowflake stripping it.
+        # Snowflake strips leading comments from QUERY_TEXT in INFORMATION_SCHEMA.QUERY_HISTORY.
+        import re
+
+        # Match leading whitespace + first keyword (SELECT, INSERT, UPDATE, DELETE, WITH, MERGE)
+        match = re.match(r"^(\s*)(SELECT|INSERT|UPDATE|DELETE|WITH|MERGE)\b", q, re.IGNORECASE)
+        if match:
+            prefix = match.group(1)  # Leading whitespace
+            keyword = match.group(2)  # The SQL keyword
+            rest = q[match.end() :]  # Everything after the keyword
+            return f"{prefix}{keyword} {marker}{rest}"
+        # Fallback: prepend marker (may get stripped but better than nothing)
+        return f"{marker} {q}"
 
     def get_sql_error_category_snapshot(self) -> dict[str, Any]:
         """
@@ -2999,7 +3060,7 @@ class TestExecutor:
                     network_overhead_ms = None
                     if sf_execution_ms is not None and sf_execution_ms >= 0:
                         network_overhead_ms = max(0.0, app_elapsed_ms - sf_execution_ms)
-                    self._query_execution_records.append(
+                    await self._append_query_execution_record(
                         _QueryExecutionRecord(
                             execution_id=str(uuid4()),
                             test_id=str(self.test_id),
@@ -3101,7 +3162,7 @@ class TestExecutor:
                 )
 
             if warmup or getattr(self.scenario, "collect_query_history", False):
-                self._query_execution_records.append(
+                await self._append_query_execution_record(
                     _QueryExecutionRecord(
                         execution_id=str(uuid4()),
                         test_id=str(self.test_id),
@@ -3314,7 +3375,7 @@ class TestExecutor:
                     network_overhead_ms = None
                     if sf_execution_ms is not None and sf_execution_ms >= 0:
                         network_overhead_ms = max(0.0, app_elapsed_ms - sf_execution_ms)
-                    self._query_execution_records.append(
+                    await self._append_query_execution_record(
                         _QueryExecutionRecord(
                             execution_id=str(uuid4()),
                             test_id=str(self.test_id),
@@ -3415,7 +3476,7 @@ class TestExecutor:
                 )
 
             if warmup or getattr(self.scenario, "collect_query_history", False):
-                self._query_execution_records.append(
+                await self._append_query_execution_record(
                     _QueryExecutionRecord(
                         execution_id=str(uuid4()),
                         test_id=str(self.test_id),
@@ -4031,7 +4092,7 @@ class TestExecutor:
             if warmup or getattr(self.scenario, "collect_query_history", False):
                 pool_obj = getattr(manager, "pool", None)
                 pool_warehouse = str(getattr(pool_obj, "warehouse", "")).strip() or None
-                self._query_execution_records.append(
+                await self._append_query_execution_record(
                     _QueryExecutionRecord(
                         execution_id=str(uuid4()),
                         test_id=str(self.test_id),
@@ -4143,7 +4204,7 @@ class TestExecutor:
                 )
 
             if warmup or getattr(self.scenario, "collect_query_history", False):
-                self._query_execution_records.append(
+                await self._append_query_execution_record(
                     _QueryExecutionRecord(
                         execution_id=str(uuid4()),
                         test_id=str(self.test_id),
@@ -4273,25 +4334,27 @@ class TestExecutor:
 
                                       -- Break down RUNNING concurrency by benchmark query kind.
                                       --
-                                      -- Preferred signal: our benchmark tag `UB_KIND=...` when present in QUERY_TEXT.
+                                      -- The marker `UB_KIND=...` is inserted after the first SQL keyword
+                                      -- (e.g., SELECT /*UB_KIND=POINT_LOOKUP*/ ...) to survive Snowflake's
+                                      -- stripping of leading comments in QUERY_HISTORY.
                                       SUM(IFF(
                                         UPPER(EXECUTION_STATUS) = 'RUNNING'
-                                        AND REGEXP_LIKE(QUERY_TEXT, 'UB_KIND=POINT_LOOKUP'),
+                                        AND CONTAINS(QUERY_TEXT, 'UB_KIND=POINT_LOOKUP'),
                                         1, 0
                                       )) AS RUNNING_POINT_LOOKUP,
                                       SUM(IFF(
                                         UPPER(EXECUTION_STATUS) = 'RUNNING'
-                                        AND REGEXP_LIKE(QUERY_TEXT, 'UB_KIND=RANGE_SCAN'),
+                                        AND CONTAINS(QUERY_TEXT, 'UB_KIND=RANGE_SCAN'),
                                         1, 0
                                       )) AS RUNNING_RANGE_SCAN,
                                       SUM(IFF(
                                         UPPER(EXECUTION_STATUS) = 'RUNNING'
-                                        AND REGEXP_LIKE(QUERY_TEXT, 'UB_KIND=INSERT'),
+                                        AND CONTAINS(QUERY_TEXT, 'UB_KIND=INSERT'),
                                         1, 0
                                       )) AS RUNNING_INSERT,
                                       SUM(IFF(
                                         UPPER(EXECUTION_STATUS) = 'RUNNING'
-                                        AND REGEXP_LIKE(QUERY_TEXT, 'UB_KIND=UPDATE'),
+                                        AND CONTAINS(QUERY_TEXT, 'UB_KIND=UPDATE'),
                                         1, 0
                                       )) AS RUNNING_UPDATE
                                     FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(

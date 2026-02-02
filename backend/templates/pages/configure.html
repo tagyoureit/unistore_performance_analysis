@@ -608,8 +608,8 @@
                 </details>
             </div>
 
-            <!-- Resource Guardrails (collapsible, shown for AUTO and BOUNDED modes, not FIXED) -->
-            <details class="mt-4" x-show="String(config.scaling?.mode || 'AUTO').toUpperCase() !== 'FIXED'">
+            <!-- Resource Guardrails (collapsible, always shown - controls host CPU/memory thresholds independent of scaling mode) -->
+            <details class="mt-4">
                 <summary class="text-sm font-semibold" style="cursor: pointer;">
                     Resource Guardrails
                 </summary>
@@ -1504,7 +1504,14 @@ function testConfiguration() {
                             this.mode = 'edit';
                             this.isReadOnly = false;
                         }
-                        this.config = { ...this.config, ...(template.config || {}) };
+                        // Deep merge nested objects to preserve defaults for scaling and guardrails
+                        const templateConfig = template.config || {};
+                        const defaultScaling = { ...this.config.scaling };
+                        const defaultGuardrails = { ...this.config.guardrails };
+                        this.config = { ...this.config, ...templateConfig };
+                        // Restore defaults for nested objects, then overlay saved values
+                        this.config.scaling = { ...defaultScaling, ...(templateConfig.scaling || {}) };
+                        this.config.guardrails = { ...defaultGuardrails, ...(templateConfig.guardrails || {}) };
                         if (this.config.warehouse_name) {
                             this.config.warehouse_name = String(this.config.warehouse_name).trim();
                         }
@@ -2046,7 +2053,13 @@ function testConfiguration() {
                 const template = await resp.json();
                 this.loadedTemplate = template;
                 this.hasResults = (template.usage_count || 0) > 0;
-                this.config = { ...this.config, ...(template.config || {}) };
+                // Deep merge nested objects to preserve defaults for scaling and guardrails
+                const templateConfig = template.config || {};
+                const defaultScaling = { ...this.config.scaling };
+                const defaultGuardrails = { ...this.config.guardrails };
+                this.config = { ...this.config, ...templateConfig };
+                this.config.scaling = { ...defaultScaling, ...(templateConfig.scaling || {}) };
+                this.config.guardrails = { ...defaultGuardrails, ...(templateConfig.guardrails || {}) };
                 this.ensureCanonicalWorkloadConfig();
                 this.config.template_name = template.template_name;
                 this.config.description = template.description;

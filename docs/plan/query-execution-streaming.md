@@ -1,14 +1,14 @@
 # Query Execution Streaming
 
-**Status**: Planning  
+**Status**: Implemented  
 **Created**: 2025-01-31  
-**Last Updated**: 2025-01-31
+**Last Updated**: 2025-02-01
 
 ## Problem Statement
 
 The current query execution persistence approach has several limitations:
 
-1. **50k record cap**: Workers use `deque(maxlen=50000)` - high-QPS tests lose data via FIFO eviction
+1. **200k record cap**: Workers use `deque(maxlen=200_000)` - high-QPS tests lose data via FIFO eviction
 2. **No streaming**: All records written at test shutdown, creating "thundering herd" when 100+ workers write simultaneously
 3. **Memory pressure**: Long-running tests accumulate records in memory until shutdown
 4. **Enrichment limitations**: Hybrid table workloads only achieve 50-70% enrichment from QUERY_HISTORY (sampled data)
@@ -68,12 +68,11 @@ The system enforces `warehouse_name != SNOWFLAKE_WAREHOUSE` to isolate benchmark
 │  Query Execution ──► QueryExecutionStreamer                     │
 │  (benchmark pool)    ├─ _buffer: deque (unbounded)              │
 │                      ├─ _flush_task: asyncio.Task               │
-│                      ├─ _pool: control pool (SNOWFLAKE_WH)      │
-│                      └─ _sample_rate: float                     │
+│                      └─ _pool: control pool (SNOWFLAKE_WH)      │
 │                                                                 │
 │  Flush triggers:                                                │
-│    • Every 5 seconds                                            │
-│    • OR buffer >= 1000 records                                  │
+│    • Every 30 seconds (relative timer, natural jitter)          │
+│    • OR buffer >= 5000 records                                  │
 │    • OR shutdown signal received                                │
 │                                                                 │
 │  On flush failure: back off recording → benchmark continues     │
@@ -82,34 +81,40 @@ The system enforces `warehouse_name != SNOWFLAKE_WAREHOUSE` to isolate benchmark
 └─────────────────────────────────────────────────────────────────┘
                                │
                                ▼
-                    QUERY_EXECUTIONS (HYBRID)
-                    ├─ Row-level locking
-                    ├─ 50 workers × concurrent INSERTs
+                    QUERY_EXECUTIONS (STANDARD TABLE)
+                    ├─ Batched INSERTs (2000-5000 rows)
+                    ├─ ~1.7 INSERTs/sec average (50 workers)
                     └─ Control warehouse (separate from benchmark)
 ```
 
-### Why Hybrid Table
+### Why Standard Table (Not Hybrid)
 
-From Snowflake documentation:
+Initial assumption was that hybrid tables would provide better concurrent write throughput.
+Analysis revealed the opposite for this use case:
 
-> "Hybrid tables provide a row-based storage engine that supports row locking for high concurrency."
+| Table Type | Optimized For | Bulk INSERT Throughput |
+|------------|---------------|------------------------|
+| **Standard** | Bulk/batch operations | Millions/min (COPY), 100k+/min (INSERT) |
+| **Hybrid** | Single-row OLTP | ~8k ops/sec ceiling, row-by-row overhead |
 
-> "High-concurrency random writes, including inserts, updates, and merges"
+**Key insight**: Hybrid tables pay overhead for row-level locking and transactional
+guarantees that aren't needed for append-only telemetry. Standard tables with batched
+INSERTs outperform hybrid for this workload.
 
-> "Metadata for applications and workflows, such as maintaining state for an ingestion workflow that requires high-concurrency updates to a single table from thousands of parallel workers"
-
-The project already uses hybrid tables for `WORKER_HEARTBEATS` (same concurrent write pattern).
+**Write load calculation**:
+- 50 workers × 1 INSERT every 30 seconds = ~1.7 INSERTs/sec average
+- Workers start at different times → natural flush stagger (no explicit jitter needed)
+- Standard tables have no ops/sec ceiling—just warehouse capacity
 
 ### QueryExecutionStreamer Class
 
 New class: `backend/core/query_execution_streamer.py`
 
 Responsibilities:
-- Buffer management (unbounded deque, with back-pressure threshold)
-- Background flush task (5s interval or 1000 records)
-- Batched INSERTs (500 rows per statement)
-- Sampling logic (100% errors, 100% warmup, constant % for measurement)
-- Failure handling (back off recording; benchmark continues)
+- Buffer management (unbounded deque)
+- Background flush task (30s interval or 5000 records)
+- Batched INSERTs (2000-5000 rows per statement)
+- Failure handling (re-queue once, then drop batch)
 - Graceful shutdown with flush-latency-based timeout
 
 ```python
@@ -118,14 +123,13 @@ class QueryExecutionStreamer:
         self,
         pool: SnowflakeConnectionPool,
         test_id: str,
-        sample_rate: float = 1.0,
-        flush_interval_seconds: float = 5.0,
-        flush_threshold_records: int = 1000,
-        back_pressure_threshold: int = 100_000,
+        flush_interval_seconds: float = 30.0,
+        flush_threshold_records: int = 5000,
+        batch_insert_size: int = 2000,
     ): ...
 
     async def append(self, record: QueryExecutionRecord) -> None:
-        """Add record to buffer. May sample based on sample_rate."""
+        """Add record to buffer (100% capture, no sampling)."""
         ...
 
     async def start(self) -> None:
@@ -139,64 +143,52 @@ class QueryExecutionStreamer:
 
 ## Sampling Strategy
 
-### Why Sample
+### Current Approach: 100% Capture (No Sampling)
 
-1. **Enrichment is already lossy**: Hybrid tables achieve only 50-70% match rate with QUERY_HISTORY
-2. **Statistical accuracy**: 30k samples provide excellent percentile accuracy
-3. **Storage efficiency**: 18M records → 1.8M with 10% sampling
+With standard table batched INSERTs, the system can handle full capture at 5,000 QPS:
+- 50 workers × 30s flush interval × 100 QPS = 3,000 records/batch
+- ~1.7 INSERTs/sec to Snowflake (well within capacity)
+- Storage: 18M records/hour is acceptable (storage is cheap)
 
-### Sampling Rules
+**Decision**: Implement 100% capture. No sampling logic needed in initial implementation.
+
+### Future Option: Sampling (Not Implemented)
+
+If future requirements exceed standard table capacity (e.g., 10k+ QPS, multi-hour tests),
+sampling can be added as a configuration option:
 
 | Record Type | Sample Rate | Rationale |
 |-------------|-------------|-----------|
 | Errors (`success=False`) | 100% (never drop) | Errors are rare and critical |
 | Warmup queries | 100% (never drop) | Low volume, needed for diagnostics |
-| Measurement queries | Configurable % (constant per run) | Statistical accuracy maintained |
+| Measurement queries | Configurable % | Statistical accuracy maintained with 30k+ samples |
 
-### Phase Classification (DECIDED)
+**When to revisit**: If storage costs become significant or write throughput is insufficient
+at higher scale targets.
 
-- Phase is captured at query submit time using the latest `RUN_CONTROL_EVENTS.SEQUENCE_ID`.
-- Sampling decisions use the captured phase (warmup is always 100%).
+### Metadata Tracking (For Future Sampling)
 
-### Sample Rate Calculation (DECIDED)
-
-Use template target QPS to compute a constant per-run sample rate:
-
-```python
-target_total_qps = template_config.get("target_qps")
-num_workers = template_config.get("num_workers")
-expected_per_worker = target_total_qps / num_workers
-sample_rate = min(1.0, TARGET_SAMPLES_PER_SEC / expected_per_worker)
-```
-- Computed once at run start and applied for the full run
-- Stored on `TEST_RESULTS.SAMPLE_RATE` for downstream scaling
-- Avoids per-worker or time-varying rates
-
-### Standard Tables Note (DECIDED)
-
-- Target full capture with no sampling on standard tables once ingest headroom is proven.
-- Fixed sampling remains the initial guardrail; revisit after capacity validation.
-
-### Metadata Tracking
-
-Store sampling metadata for downstream correction:
+If sampling is implemented later, store metadata for downstream correction:
 
 ```sql
--- In TEST_RESULTS
+-- In TEST_RESULTS (add when sampling is implemented)
 SAMPLE_RATE FLOAT,              -- e.g., 0.10 for 10%
 TOTAL_QUERIES_ISSUED NUMBER,    -- Actual count before sampling
 SAMPLED_QUERIES_STORED NUMBER   -- Count after sampling
 ```
 
-### Ingest Backoff Policy (DECIDED)
-
-- Benchmark execution is primary; never throttle benchmark to protect recording.
-- If ingest pressure threatens benchmark or control-plane bottlenecks appear, back off recording immediately.
-- When backoff triggers, mark results as partial and surface the condition in summaries/charts.
-
 ## Downstream Impact Analysis
 
-### Affected by Sampling
+### With 100% Capture (Current Plan)
+
+No query adjustments needed for sampling. All existing queries work unchanged.
+
+**Time bucketing**: Use Snowflake server time for per-second bucketization to avoid
+worker clock skew. Record server timestamp at insert time.
+
+### If Sampling Is Added Later
+
+The following queries would need adjustment:
 
 | Data Use | Current Location | Mitigation |
 |----------|------------------|------------|
@@ -243,12 +235,11 @@ SELECT
 ### Output Calculations Impact (Summary)
 
 - **Live dashboard charts**: Unchanged; live p50/p95/p99 and QPS use in-memory metrics.
-- **Post-test p50/p95/p99 and latency**: Calculated from sampled measurement rows. No scaling is applied to percentile values; accuracy depends on sample size.
-- **Per-second latency charts**: Buckets use server time; buckets with low sample counts are noisier.
-- **QPS and success counts**: Scale measurement query counts by `1 / sample_rate`.
-- **Error rates**: Errors are exact (100% retained). Success counts are scaled.
+- **Post-test p50/p95/p99 and latency**: Calculated from all measurement rows (100% capture).
+- **Per-second latency charts**: Buckets use server time; full data available.
+- **QPS and success counts**: Direct counts (no scaling needed).
+- **Error rates**: Direct calculation from full data.
 - **Warmup metrics**: Unchanged (100% retained).
-- **Recording backoff**: If backoff triggers, post-test stats are partial and must be flagged as incomplete.
 
 ## Design Decisions
 
@@ -257,29 +248,29 @@ SELECT
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Architecture | Worker-side streaming | No orchestrator collection infrastructure exists |
-| Table type | Hybrid | Row-level locking for concurrent INSERTs |
+| Table type | Standard | Batched INSERTs outperform hybrid for append-only telemetry |
 | Connection pool | Control pool | Already separated from benchmark warehouse |
-| Primary key | `EXECUTION_ID` (UUID) | Already generated and unique |
-| Flush interval | 5 seconds | Balance latency vs write overhead |
-| Batch trigger | 1000 records | Headroom above 5s interval; caps buffer to ~10s at 100 QPS/worker |
-| Batch INSERT size | 500 rows | Proven chunk size |
-| Failure behavior | Back off recording; benchmark continues | Protect benchmark from ingest bottlenecks |
+| Flush interval | 30 seconds | Natural jitter from worker start times; ~1.7 INSERTs/sec |
+| Batch trigger | 5000 records | Caps buffer to ~50s at 100 QPS/worker |
+| Batch INSERT size | 2000-5000 rows | Sweet spot for standard table INSERT performance |
+| Failure behavior | Re-queue once, then drop batch | One retry attempt; benchmark continues unaffected |
 | Shutdown timeout | 2× flush p99 (min 30s) | Aligns drain timeout with insert latency |
-| Error sampling | Never drop | Errors are rare and critical |
-| Warmup sampling | Never drop | Needed for diagnostics |
-| Sample rate calculation | Template target QPS (constant per run) | Consistent across workers and stable scaling |
-| Standard tables | Target full capture; fixed sampling is temporary | Remove sampling after headroom validation |
-| Phase classification | At query submit time | Prevents phase boundary drift |
+| Capture rate | 100% (no sampling) | Standard tables handle 5k QPS; storage is cheap |
 | Time authority | Snowflake server time | Consistent cross-worker bucketization |
 | Benchmark priority | Never throttle benchmark for recording | Preserve benchmark fidelity |
-| Flush interval bias | Prefer lower interval if no benchmark impact | Minimize ingest lag |
 | Control warehouse scaling | Auto-scale configured in backend | Avoid manual tuning |
-| Buffer back-pressure | Back off recording at 100k records | Protect benchmark under ingest pressure |
-| UI indication | Show sample rate in summary + chart indicators | User needs to know data is sampled |
 | Enrichment | Still attempt | Accept 3-70% match rate depending on workload |
 
 ### Open
 None.
+
+### Future Considerations
+
+| Item | Trigger | Action |
+|------|---------|--------|
+| Sampling | 10k+ QPS or multi-hour tests | Add configurable sample rate |
+| Hybrid tables | Single-row update patterns | Reconsider if workload changes |
+| Snowflake Postgres | Extreme write throughput needs | Evaluate if standard tables insufficient |
 
 ## Implementation Plan
 
@@ -288,73 +279,50 @@ None.
 1. **Create `QueryExecutionStreamer` class**
    - `backend/core/query_execution_streamer.py`
    - Buffer management, flush task, batched INSERTs
-   - Sampling logic
    - Failure handling/backoff
    - Graceful shutdown
 
-2. **Convert `QUERY_EXECUTIONS` to hybrid**
-   - `sql/schema/results_tables.sql`
-   - Add PRIMARY KEY on `EXECUTION_ID`
-   - Migration script for existing data
-
-3. **Update `TEST_RESULTS` schema**
-   - Add `SAMPLE_RATE` column
-   - Add `TOTAL_QUERIES_ISSUED` column
-   - Add `SAMPLED_QUERIES_STORED` column
+2. **Keep `QUERY_EXECUTIONS` as standard table**
+   - No schema changes needed
+   - Existing table structure works as-is
 
 ### Phase 2: Worker Integration
 
-4. **Integrate into worker**
+3. **Integrate into worker**
    - `scripts/run_worker.py`
    - Instantiate streamer with control pool
    - Wire `append()` calls
    - Handle shutdown sequence
 
-5. **Update TestExecutor**
+4. **Update TestExecutor**
    - `backend/core/test_executor.py`
    - Remove `maxlen=50000` cap
    - Replace deque append with `streamer.append()`
    - Remove end-of-test bulk persist
 
-6. **Update results_store**
+5. **Update results_store**
    - `backend/core/results_store.py`
    - Keep `insert_query_executions()` for streamer use
    - Remove worker-shutdown bulk insert logic
 
-### Phase 3: Downstream Updates
+### Phase 3: Testing & Validation
 
-7. **Update downstream queries**
-   - `backend/api/routes/test_results.py`
-   - Scale COUNTs by sample rate
-   - Adjust QPS calculations
-   - Update error rate calculations
-
-8. **Update UI**
-   - Add sample rate indicator to test summary
-   - Add "sampled data" indicator on charts when `sample_rate < 1.0`
-
-### Phase 4: Testing & Validation
-
-9. **Unit tests**
+6. **Unit tests**
    - QueryExecutionStreamer flush behavior
-   - Sampling logic (errors never dropped)
-   - Back-pressure handling
+   - Re-queue on failure, drop on second failure
    - Graceful shutdown
 
-10. **Integration tests**
-    - High-QPS scenario (verify streaming keeps up)
-    - Concurrent workers (verify no contention issues)
-    - Shutdown sequence (verify all records flushed)
+7. **Integration tests**
+   - High-QPS scenario (verify streaming keeps up)
+   - Concurrent workers (verify no contention issues)
+   - Shutdown sequence (verify all records flushed)
 
 ## Risk Assessment
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| Hybrid table write contention | Low | Medium | Row-level locking, proven with WORKER_HEARTBEATS |
-| Buffer overflow under extreme load | Low | High | Back-pressure threshold backs off recording |
-| Sampling affects percentile accuracy | Low | Medium | 30k+ samples provide <3% error |
+| Standard table INSERT throughput | Low | Medium | Batched INSERTs well within capacity; warehouse auto-scales |
 | Enrichment match rate drops further | Medium | Low | Already lossy (50-70%), acceptable |
-| Downstream queries break | Medium | Medium | Comprehensive test coverage |
 
 ## References
 

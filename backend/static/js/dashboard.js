@@ -1248,6 +1248,21 @@ function dashboard(opts) {
           if (typeof this.stopMultiNodeMetricsPolling === "function") {
             this.stopMultiNodeMetricsPolling();
           }
+          // Reset live Snowflake metrics to zero - no queries running after test ends
+          this.metrics.sf_running = 0;
+          this.metrics.sf_queued = 0;
+          this.metrics.sf_running_bench = 0;
+          this.metrics.sf_queued_bench = 0;
+          this.metrics.sf_blocked_bench = 0;
+          this.metrics.sf_running_tagged_bench = 0;
+          this.metrics.sf_running_other_bench = 0;
+          this.metrics.sf_running_read_bench = 0;
+          this.metrics.sf_running_write_bench = 0;
+          this.metrics.sf_running_point_lookup_bench = 0;
+          this.metrics.sf_running_range_scan_bench = 0;
+          this.metrics.sf_running_insert_bench = 0;
+          this.metrics.sf_running_update_bench = 0;
+          this.metrics.in_flight = 0;
         }
 
         if (this.mode === "live" && typeof this.updateLiveTransport === "function") {

@@ -108,7 +108,10 @@
                 :title="latencyCardTitle(50)"
             >i</span>
         </div>
-        <div class="metric-value" x-text="formatMsWithUnit(currentLatencyMs(50))"></div>
+        <div class="metric-value-with-detail">
+            <span class="metric-value-main" x-text="formatMsWithUnit(currentLatencyMs(50))"></span>
+            <span class="metric-value-precise" x-text="formatMsPrecise(currentLatencyMs(50))"></span>
+        </div>
         <div class="metric-change" x-text="latencyViewLabel()"></div>
     </div>
 
@@ -120,7 +123,10 @@
                 :title="latencyCardTitle(95)"
             >i</span>
         </div>
-        <div class="metric-value" x-text="formatMsWithUnit(currentLatencyMs(95))"></div>
+        <div class="metric-value-with-detail">
+            <span class="metric-value-main" x-text="formatMsWithUnit(currentLatencyMs(95))"></span>
+            <span class="metric-value-precise" x-text="formatMsPrecise(currentLatencyMs(95))"></span>
+        </div>
         <div class="metric-change" x-text="latencyViewLabel()"></div>
     </div>
 
@@ -132,7 +138,10 @@
                 :title="latencyCardTitle(99)"
             >i</span>
         </div>
-        <div class="metric-value" x-text="formatMsWithUnit(currentLatencyMs(99))"></div>
+        <div class="metric-value-with-detail">
+            <span class="metric-value-main" x-text="formatMsWithUnit(currentLatencyMs(99))"></span>
+            <span class="metric-value-precise" x-text="formatMsPrecise(currentLatencyMs(99))"></span>
+        </div>
         <div class="metric-change" x-text="latencyViewLabel()"></div>
     </div>
 

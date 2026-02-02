@@ -105,6 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timing.elapsed_display_seconds` for timer sync.
 - fix(orchestrator): reset parent START_TIME on run start to avoid stale elapsed
   baselines.
+- fix(orchestrator): stop duration now uses warmup start time so PREPARING
+  does not shorten the measurement window.
 - fix(api): treat zero duration_seconds as missing and cast CURRENT_TIMESTAMP
   to TIMESTAMP_NTZ for elapsed calculations.
 - Live multi-node dashboard now streams parent metrics with correct payload shape,
@@ -234,6 +236,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- perf(ws): serve live metrics from the in-memory cache fed by worker POSTs to
+  restore 1s dashboard updates and reduce Snowflake polling.
 - Skip table profiling when AI value pools exist. Previously, `profile_snowflake_table()`
   ran expensive DESCRIBE + MIN/MAX queries even when pre-computed value pools were
   already available from template preparation.

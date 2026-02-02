@@ -92,6 +92,10 @@ with focus on phase transitions and common debugging scenarios.
          │                               │                      └───────────────┘
 ```
 
+**Live cache path (low-latency):**
+- Workers also POST 1s snapshots to `/api/runs/{run_id}/metrics/live`.
+- The WebSocket prefers the in-memory cache and falls back to Snowflake if empty.
+
 ## Key Code Locations
 
 | Component | File | Line(s) | Description |

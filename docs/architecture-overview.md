@@ -1,6 +1,6 @@
 # Architecture Overview (Current)
 
-Last updated: 2026-01-27
+Last updated: 2026-02-01
 
 ## System Purpose
 
@@ -17,7 +17,8 @@ and throughput, and persists results to Snowflake.
     (`backend/core/orchestrator.py` + `scripts/run_worker.py`).
   - **FIXED scaling**: legacy in-memory registry + executor path
     (`backend/core/test_registry.py`, `backend/core/test_executor.py`).
-- **WebSocket**: `/ws/test/{test_id}` streams live metrics.
+- **WebSocket**: `/ws/test/{test_id}` streams live metrics from the in-memory cache.
+- **Live metrics cache**: populated by workers via `/api/runs/{run_id}/metrics/live`.
 - **Results store**: Snowflake (`UNISTORE_BENCHMARK.TEST_RESULTS`).
 - **Postgres**: optional target for Postgres-family benchmarks.
 
@@ -49,6 +50,7 @@ and throughput, and persists results to Snowflake.
 ### Data Plane (Workers)
 - Executes workload queries against target systems.
 - Emits live metrics snapshots to `WORKER_METRICS_SNAPSHOTS` and logs.
+- Pushes 1s live metrics to the controller cache (`/api/runs/{run_id}/metrics/live`).
 - Persists query executions and per-worker snapshots.
 - Workers joining after warmup ends start directly in MEASUREMENT phase.
 

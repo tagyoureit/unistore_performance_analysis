@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     WS_PING_TIMEOUT: int = 10
 
     # ========================================================================
+    # Live Metrics Settings
+    # ========================================================================
+    LIVE_METRICS_CACHE_TTL_SECONDS: float = 5.0
+    LIVE_METRICS_POST_URL: str = ""
+    LIVE_METRICS_POST_TIMEOUT_SECONDS: float = 0.5
+
+    # ========================================================================
     # Connection Pool Settings
     # ========================================================================
     SNOWFLAKE_POOL_SIZE: int = 5

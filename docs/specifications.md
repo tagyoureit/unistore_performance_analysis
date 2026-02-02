@@ -123,6 +123,28 @@ Rules:
 - WebSocket is read-only: no control commands are sent over this channel.
 - Control-plane commands are written by the orchestrator to `RUN_CONTROL_EVENTS`.
 
+### Live Metrics Ingestion (Cache)
+
+Workers POST live metrics snapshots to the controller every 1 second:
+
+- **Endpoint**: `POST /api/runs/{run_id}/metrics/live`
+- **Purpose**: feed the in-memory cache used by the WebSocket stream
+- **Behavior**: best-effort, cache TTL defaults to 5s; WebSocket falls back to Snowflake
+
+Request body (shape):
+```json
+{
+  "test_id": "worker-test-id",
+  "worker_id": "worker-0",
+  "worker_group_id": 0,
+  "worker_group_count": 2,
+  "phase": "WARMUP",
+  "status": "RUNNING",
+  "target_connections": 25,
+  "metrics": { "...": "Metrics payload (worker snapshot)" }
+}
+```
+
 ### Live Metrics Payload
 
 ```json

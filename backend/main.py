@@ -21,6 +21,7 @@ import logging
 
 from backend.config import settings
 from backend.core import results_store
+from backend.core.live_metrics_cache import live_metrics_cache
 from backend.core.test_registry import registry
 from backend.connectors import snowflake_pool
 
@@ -1418,9 +1419,16 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         status = run_status.get("status") if run_status else None
         status = status or await _get_parent_test_status(test_id) or "RUNNING"
         status_upper = str(status or "").upper()
-        metrics = await _aggregate_multi_worker_metrics(test_id)
-        metrics = metrics or {}
-        workers = metrics.pop("workers", [])
+        live_snapshot = await live_metrics_cache.get_run_snapshot(run_id=test_id)
+        cached_test_ids: list[str] | None = None
+        if live_snapshot:
+            metrics = dict(live_snapshot.metrics)
+            workers = list(live_snapshot.workers)
+            cached_test_ids = list(live_snapshot.test_ids)
+        else:
+            metrics = await _aggregate_multi_worker_metrics(test_id)
+            metrics = metrics or {}
+            workers = metrics.pop("workers", [])
         metrics_phase = metrics.pop("phase", None)
         phase = (
             run_status.get("phase")
@@ -1505,7 +1513,10 @@ async def _stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         if find_max_state is not None:
             payload["find_max"] = find_max_state
 
-        known_test_ids = await _fetch_run_test_ids(test_id)
+        if cached_test_ids:
+            known_test_ids = cached_test_ids
+        else:
+            known_test_ids = await _fetch_run_test_ids(test_id)
         for tid in known_test_ids:
             last_log_seq_by_test.setdefault(tid, 0)
 

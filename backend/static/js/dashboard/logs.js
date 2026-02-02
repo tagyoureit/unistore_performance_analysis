@@ -41,7 +41,7 @@ window.DashboardMixins.logs = {
     const targets = Array.isArray(this.logTargets) ? this.logTargets : [];
     if (!targets.length) return null;
     const preferred = targets.find(
-      (target) => String(target.worker_id || "") === "ORCHESTRATOR",
+      (target) => String(target.kind || "") === "all",
     );
     return preferred || targets[0];
   },
@@ -155,23 +155,8 @@ window.DashboardMixins.logs = {
     if (this.mode === "live") return;
     try {
       const params = new URLSearchParams({ limit: String(this.logMaxLines) });
-      const selectedTarget = this._getLogTargetById(this.logSelectedTargetId);
-      if (selectedTarget) {
-        const targetId = selectedTarget.target_id || selectedTarget.test_id || "";
-        if (targetId) {
-          params.set("target_id", String(targetId));
-        }
-      }
-      const selectedTestId = selectedTarget
-        ? selectedTarget.test_id
-        : this.logSelectedTestId;
-      if (
-        selectedTestId &&
-        this.testId &&
-        String(selectedTestId) !== String(this.testId)
-      ) {
-        params.set("child_test_id", String(selectedTestId));
-      }
+      // Always fetch all logs - filtering is done client-side
+      params.set("target_id", "all");
       const resp = await fetch(
         `/api/tests/${this.testId}/logs?${params.toString()}`,
       );
@@ -218,24 +203,13 @@ window.DashboardMixins.logs = {
 
   onLogTargetChange() {
     const target = this._getLogTargetById(this.logSelectedTargetId);
-    if (this.mode === "live") {
-      if (target) {
-        this._applyLogTargetSelection(target);
-      } else {
-        this.logSelectedTestId = this.testId;
-        this.logWorkerFilter = "";
-      }
-      return;
-    }
-    this.logs = [];
-    this._logSeen = {};
     if (target) {
       this._applyLogTargetSelection(target);
     } else {
       this.logSelectedTestId = this.testId;
       this.logWorkerFilter = "";
     }
-    this.loadLogs();
+    // Filtering is done client-side via filteredLogs() - no need to reload
   },
 
   appendLogs(logs) {

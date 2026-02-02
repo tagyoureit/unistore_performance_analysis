@@ -1286,7 +1286,8 @@ class OrchestratorService:
                 status_rows = await self._pool.execute_query(
                     f"""
                     SELECT STATUS, PHASE,
-                           TIMESTAMPDIFF(SECOND, START_TIME, CURRENT_TIMESTAMP()) AS ELAPSED_SECONDS
+                           TIMESTAMPDIFF(SECOND, START_TIME, CURRENT_TIMESTAMP()) AS ELAPSED_SECONDS,
+                           TIMESTAMPDIFF(SECOND, WARMUP_START_TIME, CURRENT_TIMESTAMP()) AS WARMUP_ELAPSED_SECONDS
                     FROM {prefix}.RUN_STATUS
                     WHERE RUN_ID = ?
                     """,
@@ -1296,11 +1297,16 @@ class OrchestratorService:
                     logger.warning("Poll loop: run %s not found in RUN_STATUS", run_id)
                     return
 
-                status_raw, phase_raw, elapsed_raw = status_rows[0]
+                status_raw, phase_raw, elapsed_raw, warmup_elapsed_raw = status_rows[0]
                 status = str(status_raw or "").upper()
                 phase = str(phase_raw or "").upper()
                 elapsed_seconds = (
                     float(elapsed_raw) if elapsed_raw is not None else None
+                )
+                warmup_elapsed_seconds = (
+                    float(warmup_elapsed_raw)
+                    if warmup_elapsed_raw is not None
+                    else None
                 )
                 now = datetime.now(UTC)
 
@@ -1398,16 +1404,18 @@ class OrchestratorService:
                         initial_phase,
                     )
                     # Note: START_TIME was already set in start_run() to include PREPARING phase
+                    # Set WARMUP_START_TIME now that workers are ready (for accurate warmup timing)
                     await self._pool.execute_query(
                         f"""
                         UPDATE {prefix}.RUN_STATUS
                         SET STATUS = 'RUNNING',
                             PHASE = ?,
+                            WARMUP_START_TIME = CASE WHEN ? = 'WARMUP' THEN CURRENT_TIMESTAMP() ELSE NULL END,
                             UPDATED_AT = CURRENT_TIMESTAMP()
                         WHERE RUN_ID = ?
                           AND STATUS = 'STARTING'
                         """,
-                        params=[initial_phase, run_id],
+                        params=[initial_phase, initial_phase, run_id],
                     )
                     await self._pool.execute_query(
                         f"""
@@ -1527,13 +1535,13 @@ class OrchestratorService:
                     status == "RUNNING"
                     and phase == "WARMUP"
                     and warmup_seconds > 0
-                    and elapsed_seconds is not None
-                    and elapsed_seconds >= warmup_seconds
+                    and warmup_elapsed_seconds is not None
+                    and warmup_elapsed_seconds >= warmup_seconds
                 ):
                     logger.info(
-                        "Transitioning %s from WARMUP to MEASUREMENT: elapsed=%.1fs >= warmup=%ds",
+                        "Transitioning %s from WARMUP to MEASUREMENT: warmup_elapsed=%.1fs >= warmup=%ds",
                         run_id,
-                        elapsed_seconds,
+                        warmup_elapsed_seconds,
                         warmup_seconds,
                     )
                     await self._pool.execute_query(
@@ -1558,16 +1566,21 @@ class OrchestratorService:
                     )
                     phase = "MEASUREMENT"
 
+                effective_elapsed_seconds = elapsed_seconds
+                if warmup_seconds > 0 and warmup_elapsed_seconds is not None:
+                    # Use warmup start as the elapsed base so PREPARING does not
+                    # eat into the configured warmup + measurement budget.
+                    effective_elapsed_seconds = warmup_elapsed_seconds
                 if (
                     status == "RUNNING"
                     and duration_seconds > 0
-                    and elapsed_seconds is not None
-                    and elapsed_seconds >= (warmup_seconds + duration_seconds)
+                    and effective_elapsed_seconds is not None
+                    and effective_elapsed_seconds >= (warmup_seconds + duration_seconds)
                 ):
                     logger.info(
                         "Stopping %s due to duration elapsed: elapsed=%.1fs >= warmup+duration=%d+%d=%ds",
                         run_id,
-                        elapsed_seconds,
+                        effective_elapsed_seconds,
                         warmup_seconds,
                         duration_seconds,
                         warmup_seconds + duration_seconds,

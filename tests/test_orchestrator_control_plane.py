@@ -52,12 +52,14 @@ class _PollLoopPool:
         status: str,
         phase: str,
         start_time: datetime | None,
+        warmup_start_time: datetime | None = None,
         heartbeat_row: tuple[object, ...],
         metrics_row: tuple[object, ...] | None = None,
     ) -> None:
         self.status = status
         self.phase = phase
         self.start_time = start_time
+        self.warmup_start_time = warmup_start_time
         self.heartbeat_row = heartbeat_row
         self.metrics_row = metrics_row
         self.calls: list[tuple[str, list[object] | None]] = []
@@ -71,9 +73,14 @@ class _PollLoopPool:
             and "RUN_STATUS" in sql
         ):
             elapsed = None
+            warmup_elapsed = None
             if self.start_time is not None:
                 elapsed = (datetime.now(UTC) - self.start_time).total_seconds()
-            return [(self.status, self.phase, elapsed)]
+            if self.warmup_start_time is not None:
+                warmup_elapsed = (
+                    datetime.now(UTC) - self.warmup_start_time
+                ).total_seconds()
+            return [(self.status, self.phase, elapsed, warmup_elapsed)]
         if "SELECT COUNT(*) AS WORKER_COUNT" in sql and "WORKER_HEARTBEATS" in sql:
             return [self.heartbeat_row]
         if "FROM" in sql and "WORKER_METRICS_SNAPSHOTS" in sql:
@@ -462,14 +469,16 @@ async def test_poll_loop_duration_includes_warmup(monkeypatch):
     Regression test: duration check must use warmup_seconds + duration_seconds.
 
     With warmup=10s and duration=10s, a run that has been going for 15 seconds
-    should NOT be stopped (still in measurement phase, needs 20s total).
+    since warmup start should NOT be stopped (still in measurement phase, needs 20s total).
     """
-    # 15 seconds elapsed - past warmup (10s) but not past warmup+duration (20s)
-    start_time = datetime.now(UTC) - timedelta(seconds=15)
+    # 10s PREPARING + 15s since warmup start (past warmup but not past total)
+    start_time = datetime.now(UTC) - timedelta(seconds=25)
+    warmup_start_time = datetime.now(UTC) - timedelta(seconds=15)
     pool = _PollLoopPool(
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=start_time,
+        warmup_start_time=warmup_start_time,
         heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
@@ -522,12 +531,14 @@ async def test_poll_loop_duration_stops_after_warmup_plus_duration(monkeypatch):
     With warmup=10s and duration=10s, a run that has been going for 25 seconds
     SHOULD be stopped.
     """
-    # 25 seconds elapsed - past warmup+duration (20s)
-    start_time = datetime.now(UTC) - timedelta(seconds=25)
+    # 10s PREPARING + 25s since warmup start (past warmup+duration)
+    start_time = datetime.now(UTC) - timedelta(seconds=35)
+    warmup_start_time = datetime.now(UTC) - timedelta(seconds=25)
     pool = _PollLoopPool(
         status="RUNNING",
         phase="MEASUREMENT",
         start_time=start_time,
+        warmup_start_time=warmup_start_time,
         heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )
@@ -581,6 +592,7 @@ async def test_poll_loop_warmup_phase_transition(monkeypatch):
         status="RUNNING",
         phase="WARMUP",  # Still in WARMUP phase
         start_time=start_time,
+        warmup_start_time=start_time,
         heartbeat_row=(1, 1, 0, 0, 0, None, None, None),
         metrics_row=None,
     )

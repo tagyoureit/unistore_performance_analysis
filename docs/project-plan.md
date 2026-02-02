@@ -20,7 +20,7 @@ This document serves as the index for the multi-worker architecture implementati
 | [plan/timer-fixes.md](plan/timer-fixes.md) | Elapsed time & phase bugs (2.18/2.19) |
 | [plan/refactor-bugs.md](plan/refactor-bugs.md) | Multi-worker refactor bugs (2.21) |
 | [plan/log-improvements.md](plan/log-improvements.md) | Worker log visibility & filtering (2.22) |
-| [plan/query-execution-streaming.md](plan/query-execution-streaming.md) | Query execution streaming & sampling (Phase 4) |
+| [plan/query-execution-streaming.md](plan/query-execution-streaming.md) | Query execution streaming & sampling ✅ |
 
 ## Current Status
 

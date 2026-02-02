@@ -614,6 +614,87 @@ async def update_parent_run_aggregate(*, parent_run_id: str) -> None:
         find_max_rows[0][0] if find_max_rows and find_max_rows[0][0] else None
     )
 
+    # Aggregate detailed breakdown latency stats from worker TEST_RESULTS rows.
+    # Use AVG for p50, MAX for p95/p99/max, MIN for min across workers.
+    breakdown_rows = await pool.execute_query(
+        f"""
+        SELECT
+            AVG(READ_P50_LATENCY_MS) AS READ_P50,
+            MAX(READ_P95_LATENCY_MS) AS READ_P95,
+            MAX(READ_P99_LATENCY_MS) AS READ_P99,
+            MIN(READ_MIN_LATENCY_MS) AS READ_MIN,
+            MAX(READ_MAX_LATENCY_MS) AS READ_MAX,
+            AVG(WRITE_P50_LATENCY_MS) AS WRITE_P50,
+            MAX(WRITE_P95_LATENCY_MS) AS WRITE_P95,
+            MAX(WRITE_P99_LATENCY_MS) AS WRITE_P99,
+            MIN(WRITE_MIN_LATENCY_MS) AS WRITE_MIN,
+            MAX(WRITE_MAX_LATENCY_MS) AS WRITE_MAX,
+            AVG(POINT_LOOKUP_P50_LATENCY_MS) AS POINT_LOOKUP_P50,
+            MAX(POINT_LOOKUP_P95_LATENCY_MS) AS POINT_LOOKUP_P95,
+            MAX(POINT_LOOKUP_P99_LATENCY_MS) AS POINT_LOOKUP_P99,
+            MIN(POINT_LOOKUP_MIN_LATENCY_MS) AS POINT_LOOKUP_MIN,
+            MAX(POINT_LOOKUP_MAX_LATENCY_MS) AS POINT_LOOKUP_MAX,
+            AVG(RANGE_SCAN_P50_LATENCY_MS) AS RANGE_SCAN_P50,
+            MAX(RANGE_SCAN_P95_LATENCY_MS) AS RANGE_SCAN_P95,
+            MAX(RANGE_SCAN_P99_LATENCY_MS) AS RANGE_SCAN_P99,
+            MIN(RANGE_SCAN_MIN_LATENCY_MS) AS RANGE_SCAN_MIN,
+            MAX(RANGE_SCAN_MAX_LATENCY_MS) AS RANGE_SCAN_MAX,
+            AVG(INSERT_P50_LATENCY_MS) AS INSERT_P50,
+            MAX(INSERT_P95_LATENCY_MS) AS INSERT_P95,
+            MAX(INSERT_P99_LATENCY_MS) AS INSERT_P99,
+            MIN(INSERT_MIN_LATENCY_MS) AS INSERT_MIN,
+            MAX(INSERT_MAX_LATENCY_MS) AS INSERT_MAX,
+            AVG(UPDATE_P50_LATENCY_MS) AS UPDATE_P50,
+            MAX(UPDATE_P95_LATENCY_MS) AS UPDATE_P95,
+            MAX(UPDATE_P99_LATENCY_MS) AS UPDATE_P99,
+            MIN(UPDATE_MIN_LATENCY_MS) AS UPDATE_MIN,
+            MAX(UPDATE_MAX_LATENCY_MS) AS UPDATE_MAX,
+            AVG(APP_OVERHEAD_P50_MS) AS APP_OVERHEAD_P50,
+            MAX(APP_OVERHEAD_P95_MS) AS APP_OVERHEAD_P95,
+            MAX(APP_OVERHEAD_P99_MS) AS APP_OVERHEAD_P99
+        FROM {prefix}.TEST_RESULTS
+        WHERE RUN_ID = ?
+          AND TEST_ID <> ?
+        """,
+        params=[parent_run_id, parent_run_id],
+    )
+    breakdown = breakdown_rows[0] if breakdown_rows else (None,) * 33
+    (
+        read_p50,
+        read_p95,
+        read_p99,
+        read_min,
+        read_max,
+        write_p50,
+        write_p95,
+        write_p99,
+        write_min,
+        write_max,
+        point_lookup_p50,
+        point_lookup_p95,
+        point_lookup_p99,
+        point_lookup_min,
+        point_lookup_max,
+        range_scan_p50,
+        range_scan_p95,
+        range_scan_p99,
+        range_scan_min,
+        range_scan_max,
+        insert_p50,
+        insert_p95,
+        insert_p99,
+        insert_min,
+        insert_max,
+        update_p50,
+        update_p95,
+        update_p99,
+        update_min,
+        update_max,
+        app_overhead_p50,
+        app_overhead_p95,
+        app_overhead_p99,
+    ) = breakdown
+
     merge_query = f"""
     MERGE INTO {prefix}.TEST_RESULTS AS t
     USING (SELECT ? AS TEST_ID) AS s
@@ -646,6 +727,39 @@ async def update_parent_run_aggregate(*, parent_run_id: str) -> None:
         ERROR_RATE = ?,
         CUSTOM_METRICS = PARSE_JSON(?),
         FIND_MAX_RESULT = PARSE_JSON(?),
+        READ_P50_LATENCY_MS = ?,
+        READ_P95_LATENCY_MS = ?,
+        READ_P99_LATENCY_MS = ?,
+        READ_MIN_LATENCY_MS = ?,
+        READ_MAX_LATENCY_MS = ?,
+        WRITE_P50_LATENCY_MS = ?,
+        WRITE_P95_LATENCY_MS = ?,
+        WRITE_P99_LATENCY_MS = ?,
+        WRITE_MIN_LATENCY_MS = ?,
+        WRITE_MAX_LATENCY_MS = ?,
+        POINT_LOOKUP_P50_LATENCY_MS = ?,
+        POINT_LOOKUP_P95_LATENCY_MS = ?,
+        POINT_LOOKUP_P99_LATENCY_MS = ?,
+        POINT_LOOKUP_MIN_LATENCY_MS = ?,
+        POINT_LOOKUP_MAX_LATENCY_MS = ?,
+        RANGE_SCAN_P50_LATENCY_MS = ?,
+        RANGE_SCAN_P95_LATENCY_MS = ?,
+        RANGE_SCAN_P99_LATENCY_MS = ?,
+        RANGE_SCAN_MIN_LATENCY_MS = ?,
+        RANGE_SCAN_MAX_LATENCY_MS = ?,
+        INSERT_P50_LATENCY_MS = ?,
+        INSERT_P95_LATENCY_MS = ?,
+        INSERT_P99_LATENCY_MS = ?,
+        INSERT_MIN_LATENCY_MS = ?,
+        INSERT_MAX_LATENCY_MS = ?,
+        UPDATE_P50_LATENCY_MS = ?,
+        UPDATE_P95_LATENCY_MS = ?,
+        UPDATE_P99_LATENCY_MS = ?,
+        UPDATE_MIN_LATENCY_MS = ?,
+        UPDATE_MAX_LATENCY_MS = ?,
+        APP_OVERHEAD_P50_MS = ?,
+        APP_OVERHEAD_P95_MS = ?,
+        APP_OVERHEAD_P99_MS = ?,
         UPDATED_AT = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN INSERT (
         TEST_ID,
@@ -675,12 +789,86 @@ async def update_parent_run_aggregate(*, parent_run_id: str) -> None:
         ERROR_COUNT,
         ERROR_RATE,
         CUSTOM_METRICS,
-        FIND_MAX_RESULT
+        FIND_MAX_RESULT,
+        READ_P50_LATENCY_MS,
+        READ_P95_LATENCY_MS,
+        READ_P99_LATENCY_MS,
+        READ_MIN_LATENCY_MS,
+        READ_MAX_LATENCY_MS,
+        WRITE_P50_LATENCY_MS,
+        WRITE_P95_LATENCY_MS,
+        WRITE_P99_LATENCY_MS,
+        WRITE_MIN_LATENCY_MS,
+        WRITE_MAX_LATENCY_MS,
+        POINT_LOOKUP_P50_LATENCY_MS,
+        POINT_LOOKUP_P95_LATENCY_MS,
+        POINT_LOOKUP_P99_LATENCY_MS,
+        POINT_LOOKUP_MIN_LATENCY_MS,
+        POINT_LOOKUP_MAX_LATENCY_MS,
+        RANGE_SCAN_P50_LATENCY_MS,
+        RANGE_SCAN_P95_LATENCY_MS,
+        RANGE_SCAN_P99_LATENCY_MS,
+        RANGE_SCAN_MIN_LATENCY_MS,
+        RANGE_SCAN_MAX_LATENCY_MS,
+        INSERT_P50_LATENCY_MS,
+        INSERT_P95_LATENCY_MS,
+        INSERT_P99_LATENCY_MS,
+        INSERT_MIN_LATENCY_MS,
+        INSERT_MAX_LATENCY_MS,
+        UPDATE_P50_LATENCY_MS,
+        UPDATE_P95_LATENCY_MS,
+        UPDATE_P99_LATENCY_MS,
+        UPDATE_MIN_LATENCY_MS,
+        UPDATE_MAX_LATENCY_MS,
+        APP_OVERHEAD_P50_MS,
+        APP_OVERHEAD_P95_MS,
+        APP_OVERHEAD_P99_MS
     )
     VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, PARSE_JSON(?), PARSE_JSON(?)
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        PARSE_JSON(?), PARSE_JSON(?),
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
     )
     """
+
+    def _float_or_none(v: float | None) -> float | None:
+        return float(v) if v is not None else None
+
+    breakdown_params = [
+        _float_or_none(read_p50),
+        _float_or_none(read_p95),
+        _float_or_none(read_p99),
+        _float_or_none(read_min),
+        _float_or_none(read_max),
+        _float_or_none(write_p50),
+        _float_or_none(write_p95),
+        _float_or_none(write_p99),
+        _float_or_none(write_min),
+        _float_or_none(write_max),
+        _float_or_none(point_lookup_p50),
+        _float_or_none(point_lookup_p95),
+        _float_or_none(point_lookup_p99),
+        _float_or_none(point_lookup_min),
+        _float_or_none(point_lookup_max),
+        _float_or_none(range_scan_p50),
+        _float_or_none(range_scan_p95),
+        _float_or_none(range_scan_p99),
+        _float_or_none(range_scan_min),
+        _float_or_none(range_scan_max),
+        _float_or_none(insert_p50),
+        _float_or_none(insert_p95),
+        _float_or_none(insert_p99),
+        _float_or_none(insert_min),
+        _float_or_none(insert_max),
+        _float_or_none(update_p50),
+        _float_or_none(update_p95),
+        _float_or_none(update_p99),
+        _float_or_none(update_min),
+        _float_or_none(update_max),
+        _float_or_none(app_overhead_p50),
+        _float_or_none(app_overhead_p95),
+        _float_or_none(app_overhead_p99),
+    ]
 
     params = [
         parent_run_id,
@@ -711,6 +899,7 @@ async def update_parent_run_aggregate(*, parent_run_id: str) -> None:
         float(error_rate or 0.0),
         json.dumps(custom_metrics),
         find_max_result_json,
+        *breakdown_params,
         parent_run_id,
         parent_run_id,
         test_name,
@@ -739,6 +928,7 @@ async def update_parent_run_aggregate(*, parent_run_id: str) -> None:
         float(error_rate or 0.0),
         json.dumps(custom_metrics),
         find_max_result_json,
+        *breakdown_params,
     ]
 
     await pool.execute_query(merge_query, params=params)

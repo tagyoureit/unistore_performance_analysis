@@ -263,6 +263,16 @@ window.DashboardMixins.historicalMetrics = {
       sfRunningChart.data.datasets[5].data = sfInsData;
       sfRunningChart.data.datasets[6].data = sfUpdData;
       sfRunningChart.data.datasets[7].data = sfBlockedData;
+      
+      // Check if breakdown data is available (any non-zero values in breakdown series)
+      const hasBreakdownData = sfReadData.some(v => v > 0) || 
+                               sfWriteData.some(v => v > 0) ||
+                               sfPlData.some(v => v > 0) ||
+                               sfRsData.some(v => v > 0) ||
+                               sfInsData.some(v => v > 0) ||
+                               sfUpdData.some(v => v > 0);
+      this._sfRunningHasBreakdown = hasBreakdownData;
+      
       this.applySfRunningBreakdownToChart({ skipUpdate: true });
       addWarmupAnnotation(sfRunningChart);
       sfRunningChart.update();
@@ -277,6 +287,16 @@ window.DashboardMixins.historicalMetrics = {
       opsSecChart.data.datasets[4].data = opsWriteData;
       opsSecChart.data.datasets[5].data = opsInsData;
       opsSecChart.data.datasets[6].data = opsUpdData;
+      
+      // Check if breakdown data is available (any non-zero values in breakdown series)
+      const hasOpsBreakdownData = opsReadData.some(v => v > 0) || 
+                                  opsWriteData.some(v => v > 0) ||
+                                  opsPlData.some(v => v > 0) ||
+                                  opsRsData.some(v => v > 0) ||
+                                  opsInsData.some(v => v > 0) ||
+                                  opsUpdData.some(v => v > 0);
+      this._opsSecHasBreakdown = hasOpsBreakdownData;
+      
       this.applyOpsSecBreakdownToChart({ skipUpdate: true });
       addWarmupAnnotation(opsSecChart);
       opsSecChart.update();
