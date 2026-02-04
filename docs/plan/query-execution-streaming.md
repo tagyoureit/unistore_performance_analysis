@@ -1,8 +1,13 @@
 # Query Execution Streaming
 
-**Status**: Implemented  
+**Status**: Superseded by [file-based-query-logging.md](file-based-query-logging.md)  
 **Created**: 2025-01-31  
-**Last Updated**: 2025-02-01
+**Last Updated**: 2026-02-04
+
+> **SUPERSEDED**: This streaming approach caused event loop contention at high QPS,
+> resulting in periodic concurrency dips (100 → 30-60). The file-based approach
+> in [file-based-query-logging.md](file-based-query-logging.md) eliminates this
+> by deferring Snowflake writes to the PROCESSING phase.
 
 ## Problem Statement
 

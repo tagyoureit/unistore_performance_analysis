@@ -5475,6 +5475,106 @@ def _build_latency_variance_text(
 
     return "\n".join(lines)
 
+
+def _build_postgres_latency_analysis_text(
+    *,
+    e2e_p50: float | None,
+    e2e_p95: float | None,
+    pg_mean_exec_time_ms: float | None,
+) -> str:
+    """
+    Build PostgreSQL-specific latency analysis comparing end-to-end vs server execution time.
+    
+    For PostgreSQL, we use pg_stat_statements mean execution time rather than per-query metrics.
+    This provides insight into the network overhead vs server processing time.
+    """
+    lines = ["POSTGRES LATENCY BREAKDOWN:"]
+    
+    if e2e_p50 is not None and pg_mean_exec_time_ms is not None and pg_mean_exec_time_ms > 0:
+        network_overhead_ms = e2e_p50 - pg_mean_exec_time_ms
+        network_pct = (network_overhead_ms / e2e_p50 * 100) if e2e_p50 > 0 else 0
+        server_pct = 100 - network_pct
+        
+        lines.append(f"- End-to-end P50 latency: {e2e_p50:.2f}ms (what your application sees)")
+        lines.append(f"- Server execution time: {pg_mean_exec_time_ms:.3f}ms (PostgreSQL processing)")
+        lines.append(f"- Network/protocol overhead: {network_overhead_ms:.2f}ms ({network_pct:.1f}% of total)")
+        lines.append("")
+        
+        if network_pct > 95:
+            lines.append(
+                "- DIAGNOSIS: Network-dominated latency (>95%). PostgreSQL is extremely fast, "
+                "but network round-trip dominates. To improve: reduce geographic distance, "
+                "use connection pooling, batch operations, or consider read replicas closer to the app."
+            )
+        elif network_pct > 80:
+            lines.append(
+                "- DIAGNOSIS: Network-heavy latency (80-95%). Server execution is efficient, "
+                "but network overhead is significant. Consider connection pooling, batching, "
+                "or moving compute closer to the database."
+            )
+        elif network_pct > 50:
+            lines.append(
+                "- DIAGNOSIS: Balanced latency profile. Both network and server contribute meaningfully. "
+                "Optimization opportunities exist at both layers."
+            )
+        else:
+            lines.append(
+                "- DIAGNOSIS: Server-dominated latency. PostgreSQL execution time is the primary factor. "
+                "Consider query optimization, indexing improvements, or instance sizing."
+            )
+    elif e2e_p50 is not None:
+        lines.append(f"- End-to-end P50 latency: {e2e_p50:.2f}ms")
+        lines.append("- Server execution time: N/A (pg_stat_statements data unavailable)")
+    else:
+        lines.append("- Latency data: N/A")
+    
+    return "\n".join(lines)
+
+
+def _build_postgres_server_metrics_guidance() -> str:
+    """
+    Return guidance text for interpreting PostgreSQL server metrics.
+    
+    This explains what the pg_stat_statements metrics mean and how to interpret them
+    for OLTP workload analysis.
+    """
+    return """
+POSTGRESQL METRICS INTERPRETATION GUIDE:
+
+**Cache Hit Ratio** (shared_blks_hit / (shared_blks_hit + shared_blks_read)):
+- >99%: Excellent - working set fits in shared_buffers, minimal disk I/O
+- 95-99%: Good - most data cached, occasional disk reads for less frequent data
+- 90-95%: Acceptable - consider increasing shared_buffers or optimizing queries
+- <90%: Concerning - significant disk I/O, may indicate under-provisioned memory
+
+IMPORTANT: High cache hit ratio does NOT mean "same query repeated" - it means the INDEX 
+PAGES and DATA PAGES are cached in memory. Different queries with different parameter 
+values (e.g., different primary keys) all benefit from cached B-tree index pages.
+
+**Mean Server Execution Time**: 
+- PostgreSQL's actual query processing time (excludes network)
+- <1ms: Excellent for OLTP point lookups
+- 1-10ms: Good for indexed queries
+- 10-100ms: May indicate table scans or complex joins
+- >100ms: Likely full table scans or analytical queries
+
+**Network Overhead** (App latency - Server time):
+- This is typically the LARGEST component of end-to-end latency for OLTP
+- Includes: TCP round-trip, TLS handshake (if not pooled), protocol parsing, result serialization
+- Optimize via: Connection pooling, geographic proximity, batching operations
+
+**WAL (Write-Ahead Log) Generated**:
+- Indicates write activity volume
+- High WAL with few writes = large row updates or indexes being modified
+- Monitor for replication lag implications
+
+**Block Read Time**:
+- Time spent on actual disk I/O (only when track_io_timing=on)
+- High block read time with low cache hit = memory pressure
+- High block read time with high cache hit = occasional cold data access
+"""
+
+
 def _build_concurrency_prompt(
     *,
     test_name: str,
@@ -5501,6 +5601,10 @@ def _build_concurrency_prompt(
 ) -> str:
     """Build prompt for CONCURRENCY mode (fixed worker count)."""
     error_pct = (failed_ops / total_ops * 100) if total_ops > 0 else 0
+    
+    # Determine if this is a Postgres test
+    table_type_u = str(table_type or "").upper().strip()
+    is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
 
     logs_section = ""
     if execution_logs:
@@ -5508,8 +5612,48 @@ def _build_concurrency_prompt(
 EXECUTION LOGS (filtered for relevance):
 {execution_logs}
 """
+    
+    # Build platform-specific guidance
+    if is_postgres:
+        platform_intro = "You are analyzing a **PostgreSQL** CONCURRENCY mode benchmark test."
+        latency_analysis_guidance = """3. **Latency Breakdown Analysis**: Interpret the server vs network latency split.
+   - What percentage of latency is network overhead vs PostgreSQL server execution?
+   - Is the database the bottleneck, or is network round-trip dominating?
+   - For high network overhead: consider connection pooling, geographic proximity, batching
+   - For high server time: look at cache hit ratio, query optimization, indexing
 
-    return f"""You are analyzing a Snowflake CONCURRENCY mode benchmark test.
+4. **PostgreSQL Server Metrics Analysis**: Interpret the pg_stat_statements data.
+   - Cache hit ratio: Is the working set fitting in shared_buffers? (>99% is excellent)
+   - Mean server time: Is PostgreSQL processing efficiently? (<1ms excellent for OLTP)
+   - WAL generated: Is write activity reasonable for the workload mix?
+   - Block read time: Is there excessive disk I/O?"""
+        bottleneck_guidance = """5. **Bottleneck Analysis**: What's limiting performance?
+   - Network bound (high network overhead, low server time)?
+   - Database bound (high server time, cache misses)?
+   - Connection pool bound (waiting for connections)?
+   - Instance size bound (consider larger Postgres instance)?"""
+        recommendations_guidance = """6. **Recommendations**: Specific suggestions:
+   - Should concurrency be increased or decreased?
+   - Would a larger Postgres instance help?
+   - Are there query optimization or indexing opportunities?
+   - Would connection pooling or batching improve throughput?
+   - Is the test client too far from the database (network latency)?"""
+    else:
+        platform_intro = "You are analyzing a Snowflake CONCURRENCY mode benchmark test."
+        latency_analysis_guidance = """3. **Latency Variance Analysis**: Interpret the spread ratios (P95/P50).
+   - Is variance coming from Snowflake execution or app/network layer?
+   - If high SF spread: warehouse contention, cold cache, multi-cluster scaling?
+   - If high E2E but low SF: network latency, client processing, connection pooling?"""
+        bottleneck_guidance = """4. **Bottleneck Analysis**: What's limiting performance?
+   - Compute bound (high CPU, low queue times)?
+   - Queue bound (high queue_overload_ms)?
+   - Data bound (high bytes_scanned)?"""
+        recommendations_guidance = """5. **Recommendations**: Specific suggestions:
+   - Should concurrency be increased or decreased?
+   - Would a larger warehouse help?
+   - Any query optimization opportunities?"""
+
+    return f"""{platform_intro}
 
 **Mode: CONCURRENCY (Fixed Workers / Closed Model)**
 This test ran a fixed number of concurrent workers for a set duration to measure steady-state performance under constant load.
@@ -5518,7 +5662,7 @@ TEST SUMMARY:
 - Test Name: {test_name}
 - Status: {test_status}
 - Table Type: {table_type}
-- Warehouse: {warehouse} ({warehouse_size})
+- {"Instance" if is_postgres else "Warehouse"}: {warehouse} ({warehouse_size})
 - Fixed Workers: {concurrency} workers
 - Duration: {duration}s
 - Total Operations: {total_ops} (Reads: {read_ops}, Writes: {write_ops})
@@ -5545,24 +5689,15 @@ Provide analysis structured as:
 2. **Key Findings**: What stands out in the metrics?
    - Any concerning latency outliers (compare p50 vs p95 vs p99)?
    - Read vs write performance differences?
-   - Queue wait times indicating saturation?
+   {"- Cache hit ratio and server execution time?" if is_postgres else "- Queue wait times indicating saturation?"}
 
-3. **Latency Variance Analysis**: Interpret the spread ratios (P95/P50).
-   - Is variance coming from Snowflake execution or app/network layer?
-   - If high SF spread: warehouse contention, cold cache, multi-cluster scaling?
-   - If high E2E but low SF: network latency, client processing, connection pooling?
+{latency_analysis_guidance}
 
-4. **Bottleneck Analysis**: What's limiting performance?
-   - Compute bound (high CPU, low queue times)?
-   - Queue bound (high queue_overload_ms)?
-   - Data bound (high bytes_scanned)?
+{bottleneck_guidance}
 
-5. **Recommendations**: Specific suggestions:
-   - Should concurrency be increased or decreased?
-   - Would a larger warehouse help?
-   - Any query optimization opportunities?
+{recommendations_guidance}
 
-6. **Overall Grade**: A/B/C/D/F with brief justification.
+{"7" if is_postgres else "6"}. **Overall Grade**: A/B/C/D/F with brief justification.
 
 Keep analysis concise and actionable. Use bullet points with specific numbers."""
 
@@ -5596,6 +5731,10 @@ def _build_qps_prompt(
     """Build prompt for QPS mode (auto-scaling to target)."""
     error_pct = (failed_ops / total_ops * 100) if total_ops > 0 else 0
     target_achieved_pct = (ops_per_sec / target_qps * 100) if target_qps > 0 else 0
+    
+    # Determine if this is a Postgres test
+    table_type_u = str(table_type or "").upper().strip()
+    is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
 
     logs_section = ""
     if execution_logs:
@@ -5603,8 +5742,44 @@ def _build_qps_prompt(
 AUTO-SCALER LOGS (showing controller decisions):
 {execution_logs}
 """
+    
+    # Platform-specific intro and guidance
+    if is_postgres:
+        platform_intro = "You are analyzing a **PostgreSQL** QPS mode benchmark test."
+        latency_guidance = """3. **Latency Breakdown Analysis**: Interpret the server vs network latency split.
+   - What percentage of latency is network overhead vs PostgreSQL server execution?
+   - Is the database the bottleneck, or is network round-trip dominating?
+   - Cache hit ratio: Is the working set fitting in shared_buffers?
+   - Mean server time: Is PostgreSQL processing efficiently?"""
+        bottleneck_guidance = """4. **Bottleneck Analysis**: What limited target achievement?
+   - Max workers reached?
+   - Network latency limiting throughput?
+   - PostgreSQL server capacity (check server execution time)?
+   - Connection pool exhaustion?
+   - High error rate?"""
+        recommendations_guidance = """5. **Recommendations**:
+   - Adjust target QPS (higher or lower)?
+   - Increase max_concurrency?
+   - Larger Postgres instance needed?
+   - Improve network latency (geographic proximity)?
+   - Query optimizations or better indexing?"""
+    else:
+        platform_intro = "You are analyzing a Snowflake QPS mode benchmark test."
+        latency_guidance = """3. **Latency Variance Analysis**: Interpret the spread ratios (P95/P50).
+   - Is variance coming from Snowflake execution or app/network layer?
+   - If high SF spread: warehouse contention, cold cache, multi-cluster scaling?
+   - If high E2E but low SF: network latency, client processing, connection pooling?"""
+        bottleneck_guidance = """4. **Bottleneck Analysis**: What limited target achievement?
+   - Max workers reached?
+   - Warehouse saturation (queue times)?
+   - High error rate?"""
+        recommendations_guidance = """5. **Recommendations**:
+   - Adjust target QPS (higher or lower)?
+   - Increase max_concurrency?
+   - Larger warehouse needed?
+   - Query optimizations?"""
 
-    return f"""You are analyzing a Snowflake QPS mode benchmark test.
+    return f"""{platform_intro}
 
 **Mode: QPS (Auto-Scale to Target Throughput)**
 This test dynamically scaled connections between {min_connections}-{max_concurrency} to achieve a target throughput of {target_qps} ops/sec. The controller adjusts concurrency based on achieved vs target QPS.
@@ -5613,7 +5788,7 @@ TEST SUMMARY:
 - Test Name: {test_name}
 - Status: {test_status}
 - Table Type: {table_type}
-- Warehouse: {warehouse} ({warehouse_size})
+- {"Instance" if is_postgres else "Warehouse"}: {warehouse} ({warehouse_size})
 - Target QPS: {target_qps} ops/sec
 - Achieved QPS: {ops_per_sec:.1f} ops/sec ({target_achieved_pct:.1f}% of target)
 - Connection Range: {min_connections}-{max_concurrency}
@@ -5641,23 +5816,13 @@ Provide analysis structured as:
 2. **Auto-Scaler Performance**: How well did the controller perform?
    - Did it effectively scale to meet demand?
    - Were there oscillations or instability? (Check the logs for scaling decisions)
-   - Queue times indicating the controller couldn't keep up?
+   {"- Connection pool utilization and PostgreSQL connection limits?" if is_postgres else "- Queue times indicating the controller couldn't keep up?"}
 
-3. **Latency Variance Analysis**: Interpret the spread ratios (P95/P50).
-   - Is variance coming from Snowflake execution or app/network layer?
-   - If high SF spread: warehouse contention, cold cache, multi-cluster scaling?
-   - If high E2E but low SF: network latency, client processing, connection pooling?
+{latency_guidance}
 
-4. **Bottleneck Analysis**: What limited target achievement?
-   - Max workers reached?
-   - Warehouse saturation (queue times)?
-   - High error rate?
+{bottleneck_guidance}
 
-5. **Recommendations**:
-   - Adjust target QPS (higher or lower)?
-   - Increase max_concurrency?
-   - Larger warehouse needed?
-   - Query optimizations?
+{recommendations_guidance}
 
 6. **Overall Grade**: A/B/C/D/F with brief justification.
 
@@ -5696,6 +5861,10 @@ def _build_find_max_prompt(
 ) -> str:
     """Build prompt for FIND_MAX_CONCURRENCY mode (step-load test)."""
     error_pct = (failed_ops / total_ops * 100) if total_ops > 0 else 0
+    
+    # Determine if this is a Postgres test
+    table_type_u = str(table_type or "").upper().strip()
+    is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
 
     logs_section = ""
     if execution_logs:
@@ -5738,8 +5907,51 @@ EXECUTION LOGS (step transitions, degradation detection, backoff decisions):
                     f"| {step_num} | {workers} | {qps:.1f} | {step_p95:.1f} "
                     f"| {err_pct:.2f}% | {stable} | {reason} |\n"
                 )
+    
+    # Platform-specific intro and guidance
+    if is_postgres:
+        platform_intro = "You are analyzing a **PostgreSQL** FIND_MAX_CONCURRENCY benchmark test."
+        latency_guidance = """3. **Latency Breakdown Analysis**: Interpret the server vs network latency split.
+   - What percentage of latency is network overhead vs PostgreSQL server execution?
+   - Did server execution time increase as concurrency increased?
+   - Is the cache hit ratio maintaining at higher concurrency?
+   - At what concurrency did network overhead become the bottleneck?"""
+        bottleneck_guidance = """5. **Bottleneck Identification**: What resource was exhausted?
+   - Network bandwidth or connection limits?
+   - PostgreSQL server capacity (check server execution time)?
+   - Connection pool exhaustion?
+   - Shared buffer contention (cache hit ratio dropping)?
+   - Lock contention at high concurrency?"""
+        recommendations_guidance = """6. **Recommendations**:
+   - Optimal operating point (usually 70-80% of max)?
+   - Would a larger Postgres instance increase max concurrency?
+   - Would improved network latency allow higher throughput?
+   - Any connection pooling or batching optimizations?"""
+        grade_criteria = f"""7. **Overall Grade**: A/B/C/D/F based on:
+   - How well did max concurrency match expectations for {warehouse_size} Postgres instance?
+   - Was degradation graceful or sudden?
+   - Is the recommended operating point practical?
+   - How much of the latency is server vs network at the optimal point?"""
+    else:
+        platform_intro = "You are analyzing a Snowflake FIND_MAX_CONCURRENCY benchmark test."
+        latency_guidance = """3. **Latency Variance Analysis**: Interpret the spread ratios (P95/P50).
+   - Is variance coming from Snowflake execution or app/network layer?
+   - If high SF spread: warehouse contention, cold cache, multi-cluster scaling?
+   - If high E2E but low SF: network latency, client processing, connection pooling?"""
+        bottleneck_guidance = """5. **Bottleneck Identification**: What resource was exhausted?
+   - Warehouse compute capacity?
+   - Connection/query queue limits?
+   - Data access contention?"""
+        recommendations_guidance = """6. **Recommendations**:
+   - Optimal operating point (usually 70-80% of max)?
+   - Would larger warehouse increase max concurrency?
+   - Any configuration changes to improve scalability?"""
+        grade_criteria = f"""7. **Overall Grade**: A/B/C/D/F based on:
+   - How well did max concurrency match expectations for {warehouse_size} warehouse?
+   - Was degradation graceful or sudden?
+   - Is the recommended operating point practical?"""
 
-    return f"""You are analyzing a Snowflake FIND_MAX_CONCURRENCY benchmark test.
+    return f"""{platform_intro}
 
 **Mode: FIND_MAX_CONCURRENCY (Step-Load Test)**
 This test incrementally increased concurrent workers to find the maximum sustainable concurrency before performance degraded. It started at {start_concurrency} workers, increased by +{increment} every {step_duration}s, up to max {max_concurrency}.
@@ -5754,7 +5966,7 @@ TEST SUMMARY:
 - Test Name: {test_name}
 - Status: {test_status}
 - Table Type: {table_type}
-- Warehouse: {warehouse} ({warehouse_size})
+- {"Instance" if is_postgres else "Warehouse"}: {warehouse} ({warehouse_size})
 - Step Configuration: Start={start_concurrency}, +{increment}/step, {step_duration}s/step, Max={max_concurrency}
 - **Best Sustainable Concurrency: {best_concurrency} workers**
 - **Best Stable QPS: {best_qps}**
@@ -5789,31 +6001,19 @@ Provide analysis structured as:
    - Where did diminishing returns begin?
    - At what point did latency start degrading?
 
-3. **Latency Variance Analysis**: Interpret the spread ratios (P95/P50).
-   - Is variance coming from Snowflake execution or app/network layer?
-   - If high SF spread: warehouse contention, cold cache, multi-cluster scaling?
-   - If high E2E but low SF: network latency, client processing, connection pooling?
+{latency_guidance}
 
 4. **Degradation Point**: What caused the system to stop scaling?
    - Latency spike (compare baseline vs final p95)?
    - Error rate increase?
-   - Queue saturation?
+   {"- Cache hit ratio dropping or server time increasing?" if is_postgres else "- Queue saturation?"}
    - Check logs for specific degradation messages
 
-5. **Bottleneck Identification**: What resource was exhausted?
-   - Warehouse compute capacity?
-   - Connection/query queue limits?
-   - Data access contention?
+{bottleneck_guidance}
 
-6. **Recommendations**:
-   - Optimal operating point (usually 70-80% of max)?
-   - Would larger warehouse increase max concurrency?
-   - Any configuration changes to improve scalability?
+{recommendations_guidance}
 
-7. **Overall Grade**: A/B/C/D/F based on:
-   - How well did max concurrency match expectations for {warehouse_size} warehouse?
-   - Was degradation graceful or sudden?
-   - Is the recommended operating point practical?
+{grade_criteria}
 
 Keep analysis concise and actionable. Use bullet points with specific numbers."""
 
@@ -5981,6 +6181,8 @@ async def ai_analysis(
 
         # Fetch warehouse/postgres metrics
         wh_text = ""
+        pg_server_metrics_text = ""
+        pg_mean_exec_time_ms = None
         if is_postgres:
             pg_text = ""
             try:
@@ -6007,7 +6209,7 @@ async def ai_analysis(
                 if not isinstance(pool_stats, dict):
                     pool_stats = {}
                 pg_text = (
-                    "POSTGRES METRICS:\n"
+                    "POSTGRES CONNECTION POOL:\n"
                     f"- Pool size: {pool_stats.get('size', 'N/A')}\n"
                     f"- Pool in-use: {pool_stats.get('in_use', 'N/A')}\n"
                     f"- Pool free: {pool_stats.get('free', 'N/A')}\n"
@@ -6015,7 +6217,60 @@ async def ai_analysis(
                     f"- Active connections: {ps.get('active_connections', 'N/A')}\n"
                     f"- Max connections: {ps.get('max_connections', 'N/A')}"
                 )
-            wh_text = pg_text
+            
+            # Fetch pg_stat_statements enrichment data (server-side metrics)
+            pg_enrichment = await _fetch_pg_enrichment(pool=pool, test_id=test_id)
+            if pg_enrichment.get("pg_enrichment_available"):
+                pge = pg_enrichment.get("pg_enrichment", {})
+                pg_mean_exec_time_ms = pge.get("mean_exec_time_ms")
+                
+                # Format WAL bytes nicely
+                wal_bytes = pge.get("wal_bytes")
+                if wal_bytes and wal_bytes > 0:
+                    if wal_bytes > 1024 * 1024:
+                        wal_str = f"{wal_bytes / (1024 * 1024):.2f} MB"
+                    elif wal_bytes > 1024:
+                        wal_str = f"{wal_bytes / 1024:.2f} KB"
+                    else:
+                        wal_str = f"{wal_bytes} bytes"
+                else:
+                    wal_str = "N/A"
+                
+                # Build breakdown by query kind if available
+                by_kind = pge.get("by_kind", {})
+                by_kind_text = ""
+                if by_kind:
+                    by_kind_text = "\n\nSERVER METRICS BY QUERY TYPE:\n"
+                    for kind, stats in by_kind.items():
+                        if kind == "SYSTEM":
+                            continue  # Skip system queries in analysis
+                        calls = stats.get("calls", 0)
+                        mean_ms = stats.get("mean_exec_time_ms", 0)
+                        rows = stats.get("rows_returned", 0)
+                        cache_hit = stats.get("cache_hit_ratio", 0)
+                        by_kind_text += (
+                            f"- {kind}: {calls:,} calls, "
+                            f"mean={mean_ms:.3f}ms, "
+                            f"rows={rows:,}, "
+                            f"cache_hit={cache_hit * 100:.1f}%\n"
+                        )
+                
+                pg_server_metrics_text = (
+                    "\nPOSTGRES SERVER METRICS (from pg_stat_statements):\n"
+                    f"- Total Server Calls: {pge.get('total_calls', 0):,}\n"
+                    f"- Mean Server Execution Time: {_format_stat(pge.get('mean_exec_time_ms'), '.3f')}ms\n"
+                    f"- Total Server Execution Time: {_format_stat(pge.get('total_exec_time_ms'), '.2f')}ms\n"
+                    f"- Cache Hit Ratio: {_format_stat(pge.get('cache_hit_pct'), '.2f')}%\n"
+                    f"- Shared Blocks Hit: {pge.get('shared_blks_hit', 0):,}\n"
+                    f"- Shared Blocks Read (disk): {pge.get('shared_blks_read', 0):,}\n"
+                    f"- Block Read Time (I/O): {_format_stat(pge.get('blk_read_time_ms'), '.2f')}ms\n"
+                    f"- Rows Returned: {pge.get('rows_returned', 0):,}\n"
+                    f"- WAL Generated: {wal_str}\n"
+                    f"- Query Patterns Captured: {pge.get('query_pattern_count', 0)}"
+                    f"{by_kind_text}"
+                )
+            
+            wh_text = pg_text + pg_server_metrics_text
         else:
             wh_metrics = await _fetch_warehouse_metrics(pool=pool, test_id=test_id)
             if wh_metrics.get("warehouse_metrics_available"):
@@ -6029,7 +6284,7 @@ async def ai_analysis(
                     f"- Cache hit rate: {_format_stat(wm.get('read_cache_hit_pct'), '.1f')}%"
                 )
 
-        # Fetch SF execution latency for spread analysis
+        # Fetch SF execution latency for spread analysis (only for Snowflake)
         sf_latency = await _fetch_sf_execution_latency_summary(pool=pool, test_id=test_id)
         sf_p50 = sf_latency.get("sf_p50_latency_ms")
         sf_p95 = sf_latency.get("sf_p95_latency_ms")
@@ -6038,15 +6293,26 @@ async def ai_analysis(
         e2e_spread = _compute_latency_spread(p50=p50, p95=p95)
         sf_spread = _compute_latency_spread(p50=sf_p50, p95=sf_p95)
 
-        # Build latency variance text for prompt
-        latency_variance_text = _build_latency_variance_text(
-            e2e_p50=p50,
-            e2e_p95=p95,
-            e2e_spread_ratio=e2e_spread.get("latency_spread_ratio"),
-            sf_p50=sf_p50,
-            sf_p95=sf_p95,
-            sf_spread_ratio=sf_spread.get("latency_spread_ratio"),
-        )
+        # Build latency variance text for prompt (different for Postgres vs Snowflake)
+        if is_postgres and pg_mean_exec_time_ms is not None:
+            # Use Postgres-specific latency analysis with server metrics
+            latency_variance_text = _build_postgres_latency_analysis_text(
+                e2e_p50=p50,
+                e2e_p95=p95,
+                pg_mean_exec_time_ms=pg_mean_exec_time_ms,
+            )
+            # Add the Postgres metrics interpretation guide
+            latency_variance_text += "\n\n" + _build_postgres_server_metrics_guidance()
+        else:
+            # Standard Snowflake latency variance analysis
+            latency_variance_text = _build_latency_variance_text(
+                e2e_p50=p50,
+                e2e_p95=p95,
+                e2e_spread_ratio=e2e_spread.get("latency_spread_ratio"),
+                sf_p50=sf_p50,
+                sf_p95=sf_p95,
+                sf_spread_ratio=sf_spread.get("latency_spread_ratio"),
+            )
 
         context = req.context if req else None
 

@@ -347,3 +347,63 @@ See [postgres-enrichment.md](postgres-enrichment.md) for detailed implementation
 - [ ] Dashboard displays cache hit ratio for Postgres tests
 - [ ] Graceful degradation when pg_stat_statements unavailable
 - [ ] Comparison view shows appropriate metrics for each table type
+
+## 2.25 File-Based Query Logging ⬜
+
+See [file-based-query-logging.md](file-based-query-logging.md) for detailed implementation plan.
+
+**Problem**: The `QueryExecutionStreamer` causes periodic concurrency dips (100 → 30-60) during high-throughput benchmarks due to async lock contention on the event loop.
+
+**Solution**: Replace streaming INSERTs with file-based logging:
+1. Write query records to local Parquet files during benchmark (no event loop interaction)
+2. PUT files to internal stage during PROCESSING phase
+3. COPY INTO for bulk load (fastest possible)
+4. Cleanup staged files after successful load
+
+**Key Design Decisions**:
+- **File format**: Parquet (fastest for COPY INTO, best compression)
+- **File size**: 500K rows (~100-250MB compressed) per file
+- **Buffer size**: 10K rows in memory before disk flush
+- **Stage cleanup**: Automatic after successful COPY INTO
+
+### Phase 1: Infrastructure ⬜
+- [ ] Create `backend/core/file_query_logger.py`
+  - [ ] `FileBasedQueryLogger` class
+  - [ ] Buffer management (plain list, no async lock)
+  - [ ] Parquet file writing with PyArrow
+  - [ ] File splitting at 500K rows threshold
+- [ ] Add `QUERY_EXECUTIONS_STAGE` to `sql/schema/results_tables.sql`
+- [ ] Apply schema changes to Snowflake
+
+### Phase 2: Worker Integration ⬜
+- [ ] Update `scripts/run_worker.py`
+  - [ ] Replace `QueryExecutionStreamer` with `FileBasedQueryLogger`
+  - [ ] Add `finalize()` call to shutdown sequence
+  - [ ] Add `cleanup_on_error()` to exception handlers
+- [ ] Update `backend/core/test_executor.py`
+  - [ ] Accept `FileBasedQueryLogger` instead of streamer
+  - [ ] Change `append()` to sync call (no await)
+
+### Phase 3: Testing ⬜
+- [ ] Unit tests for `FileBasedQueryLogger`
+  - [ ] Buffer flushing to Parquet
+  - [ ] File splitting at threshold
+  - [ ] Schema correctness
+- [ ] Integration tests
+  - [ ] PUT + COPY INTO flow
+  - [ ] Stage cleanup verification
+  - [ ] Multi-worker concurrent uploads
+- [ ] Performance validation
+  - [ ] Verify no concurrency dips during benchmark
+  - [ ] Measure PROCESSING phase duration impact
+
+### Phase 4: Cleanup ⬜
+- [ ] Remove `QueryExecutionStreamer` class and file
+- [ ] Update `docs/plan/query-execution-streaming.md` status to "Superseded"
+- [ ] Update architecture documentation
+
+**Acceptance**:
+- [ ] Benchmark concurrency stable at 95-100 (no dips)
+- [ ] Query records successfully loaded to QUERY_EXECUTIONS
+- [ ] No orphaned files in stage after test completion
+- [ ] PROCESSING phase duration acceptable (<60s for typical tests)
