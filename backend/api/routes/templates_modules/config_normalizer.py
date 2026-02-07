@@ -5,6 +5,8 @@ Template configuration normalization and validation.
 import math
 from typing import Any
 
+from backend.core.mode_config import ModeConfig
+
 from .constants import (
     _CUSTOM_PCT_FIELDS,
     _CUSTOM_QUERY_FIELDS,
@@ -155,25 +157,22 @@ def _normalize_template_config(cfg: Any) -> dict[str, Any]:
 
     # Load mode: fixed workers vs auto-scale (QPS target).
     # - QPS mode targets app-side throughput (ops/sec). Snowflake RUNNING is observed separately.
-    load_mode_raw = str(out.get("load_mode") or "CONCURRENCY").strip()
-    load_mode = load_mode_raw.upper() if load_mode_raw else "CONCURRENCY"
-    if load_mode not in {"CONCURRENCY", "QPS", "FIND_MAX_CONCURRENCY"}:
-        raise ValueError("load_mode must be CONCURRENCY, QPS, or FIND_MAX_CONCURRENCY")
-    out["load_mode"] = load_mode
-
-    if "min_concurrency" in out:
-        raise ValueError("min_concurrency was renamed to scaling.min_connections")
-
+    # Use ModeConfig for unified parsing (strict=True raises ValueError on invalid)
     scaling_cfg = out.get("scaling")
     if not isinstance(scaling_cfg, dict):
         scaling_cfg = {}
     out["scaling"] = scaling_cfg
 
-    scaling_mode_raw = str(scaling_cfg.get("mode") or "AUTO").strip()
-    scaling_mode = scaling_mode_raw.upper() if scaling_mode_raw else "AUTO"
-    if scaling_mode not in {"AUTO", "BOUNDED", "FIXED"}:
-        raise ValueError("scaling.mode must be AUTO, BOUNDED, or FIXED")
-    scaling_cfg["mode"] = scaling_mode
+    _norm_mode_cfg = ModeConfig.from_config(
+        scaling_cfg=scaling_cfg, workload_cfg=out, strict=True
+    )
+    load_mode = _norm_mode_cfg.load_mode
+    out["load_mode"] = load_mode
+    scaling_cfg["mode"] = _norm_mode_cfg.scaling_mode
+    scaling_mode = _norm_mode_cfg.scaling_mode
+
+    if "min_concurrency" in out:
+        raise ValueError("min_concurrency was renamed to scaling.min_connections")
 
     def _coerce_optional_int(
         value: Any, *, label: str, allow_unbounded: bool = False

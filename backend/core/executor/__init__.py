@@ -4,8 +4,6 @@ Test Executor Package
 This package provides the TestExecutor class for orchestrating performance tests.
 
 For backward compatibility, TestExecutor is imported from the original module.
-The mixin modules (metrics, workers, operations, controllers) provide reference
-implementations that can be used for future refactoring.
 
 Usage:
     from backend.core.executor import TestExecutor

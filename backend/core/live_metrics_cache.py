@@ -228,8 +228,10 @@ def _aggregate_workers(
             phases.append(phase_value)
 
         status_upper = _normalize_status(snapshot.status)
+        # Include WARMUP, MEASUREMENT, and RUNNING phase metrics.
+        # Workers report phase as "RUNNING" (not "MEASUREMENT") during benchmark execution.
         include_for_metrics = (
-            not phase_value or phase_value in ("WARMUP", "MEASUREMENT")
+            not phase_value or phase_value in ("WARMUP", "MEASUREMENT", "RUNNING")
         ) and status_upper != "DEAD"
 
         if include_for_metrics:

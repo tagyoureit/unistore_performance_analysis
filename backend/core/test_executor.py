@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, List, Optional, cast
 from uuid import uuid4
 import time
 
@@ -32,7 +32,9 @@ from backend.models import (
 )
 from backend.config import settings
 from backend.connectors import snowflake_pool
+from backend.core.mode_config import ModeConfig
 from backend.core.table_managers import create_table_manager, TableManager
+from backend.core.worker_pool import WorkerPool
 from backend.core.table_profiler import (
     TableProfile,
     profile_snowflake_table,
@@ -1091,41 +1093,6 @@ class TestExecutor:
             logger.debug("Failed to load TEMPLATE_VALUE_POOLS: %s", e)
             self._value_pools = {}
 
-    def _select_list_sql(self) -> str:
-        """
-        Projection list for SELECT queries.
-
-        If the template includes ai_workload.projection_columns, we use it to
-        avoid SELECT * on wide customer tables.
-        """
-        tpl_cfg = getattr(self, "_template_config", None)
-        if not isinstance(tpl_cfg, dict):
-            return "*"
-        ai_cfg = tpl_cfg.get("ai_workload")
-        if not isinstance(ai_cfg, dict):
-            return "*"
-        cols = ai_cfg.get("projection_columns")
-        if not isinstance(cols, list):
-            return "*"
-
-        out: list[str] = []
-        for c in cols:
-            s = str(c or "").strip().upper()
-            if not s:
-                continue
-            out.append(f'"{s}"')
-        # De-dupe and cap to keep SQL reasonable.
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for c in out:
-            if c in seen:
-                continue
-            seen.add(c)
-            deduped.append(c)
-        if not deduped:
-            return "*"
-        return ", ".join(deduped[:50])
-
     def _pool_values(self, kind: str, column: Optional[str] = None) -> list[Any]:
         pools = getattr(self, "_value_pools", {}) or {}
         kind_u = (kind or "").upper()
@@ -1183,13 +1150,9 @@ class TestExecutor:
         metrics_task: Optional[asyncio.Task] = None
         qps_controller_task: Optional[asyncio.Task] = None
         try:
-            load_mode = (
-                str(getattr(self.scenario, "load_mode", "CONCURRENCY") or "CONCURRENCY")
-                .strip()
-                .upper()
-            )
-            if load_mode not in {"CONCURRENCY", "QPS", "FIND_MAX_CONCURRENCY"}:
-                load_mode = "CONCURRENCY"
+            # Use ModeConfig for unified parsing (strict=False uses defaults)
+            _exec_mode_cfg = ModeConfig.from_config(scenario=self.scenario, strict=False)
+            load_mode = _exec_mode_cfg.load_mode
 
             controller_logger = logging.LoggerAdapter(
                 logger, {"worker_id": "CONTROLLER"}
@@ -1267,8 +1230,8 @@ class TestExecutor:
                 if isinstance(tpl_cfg, dict):
                     # Derive autoscale_enabled from scaling.mode (AUTO/BOUNDED = enabled)
                     scaling_cfg = tpl_cfg.get("scaling") or {}
-                    scaling_mode = str(scaling_cfg.get("mode") or "AUTO").upper()
-                    autoscale_enabled = scaling_mode != "FIXED"
+                    _qps_mode_cfg = ModeConfig.from_config(scaling_cfg=scaling_cfg, strict=False)
+                    autoscale_enabled = _qps_mode_cfg.autoscale_enabled
                     parent_run_id = tpl_cfg.get("parent_run_id")
                     if parent_run_id:
                         autoscale_parent_run_id = str(parent_run_id)
@@ -1282,40 +1245,30 @@ class TestExecutor:
                 if min_workers > max_workers:
                     min_workers = max_workers
 
-                qps_workers: dict[int, tuple[asyncio.Task, asyncio.Event]] = {}
-                next_worker_id = 0
+                # Use WorkerPool for unified worker management
+                def _qps_worker_factory(
+                    wid: int, warmup: bool, stop_signal: asyncio.Event
+                ) -> Coroutine[Any, Any, None]:
+                    return self._controlled_worker(
+                        worker_id=wid, warmup=warmup, stop_signal=stop_signal
+                    )
 
                 def _sync_worker_list() -> None:
-                    self.workers = [t for t, _ in qps_workers.values() if not t.done()]
+                    self.workers = qps_pool.get_tasks()
 
-                def _prune_done() -> None:
-                    for wid, (t, _) in list(qps_workers.items()):
-                        if t.done():
-                            qps_workers.pop(wid, None)
-
-                def _running_worker_ids() -> list[int]:
-                    out: list[int] = []
-                    for wid, (t, stop_signal) in qps_workers.items():
-                        if t.done():
-                            continue
-                        if stop_signal.is_set():
-                            continue
-                        out.append(int(wid))
-                    return out
-
-                def _live_worker_ids() -> list[int]:
-                    out: list[int] = []
-                    for wid, (t, _) in qps_workers.items():
-                        if t.done():
-                            continue
-                        out.append(int(wid))
-                    return out
+                qps_pool = WorkerPool(
+                    worker_factory=_qps_worker_factory,
+                    min_workers=min_workers,
+                    max_workers=max_workers,
+                    use_lock=False,
+                    on_workers_changed=_sync_worker_list,
+                )
 
                 def _active_worker_count() -> int:
-                    return len(_running_worker_ids())
+                    return len(qps_pool.running_worker_ids())
 
                 def _live_worker_count() -> int:
-                    return len(_live_worker_ids())
+                    return len(qps_pool.live_worker_ids())
 
                 async def _fetch_autoscale_target_qps() -> tuple[
                     float | None, int | None
@@ -1363,79 +1316,22 @@ class TestExecutor:
                     per_worker_target = target_total / float(worker_count)
                     return (float(per_worker_target), int(worker_count))
 
-                async def _spawn_one(*, warmup: bool) -> None:
-                    nonlocal next_worker_id
-                    wid = int(next_worker_id)
-                    next_worker_id += 1
-                    stop_signal = asyncio.Event()
-                    task = asyncio.create_task(
-                        self._controlled_worker(
-                            worker_id=wid, warmup=warmup, stop_signal=stop_signal
-                        )
-                    )
-                    qps_workers[wid] = (task, stop_signal)
-                    _sync_worker_list()
-
                 async def _scale_to(*, target: int, warmup: bool) -> None:
-                    _prune_done()
+                    """Scale workers using WorkerPool."""
                     target = int(target)
                     target = max(min_workers, min(max_workers, target))
                     self._target_workers = target  # Track target for metrics
 
-                    running_ids = sorted(_running_worker_ids())
-                    running = len(running_ids)
-                    live = len(_live_worker_ids())
-
-                    # Scale up:
-                    # - Never exceed max_workers/pool_size by counting ALL live tasks,
-                    #   including stop-signaled ones that are still finishing an in-flight query.
-                    if running < target:
+                    async def _prewarm(n: int) -> None:
                         pool = getattr(self, "_snowflake_pool_override", None)
                         if pool is not None and hasattr(pool, "prewarm"):
-                            await pool.prewarm(target)
-                        spawn_n = min((target - running), max(0, target - live))
-                        for _ in range(spawn_n):
-                            await _spawn_one(warmup=warmup)
+                            await pool.prewarm(n)
 
-                    # Scale down:
-                    # - Only mark currently running workers to stop; workers already
-                    #   stop-signaled still occupy capacity until they fully exit.
-                    elif running > target:
-                        stop_n = running - target
-                        stop_ids = list(reversed(running_ids))[:stop_n]
-                        for wid in stop_ids:
-                            _, stop_signal = qps_workers.get(wid, (None, None))
-                            if isinstance(stop_signal, asyncio.Event):
-                                stop_signal.set()
-                        _sync_worker_list()
+                    await qps_pool.scale_to(target, warmup=warmup, prewarm_callback=_prewarm)
 
                 async def _stop_all_workers(*, timeout_seconds: float) -> None:
-                    _prune_done()
-                    for _, stop_signal in qps_workers.values():
-                        stop_signal.set()
-                    _sync_worker_list()
-                    tasks = [t for t, _ in qps_workers.values()]
-                    if not tasks:
-                        qps_workers.clear()
-                        return
-                    # Never cancel workers here: cancelling tasks while they're awaiting
-                    # `run_in_executor(...)` can leave the underlying thread still running
-                    # a query while the connection is returned to the pool.
-                    #
-                    # Use timeout to avoid hanging indefinitely if workers are blocked
-                    # on uninterruptible I/O operations.
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*tasks, return_exceptions=True),
-                            timeout=timeout_seconds,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "Timed out waiting for QPS workers to stop after %.1fs",
-                            timeout_seconds,
-                        )
-                    qps_workers.clear()
-                    _sync_worker_list()
+                    """Stop all workers using WorkerPool."""
+                    await qps_pool.stop_all(timeout_seconds=timeout_seconds)
 
                 def _desired_workers_from_qps(
                     *,
@@ -1552,7 +1448,7 @@ class TestExecutor:
 
                     while not self._stop_event.is_set():
                         await asyncio.sleep(control_interval)
-                        _prune_done()
+                        qps_pool.prune_completed()
 
                         current_running = _active_worker_count()
                         current_live = _live_worker_count()
@@ -1891,7 +1787,7 @@ class TestExecutor:
                         pass
                     qps_controller_task = None
 
-                    _prune_done()
+                    qps_pool.prune_completed()
                     estimated_workers = _active_worker_count()
                     logger.info(
                         "Warmup complete. Estimated starting workers for measurement: %d (max=%d).",
@@ -2070,78 +1966,49 @@ class TestExecutor:
                     },
                 }
 
-                fmc_workers: dict[int, tuple[asyncio.Task, asyncio.Event]] = {}
-                fmc_next_worker_id = 0
+                # Use WorkerPool for unified worker management (FMC mode)
+                def _fmc_worker_factory(
+                    wid: int, warmup: bool, stop_signal: asyncio.Event
+                ) -> Coroutine[Any, Any, None]:
+                    return self._controlled_worker(
+                        worker_id=wid, warmup=warmup, stop_signal=stop_signal
+                    )
 
                 def _fmc_sync_worker_list() -> None:
-                    self.workers = [t for t, _ in fmc_workers.values() if not t.done()]
+                    self.workers = fmc_pool.get_tasks()
 
-                def _fmc_prune_done() -> None:
-                    for wid, (t, _) in list(fmc_workers.items()):
-                        if t.done():
-                            fmc_workers.pop(wid, None)
-
-                def _fmc_running_worker_ids() -> list[int]:
-                    out: list[int] = []
-                    for wid, (t, stop_signal) in fmc_workers.items():
-                        if t.done() or stop_signal.is_set():
-                            continue
-                        out.append(int(wid))
-                    return out
+                fmc_pool = WorkerPool(
+                    worker_factory=_fmc_worker_factory,
+                    min_workers=1,
+                    max_workers=max_cc,
+                    use_lock=False,
+                    on_workers_changed=_fmc_sync_worker_list,
+                )
 
                 def _fmc_active_worker_count() -> int:
-                    return len(_fmc_running_worker_ids())
-
-                async def _fmc_spawn_one(*, warmup: bool) -> None:
-                    nonlocal fmc_next_worker_id
-                    wid = int(fmc_next_worker_id)
-                    fmc_next_worker_id += 1
-                    stop_signal = asyncio.Event()
-                    task = asyncio.create_task(
-                        self._controlled_worker(
-                            worker_id=wid, warmup=warmup, stop_signal=stop_signal
-                        )
-                    )
-                    fmc_workers[wid] = (task, stop_signal)
-                    _fmc_sync_worker_list()
+                    return len(fmc_pool.running_worker_ids())
 
                 async def _fmc_scale_to(*, target: int, warmup: bool) -> None:
-                    _fmc_prune_done()
+                    """Scale FMC workers using WorkerPool."""
                     target = int(max(1, min(max_cc, target)))
                     self._target_workers = target  # Track target for metrics
-                    running_ids = sorted(_fmc_running_worker_ids())
-                    running = len(running_ids)
 
-                    if running < target:
+                    async def _prewarm(n: int) -> None:
+                        logger.info("[FMC] _prewarm callback invoked with target=%d", n)
                         pool = getattr(self, "_snowflake_pool_override", None)
-                        if pool is not None and hasattr(pool, "prewarm"):
-                            await pool.prewarm(target)
-                        for _ in range(target - running):
-                            await _fmc_spawn_one(warmup=warmup)
-                    elif running > target:
-                        to_stop = running_ids[target:]
-                        for wid in to_stop:
-                            if wid in fmc_workers:
-                                _, stop_sig = fmc_workers[wid]
-                                stop_sig.set()
+                        if pool is None:
+                            logger.warning("[FMC] _prewarm: pool is None, cannot prewarm")
+                            return
+                        if not hasattr(pool, "prewarm"):
+                            logger.warning("[FMC] _prewarm: pool has no prewarm method")
+                            return
+                        await pool.prewarm(n)
+
+                    await fmc_pool.scale_to(target, warmup=warmup, prewarm_callback=_prewarm)
 
                 async def _fmc_stop_all_workers(timeout_seconds: float = 2.0) -> None:
-                    for _, (_, stop_signal) in fmc_workers.items():
-                        stop_signal.set()
-                    tasks = [t for t, _ in fmc_workers.values() if not t.done()]
-                    if tasks:
-                        try:
-                            await asyncio.wait_for(
-                                asyncio.gather(*tasks, return_exceptions=True),
-                                timeout=timeout_seconds,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Timed out waiting for FMC workers to stop after %.1fs",
-                                timeout_seconds,
-                            )
-                    fmc_workers.clear()
-                    _fmc_sync_worker_list()
+                    """Stop all FMC workers using WorkerPool."""
+                    await fmc_pool.stop_all(timeout_seconds=timeout_seconds)
 
                 @dataclass
                 class StepResult:

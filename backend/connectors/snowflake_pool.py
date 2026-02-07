@@ -696,7 +696,19 @@ class SnowflakeConnectionPool:
             target_size = min(target_size, max_allowed)
             to_create = max(0, target_size - current_total)
 
+            logger.info(
+                "[%s] prewarm called: target=%d, current_total=%d (pool=%d, in_use=%d), max_allowed=%d, to_create=%d",
+                self._pool_name,
+                target_size,
+                current_total,
+                len(self._pool),
+                len(self._in_use),
+                max_allowed,
+                to_create,
+            )
+
             if to_create == 0:
+                logger.info("[%s] prewarm: nothing to create, already at target", self._pool_name)
                 return 0
 
             logger.info(

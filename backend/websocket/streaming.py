@@ -344,7 +344,7 @@ async def stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
         if (
             warehouse_name
             and not is_postgres_table
-            and phase_upper in {"WARMUP", "MEASUREMENT"}
+            and phase_upper in {"WARMUP", "MEASUREMENT", "RUNNING"}
             and (
                 cached_warehouse_details is None
                 or _should_poll("warehouse_details", WAREHOUSE_DETAILS_TTL, now)

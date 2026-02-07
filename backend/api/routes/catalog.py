@@ -22,6 +22,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from backend.api.error_handling import http_exception
 from backend.connectors import postgres_pool, snowflake_pool
 from backend.models.test_config import TableType
 
@@ -109,11 +110,7 @@ async def list_databases(table_type: str = Query("standard")):
             # Preserve original case for Postgres (it's case-sensitive)
             return [{"name": str(r["datname"]), "type": "DATABASE"} for r in rows]
         except Exception as e:
-            logger.warning(f"Failed to list Postgres databases: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Failed to connect to Postgres: {e}",
-            ) from e
+            raise http_exception("list Postgres databases", e)
 
     sf = snowflake_pool.get_default_pool()
     rows = await sf.execute_query("SHOW DATABASES")
@@ -168,11 +165,7 @@ async def list_schemas(
             )
             return [{"name": str(r["schema_name"]), "type": "SCHEMA"} for r in rows]
         except Exception as e:
-            logger.warning(f"Failed to list schemas in {db_name}: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Failed to connect to database '{db_name}': {e}",
-            ) from e
+            raise http_exception(f"list schemas in {db_name}", e)
 
     try:
         db = _validate_ident(database, label="database")
@@ -324,11 +317,7 @@ async def list_objects(
             out.sort(key=lambda x: (x["detected_type"], x["name"]))
             return out
         except Exception as e:
-            logger.warning(f"Failed to list objects in {db_name}.{schema_name}: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Failed to connect to database '{db_name}': {e}",
-            ) from e
+            raise http_exception(f"list objects in {db_name}.{schema_name}", e)
 
     try:
         db = _validate_ident(database, label="database")
@@ -535,11 +524,7 @@ async def get_postgres_capabilities(
             detail=f"Database '{database}' not found.",
         )
     except Exception as e:
-        logger.warning("Failed to check Postgres capabilities: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to connect to database '{database}': {e}",
-        )
+        raise http_exception(f"check Postgres capabilities for {database}", e)
     finally:
         if conn:
             await conn.close()

@@ -552,7 +552,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label" style="font-size: 0.75rem;">Threads/Worker</label>
-                                    <input type="number" class="form-input" x-model.number="config.scaling.min_connections" min="1" step="1">
+                                    <input type="number" class="form-input" x-model.number="config.scaling.min_connections" min="1" max="200" step="1">
                                 </div>
                             </div>
                             <div style="padding: 0.5rem; border-radius: 0.25rem; font-size: 0.875rem; background-color: #dbeafe; color: #1e40af;">
@@ -577,7 +577,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label" style="font-size: 0.75rem;">Max Threads/Wkr</label>
-                                    <input type="number" class="form-input" x-model.number="config.scaling.max_connections" min="1" step="1" placeholder="∞">
+                                    <input type="number" class="form-input" x-model.number="config.scaling.max_connections" min="1" max="200" step="1" placeholder="200">
                                 </div>
                             </div>
                         </div>
@@ -649,7 +649,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label" style="font-size: 0.75rem;">Threads/Worker</label>
-                                    <input type="number" class="form-input" x-model.number="config.scaling.min_connections" min="1" step="1">
+                                    <input type="number" class="form-input" x-model.number="config.scaling.min_connections" min="1" max="200" step="1">
                                 </div>
                             </div>
                         </div>
@@ -669,7 +669,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label" style="font-size: 0.75rem;">Max Threads/Wkr</label>
-                                    <input type="number" class="form-input" x-model.number="config.scaling.max_connections" min="1" step="1" placeholder="∞">
+                                    <input type="number" class="form-input" x-model.number="config.scaling.max_connections" min="1" max="200" step="1" placeholder="200">
                                 </div>
                             </div>
                         </div>
@@ -782,7 +782,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label" style="font-size: 0.75rem;">Threads/Worker</label>
-                                    <input type="number" class="form-input" x-model.number="config.scaling.min_connections" min="1" step="1">
+                                    <input type="number" class="form-input" x-model.number="config.scaling.min_connections" min="1" max="200" step="1">
                                 </div>
                             </div>
                             <div style="padding: 0.5rem; border-radius: 0.25rem; font-size: 0.875rem; background-color: #dbeafe; color: #1e40af;">
@@ -806,7 +806,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label" style="font-size: 0.75rem;">Max Threads/Wkr</label>
-                                    <input type="number" class="form-input" x-model.number="config.scaling.max_connections" min="1" step="1" placeholder="∞">
+                                    <input type="number" class="form-input" x-model.number="config.scaling.max_connections" min="1" max="200" step="1" placeholder="200">
                                 </div>
                             </div>
                         </div>
@@ -1835,6 +1835,27 @@ function testConfiguration() {
                 this.config.concurrent_connections = Math.max(1, Math.round(next));
             });
 
+            // Enforce 200 per-worker connection limit with immediate feedback
+            const MAX_CONNS_PER_WORKER = 200;
+            this.$watch('config.scaling.min_connections', (v) => {
+                const scalingMode = String(this.config.scaling?.mode || 'AUTO').toUpperCase();
+                if (scalingMode !== 'FIXED' && scalingMode !== 'BOUNDED') return;
+                const val = Number(v);
+                if (Number.isFinite(val) && val > MAX_CONNS_PER_WORKER) {
+                    window.toast.error(`Threads/Worker capped at ${MAX_CONNS_PER_WORKER}. Each connection spawns multiple internal threads.`);
+                    this.config.scaling.min_connections = MAX_CONNS_PER_WORKER;
+                }
+            });
+            this.$watch('config.scaling.max_connections', (v, prev) => {
+                const scalingMode = String(this.config.scaling?.mode || 'AUTO').toUpperCase();
+                if (scalingMode !== 'BOUNDED') return;
+                const val = Number(v);
+                if (Number.isFinite(val) && val > MAX_CONNS_PER_WORKER) {
+                    window.toast.error(`Max Threads/Worker capped at ${MAX_CONNS_PER_WORKER}. Each connection spawns multiple internal threads.`);
+                    this.config.scaling.max_connections = MAX_CONNS_PER_WORKER;
+                }
+            });
+
             // Initialize guardrails defaults when switching to non-FIXED mode
             this.$watch('config.scaling.mode', (v) => {
                 const mode = String(v || 'AUTO').toUpperCase();
@@ -2169,6 +2190,22 @@ function testConfiguration() {
                 window.toast.warning('Min Connections must be <= Max Connections.');
                 return;
             }
+
+            // Enforce 200 per-worker connection limit for BOUNDED and FIXED modes.
+            // Each Snowflake connection spawns 3-4 internal threads, so 200 connections
+            // = 600-800 threads per worker. Higher values risk OS thread exhaustion.
+            const MAX_CONNECTIONS_PER_WORKER = 200;
+            if (scalingMode === 'BOUNDED' || scalingMode === 'FIXED') {
+                if (minC > MAX_CONNECTIONS_PER_WORKER) {
+                    window.toast.error(`Threads/Worker cannot exceed ${MAX_CONNECTIONS_PER_WORKER}. Each connection spawns multiple internal threads.`);
+                    return;
+                }
+                if (maxC != null && maxC > MAX_CONNECTIONS_PER_WORKER) {
+                    window.toast.error(`Max Threads/Worker cannot exceed ${MAX_CONNECTIONS_PER_WORKER}. Each connection spawns multiple internal threads.`);
+                    return;
+                }
+            }
+
             if (scalingMode === 'FIXED') {
                 if (this.config.scaling?.min_workers == null || String(this.config.scaling?.min_workers).trim() === '') {
                     window.toast.warning('FIXED mode requires Min Workers.');

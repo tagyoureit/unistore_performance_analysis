@@ -207,10 +207,11 @@ async def aggregate_multi_worker_metrics(parent_run_id: str) -> dict[str, Any]:
                 heartbeat_status = hb[2]
                 break
         status_upper = str(heartbeat_status or "").upper()
-        # Include both WARMUP and MEASUREMENT phase metrics for real-time streaming.
+        # Include WARMUP, MEASUREMENT, and RUNNING phase metrics for real-time streaming.
+        # Workers report phase as "RUNNING" (not "MEASUREMENT") during benchmark execution.
         # Excluding WARMUP caused ~45s delay before metrics appeared on dashboard.
         include_for_metrics = (
-            not phase_value or phase_value in ("WARMUP", "MEASUREMENT")
+            not phase_value or phase_value in ("WARMUP", "MEASUREMENT", "RUNNING")
         ) and status_upper != "DEAD"
         if include_for_metrics:
             elapsed_seconds = max(float(elapsed or 0), elapsed_seconds)

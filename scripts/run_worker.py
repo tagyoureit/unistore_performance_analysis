@@ -12,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Coroutine
 from uuid import uuid4
 from urllib.request import Request, urlopen
 
@@ -20,7 +20,9 @@ from backend.config import settings
 from backend.connectors import postgres_pool, snowflake_pool
 from backend.core import results_store
 from backend.core.file_query_logger import FileBasedQueryLogger
+from backend.core.pool_sizing import PoolSizeConfig
 from backend.core.test_executor import TestExecutor
+from backend.core.worker_pool import WorkerPool
 from backend.core.test_log_stream import (
     CURRENT_TEST_ID,
     CURRENT_WORKER_ID,
@@ -147,16 +149,19 @@ def _resolve_per_worker_cap(
     total_connections: int,
     initial_target: int,
     per_worker_connections: int | None,
+    max_connections: int | None,
 ) -> int:
-    # CRITICAL: For FIND_MAX_CONCURRENCY mode, the worker needs a high pool capacity
-    # to allow the algorithm to scale up and discover the true max throughput.
-    # The orchestrator will control how many concurrent queries actually run.
-    # The pool cap is just the ceiling - the algorithm stops based on degradation detection.
-    if load_mode == "FIND_MAX_CONCURRENCY":
-        # Use a high ceiling for FIND_MAX - the algorithm controls actual concurrency.
-        # 10000 is an arbitrary high number that shouldn't be reached in practice.
-        # The algorithm will stop at degradation, not at this ceiling.
-        return 10000
+    """
+    Resolve the per-worker connection pool capacity.
+
+    Priority:
+    1. max_connections (from scaling.max_connections) - universal cap
+    2. per_worker_connections (from scaling.per_worker_capacity) - legacy/explicit
+    3. Fallback based on load_mode
+    """
+    # max_connections is the authoritative cap from template/orchestrator
+    if max_connections is not None:
+        return max(1, int(max_connections))
     if per_worker_connections is not None:
         return max(1, int(per_worker_connections))
     if load_mode == "QPS":
@@ -377,6 +382,7 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     per_worker_connections = scaling_cfg.get("per_worker_connections")
     if per_worker_connections is None:
         per_worker_connections = scaling_cfg.get("per_worker_capacity")
+    max_connections = scaling_cfg.get("max_connections")
     min_connections = _coerce_int(scaling_cfg.get("min_connections"), default=1)
 
     load_mode = str(
@@ -421,6 +427,11 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
         per_worker_connections=(
             _coerce_int(per_worker_connections, default=0)
             if per_worker_connections is not None
+            else None
+        ),
+        max_connections=(
+            _coerce_int(max_connections, default=0)
+            if max_connections is not None
             else None
         ),
     )
@@ -640,8 +651,12 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
                 int(max_allowed),
             )
 
-        initial_pool = max(1, min(max_workers, max(1, int(initial_target or 1))))
-        overflow = max(0, max_workers - initial_pool)
+        # Use PoolSizeConfig for unified pool sizing
+        _sf_pool_cfg = PoolSizeConfig.for_snowflake(
+            initial_target=int(initial_target or 1),
+            max_workers=max_workers,
+        )
+        initial_pool, overflow = _sf_pool_cfg.calculate()
         logger.info(
             "[benchmark] Pool sizing: total_connections=%d, initial_target=%d, per_worker_cap=%d, "
             "max_workers=%d, initial_pool=%d, overflow=%d, load_mode=%s",
@@ -690,19 +705,15 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
         # =========================================================================
         max_workers = int(per_worker_cap)
 
-        # Cap connection pool size based on connection mode
-        # - Direct PostgreSQL (port 5432): Cap at 200 to leave room within max_connections=500
-        # - PgBouncer (port 5431): Allow up to 1000 client connections - PgBouncer multiplexes
-        #   these over its server-side pool (default_pool_size: 497) using transaction pooling
-        DIRECT_POSTGRES_CAP = 200  # Safe limit for direct PostgreSQL connections
-        PGBOUNCER_CLIENT_CAP = (
-            1000  # PgBouncer handles multiplexing, can have many clients
+        # Use PoolSizeConfig for unified pool sizing
+        _pg_pool_cfg = PoolSizeConfig.for_postgres(
+            initial_target=int(initial_target or 1),
+            max_workers=max_workers,
+            use_pgbouncer=use_pgbouncer,
         )
+        initial_pool, effective_max_workers = _pg_pool_cfg.calculate()
 
-        pool_cap = PGBOUNCER_CLIENT_CAP if use_pgbouncer else DIRECT_POSTGRES_CAP
-
-        if max_workers > pool_cap:
-            effective_max_workers = pool_cap
+        if max_workers > effective_max_workers:
             logger.info(
                 "[benchmark] Capping asyncpg pool from %d to %d (use_pgbouncer=%s, port=%s)",
                 max_workers,
@@ -710,32 +721,6 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
                 use_pgbouncer,
                 "5431" if use_pgbouncer else "5432",
             )
-        else:
-            effective_max_workers = max_workers
-
-        # Calculate initial pool size (connections created at startup)
-        # These limits are based on Snowflake Postgres defaults:
-        # - PostgreSQL max_connections: 500
-        # - PgBouncer default_pool_size: 497 (server-side connections)
-        #
-        # With PgBouncer: Start with fewer connections to avoid overwhelming the pooler
-        # during init. PgBouncer can't handle 1000 simultaneous connection attempts.
-        # The pool will grow on-demand up to effective_max_workers.
-        #
-        # Without PgBouncer: Can initialize closer to max since we connect directly.
-        PGBOUNCER_INITIAL_CAP = 100  # Conservative to avoid client_login_timeout
-        DIRECT_INITIAL_CAP = (
-            497  # PostgreSQL max_connections is 500, leave small buffer
-        )
-
-        if use_pgbouncer:
-            # Start smaller, let pool grow on demand
-            initial_pool = min(PGBOUNCER_INITIAL_CAP, max(1, int(initial_target or 1)))
-        else:
-            initial_pool = max(
-                1, min(effective_max_workers, max(1, int(initial_target or 1)))
-            )
-            initial_pool = min(initial_pool, DIRECT_INITIAL_CAP)
 
         logger.info(
             "[benchmark] Postgres pool sizing: total_connections=%d, initial_target=%d, "
@@ -1162,70 +1147,43 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     # NOTE: Pool initialization and executor.setup() now happen BEFORE _wait_for_start()
     # to ensure workers are ready when warmup begins (see "CRITICAL" block above).
 
-    worker_tasks: dict[int, tuple[asyncio.Task, asyncio.Event]] = {}
-    next_worker_id = 0
-    scale_lock = asyncio.Lock()
-
-    def _prune_workers() -> None:
-        for wid, (task, _) in list(worker_tasks.items()):
-            if task.done():
-                worker_tasks.pop(wid, None)
-
-    async def _spawn_one(*, warmup: bool) -> None:
-        nonlocal next_worker_id
-        wid = int(next_worker_id)
-        next_worker_id += 1
-        stop_signal = asyncio.Event()
-        task = asyncio.create_task(
-            executor._controlled_worker(
-                worker_id=wid, warmup=warmup, stop_signal=stop_signal
-            )
+    # Use WorkerPool for unified worker management
+    def _worker_factory(
+        wid: int, warmup: bool, stop_signal: asyncio.Event
+    ) -> Coroutine[Any, Any, None]:
+        return executor._controlled_worker(
+            worker_id=wid, warmup=warmup, stop_signal=stop_signal
         )
-        worker_tasks[wid] = (task, stop_signal)
+
+    worker_pool = WorkerPool(
+        worker_factory=_worker_factory,
+        min_workers=0,
+        max_workers=per_worker_cap,
+        use_lock=True,
+    )
 
     async def _scale_to(target: int, *, warmup: bool) -> None:
         nonlocal current_target
-        async with scale_lock:
-            _prune_workers()
-            target = max(0, int(target))
-            if target > per_worker_cap:
-                logger.warning(
-                    "Target %d exceeds per-worker cap %d; clamping",
-                    target,
-                    per_worker_cap,
-                )
-                target = int(per_worker_cap)
-            current_target = target
-            executor._target_workers = int(target)
-            running = len(worker_tasks)
-            if running < target:
-                spawn_n = target - running
-                for _ in range(spawn_n):
-                    await _spawn_one(warmup=warmup)
-            elif running > target:
-                stop_n = running - target
-                stop_ids = sorted(worker_tasks.keys(), reverse=True)[:stop_n]
-                for wid in stop_ids:
-                    _, stop_signal = worker_tasks.get(wid, (None, None))
-                    if isinstance(stop_signal, asyncio.Event):
-                        stop_signal.set()
+        target = max(0, int(target))
+        if target > per_worker_cap:
+            logger.warning(
+                "Target %d exceeds per-worker cap %d; clamping",
+                target,
+                per_worker_cap,
+            )
+            target = int(per_worker_cap)
+        current_target = target
+        executor._target_workers = int(target)
+
+        async def _prewarm(n: int) -> None:
+            pool = getattr(executor, "_snowflake_pool_override", None)
+            if pool is not None and hasattr(pool, "prewarm"):
+                await pool.prewarm(n)
+
+        await worker_pool.scale_to(target, warmup=warmup, prewarm_callback=_prewarm)
 
     async def _stop_all(*, timeout_seconds: float) -> None:
-        async with scale_lock:
-            for _, stop_signal in worker_tasks.values():
-                stop_signal.set()
-        tasks = [t for t, _ in worker_tasks.values()]
-        if not tasks:
-            return
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Timed out draining workers after %.1fs", timeout_seconds)
-            for t in tasks:
-                t.cancel()
+        await worker_pool.stop_all(timeout_seconds=timeout_seconds)
 
     logger.info(
         "Scaling to initial target=%d workers (phase=%s)", current_target, current_phase

@@ -14,6 +14,7 @@ from typing import Any
 from backend.config import settings
 from backend.connectors import snowflake_pool
 from backend.core import results_store
+from backend.core.mode_config import ModeConfig
 from backend.core.pool_refresh import refresh_key_pool_after_writes, test_had_writes
 from backend.core.postgres_stats import (
     PgCapabilities,
@@ -37,6 +38,10 @@ from backend.core.test_log_stream import (
     TestLogQueueHandler,
 )
 from backend.core.table_managers import create_table_manager
+from backend.core.orchestrator_modules.qps_controller import (
+    QPSControllerState,
+    evaluate_qps_scaling,
+)
 from backend.models.test_config import TableConfig, TableType, TestScenario
 
 logger = logging.getLogger(__name__)
@@ -500,9 +505,9 @@ class OrchestratorService:
         scaling_cfg = template_config.get("scaling")
         if not isinstance(scaling_cfg, dict):
             scaling_cfg = {}
-        scaling_mode = str(scaling_cfg.get("mode") or "AUTO").strip().upper() or "AUTO"
-        if scaling_mode not in {"AUTO", "BOUNDED", "FIXED"}:
-            raise ValueError("scaling.mode must be AUTO, BOUNDED, or FIXED")
+        # Use ModeConfig for unified parsing (strict=True raises ValueError on invalid)
+        _mode_cfg = ModeConfig.from_config(scaling_cfg=scaling_cfg, scenario=scenario, strict=True)
+        scaling_mode = _mode_cfg.scaling_mode
 
         def _coerce_optional_int(value: Any) -> int | None:
             if value is None:
@@ -526,13 +531,15 @@ class OrchestratorService:
             scaling_cfg.get("max_connections")
         )
 
-        # Sensible default for AUTO and BOUNDED modes to prevent footgun scenarios
-        # (e.g., 1 worker with 5000 threads). Workers handle ~250 threads well.
-        DEFAULT_MAX_THREADS_PER_WORKER = 250
+        # Universal default for max connections per worker.
+        # Each Snowflake connection spawns 3-4 internal threads, so 200 connections
+        # = 600-800 threads per worker process. Higher values risk hitting OS thread
+        # limits ("can't start new thread" errors). For higher total concurrency,
+        # use multiple worker processes.
+        DEFAULT_MAX_THREADS_PER_WORKER = 200
 
-        if scaling_mode in {"AUTO", "BOUNDED"}:
-            if max_threads_per_worker is None:
-                max_threads_per_worker = DEFAULT_MAX_THREADS_PER_WORKER
+        if max_threads_per_worker is None:
+            max_threads_per_worker = DEFAULT_MAX_THREADS_PER_WORKER
 
         if min_workers < 1:
             raise ValueError("min_workers must be >= 1")
@@ -596,8 +603,7 @@ class OrchestratorService:
         if per_worker_threads is not None:
             per_worker_threads = int(per_worker_threads)
 
-        load_mode = str(getattr(scenario, "load_mode", "CONCURRENCY") or "CONCURRENCY")
-        load_mode = load_mode.strip().upper()
+        load_mode = _mode_cfg.load_mode
         if scaling_mode == "FIXED" and load_mode == "CONCURRENCY":
             total_threads = int(min_workers) * int(min_threads_per_worker)
 
@@ -1221,6 +1227,60 @@ class OrchestratorService:
 
         logger.info("Spawned %d workers for run %s", ctx.worker_group_count, ctx.run_id)
 
+    async def _spawn_single_worker(
+        self, ctx: RunContext, group_id: int, total_workers: int
+    ) -> None:
+        """
+        Spawn a single additional worker subprocess.
+        Used for dynamic scaling in BOUNDED mode when existing workers hit capacity.
+        """
+        uv_bin = _uv_available()
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+
+        worker_id = f"worker-{group_id}"
+
+        if uv_bin:
+            cmd = [uv_bin, "run", "python", "scripts/run_worker.py"]
+        else:
+            cmd = ["python", "scripts/run_worker.py"]
+
+        cmd.extend(
+            [
+                "--run-id",
+                ctx.run_id,
+                "--worker-id",
+                worker_id,
+                "--worker-group-id",
+                str(group_id),
+                "--worker-group-count",
+                str(total_workers),
+            ]
+        )
+
+        logger.info(
+            "Spawning additional worker %s for run %s (group %d/%d)",
+            worker_id,
+            ctx.run_id,
+            group_id + 1,
+            total_workers,
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        ctx.worker_procs.append(proc)
+
+        stream_task = asyncio.create_task(
+            _stream_worker_output(proc, group_id, ctx.run_id)
+        )
+        ctx.worker_stream_tasks.append(stream_task)
+
+        ctx.worker_group_count = total_workers
+
     async def _drain_log_queue(self, run_id: str, queue: asyncio.Queue) -> None:
         """
         Background task that drains the log queue and persists logs to Snowflake.
@@ -1335,10 +1395,12 @@ class OrchestratorService:
 
         scaling_cfg = dict((ctx.scenario_config or {}).get("scaling") or {})
         find_max_cfg = dict((ctx.scenario_config or {}).get("find_max") or {})
-        load_mode = str(workload_cfg.get("load_mode") or "").strip().upper()
-        scaling_mode = str(scaling_cfg.get("mode") or "AUTO").strip().upper() or "AUTO"
-        if scaling_mode not in {"AUTO", "BOUNDED", "FIXED"}:
-            scaling_mode = "AUTO"
+        # Use ModeConfig for unified parsing (strict=False uses defaults for invalid)
+        _orch_mode_cfg = ModeConfig.from_config(
+            scaling_cfg=scaling_cfg, workload_cfg=workload_cfg, strict=False
+        )
+        load_mode = _orch_mode_cfg.load_mode
+        scaling_mode = _orch_mode_cfg.scaling_mode
         min_workers = _coerce_optional_int(scaling_cfg.get("min_workers")) or 1
         max_workers = _coerce_optional_int(
             scaling_cfg.get("max_workers"), allow_unbounded=True
@@ -1398,15 +1460,10 @@ class OrchestratorService:
             workload_cfg.get("concurrent_connections")
         )
         if load_mode == "FIND_MAX_CONCURRENCY":
-            # FIND_MAX mode: ALWAYS use a high ceiling to allow discovering the true max.
+            # FIND_MAX mode: Use a high ceiling to allow discovering the true max.
             # The algorithm stops when degradation is detected, not at this ceiling.
-            # CRITICAL: Ignore concurrent_connections entirely - it's not meant for FIND_MAX mode.
-            # concurrent_connections is for CONSTANT load mode to set a fixed concurrency level.
+            # CRITICAL: Ignore concurrent_connections - it's for CONSTANT load mode.
             max_concurrency = 10000
-            # CRITICAL: Also override per_worker_threads so build_worker_targets doesn't clamp targets.
-            # Without this, targets would be clamped to per_worker_threads (e.g., 10) even though
-            # max_concurrency is 10000.
-            per_worker_threads = None
         else:
             # Other modes: Use concurrent_connections or fall back to find_max_start
             max_concurrency = _configured_concurrent_connections or find_max_start
@@ -1457,6 +1514,11 @@ class OrchestratorService:
         last_warehouse_poll_mono: float | None = None
         warehouse_poll_task: asyncio.Task | None = None
         bounds_under_target_intervals = 0
+
+        # QPS controller state for orchestrator-driven scaling
+        qps_controller_state: QPSControllerState | None = None
+        qps_controller_step_number = 0
+        last_qps_scaling_time: float | None = None
 
         find_max_step_number = 0
         find_max_step_id: str | None = None
@@ -1589,6 +1651,79 @@ class OrchestratorService:
                 )
 
             return effective_total
+
+        async def _ensure_workers_for_target(target: int) -> int:
+            """
+            Ensure enough workers exist to handle the target concurrency.
+            Spawns additional workers if needed and max_workers allows.
+            Returns the (possibly increased) worker count.
+            """
+            nonlocal worker_group_count
+
+            effective_cap = per_worker_threads
+            if max_threads_per_worker is not None:
+                effective_cap = (
+                    min(int(max_threads_per_worker), int(per_worker_threads))
+                    if per_worker_threads is not None
+                    else int(max_threads_per_worker)
+                )
+
+            if effective_cap is None or effective_cap <= 0:
+                return worker_group_count
+
+            needed_workers = math.ceil(target / effective_cap)
+            needed_workers = max(needed_workers, min_workers)
+
+            if max_workers is not None:
+                needed_workers = min(needed_workers, max_workers)
+
+            if needed_workers <= worker_group_count:
+                return worker_group_count
+
+            workers_to_spawn = needed_workers - worker_group_count
+            logger.info(
+                "BOUNDED scaling: target=%d requires %d workers (have %d, spawning %d more)",
+                target,
+                needed_workers,
+                worker_group_count,
+                workers_to_spawn,
+            )
+
+            for i in range(workers_to_spawn):
+                new_group_id = worker_group_count + i
+                await self._spawn_single_worker(ctx, new_group_id, needed_workers)
+
+            worker_group_count = needed_workers
+
+            # Wait for newly spawned workers to become ready (up to 30s)
+            wait_deadline = asyncio.get_running_loop().time() + 30.0
+            while asyncio.get_running_loop().time() < wait_deadline:
+                rows = await self._pool.execute_query(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {prefix}.WORKER_HEARTBEATS
+                    WHERE RUN_ID = ?
+                      AND UPPER(STATUS) IN ('READY', 'RUNNING', 'WAITING')
+                    """,
+                    params=[run_id],
+                )
+                ready_count = int(rows[0][0] or 0) if rows else 0
+                if ready_count >= needed_workers:
+                    logger.info(
+                        "All %d workers ready after spawn (ready_count=%d)",
+                        needed_workers,
+                        ready_count,
+                    )
+                    break
+                await asyncio.sleep(1.0)
+            else:
+                logger.warning(
+                    "Timed out waiting for workers to be ready (needed=%d, ready=%d)",
+                    needed_workers,
+                    ready_count,
+                )
+
+            return worker_group_count
 
         async def _persist_find_max_state(state: dict[str, Any]) -> None:
             await self._pool.execute_query(
@@ -2274,8 +2409,14 @@ class OrchestratorService:
                     # Use warmup start as the elapsed base so PREPARING does not
                     # eat into the configured warmup + measurement budget.
                     effective_elapsed_seconds = warmup_elapsed_seconds
+                # FIND_MAX mode: Bypass duration limit - let algorithm run until it finds max.
+                # Duration limit should not interrupt FIND_MAX; it stops via degradation/ceiling.
+                duration_check_enabled = not (
+                    find_max_enabled and not find_max_completed
+                )
                 if (
-                    status == "RUNNING"
+                    duration_check_enabled
+                    and status == "RUNNING"
                     and duration_seconds > 0
                     and effective_elapsed_seconds is not None
                     and effective_elapsed_seconds >= (warmup_seconds + duration_seconds)
@@ -2487,6 +2628,99 @@ class OrchestratorService:
                 else:
                     bounds_under_target_intervals = 0
 
+                # QPS-based thread scaling for FIXED and BOUNDED modes
+                # This runs in the MEASUREMENT phase when load_mode is QPS
+                if (
+                    load_mode == "QPS"
+                    and status == "RUNNING"
+                    and phase == "MEASUREMENT"
+                    and target_qps_total
+                    and current_qps is not None
+                    and not find_max_enabled  # Don't interfere with FIND_MAX
+                ):
+                    loop_time = asyncio.get_running_loop().time()
+                    
+                    # Initialize QPS controller state on first iteration
+                    if qps_controller_state is None:
+                        # Determine thread bounds based on scaling mode
+                        if scaling_mode == "FIXED":
+                            # FIXED mode: can only scale threads within each worker
+                            max_total = (
+                                int(effective_max_threads_per_worker) * int(worker_group_count)
+                                if effective_max_threads_per_worker is not None
+                                else int(worker_group_count) * 100
+                            )
+                            min_total = int(min_threads_per_worker) * int(worker_group_count)
+                        else:
+                            # BOUNDED/AUTO: can scale workers too
+                            worker_cap = (
+                                int(max_workers)
+                                if max_workers is not None
+                                else int(worker_group_count) * 4  # Allow 4x growth
+                            )
+                            max_total = (
+                                int(effective_max_threads_per_worker) * worker_cap
+                                if effective_max_threads_per_worker is not None
+                                else worker_cap * 100
+                            )
+                            min_total = int(min_threads_per_worker) * int(min_workers)
+                        
+                        qps_controller_state = QPSControllerState(
+                            target_qps=float(target_qps_total),
+                            min_threads=min_total,
+                            max_threads=max_total,
+                        )
+                        logger.info(
+                            "QPS controller initialized: target=%.1f qps, threads=[%d, %d]",
+                            target_qps_total,
+                            min_total,
+                            max_total,
+                        )
+                    
+                    # Rate limit scaling decisions (minimum 2 seconds between adjustments)
+                    min_interval = 2.0
+                    can_scale = (
+                        last_qps_scaling_time is None
+                        or (loop_time - last_qps_scaling_time) >= min_interval
+                    )
+                    
+                    if can_scale:
+                        decision = evaluate_qps_scaling(
+                            state=qps_controller_state,
+                            current_qps=float(current_qps),
+                            current_threads=int(target_connections_total),
+                        )
+                        
+                        if decision.should_scale and decision.new_target > 0:
+                            new_target = decision.new_target
+                            direction = "up" if new_target > target_connections_total else "down"
+                            
+                            # For BOUNDED mode, ensure we have enough workers
+                            if scaling_mode == "BOUNDED":
+                                await _ensure_workers_for_target(new_target)
+                            
+                            qps_controller_step_number += 1
+                            step_id = str(uuid.uuid4())
+                            
+                            logger.info(
+                                "QPS scaling: %s from %d to %d threads (qps=%.1f, target=%.1f, reason=%s)",
+                                direction,
+                                target_connections_total,
+                                new_target,
+                                current_qps,
+                                target_qps_total,
+                                decision.reason,
+                            )
+                            
+                            effective_new = await _apply_worker_targets(
+                                total_target=new_target,
+                                step_id=step_id,
+                                step_number=qps_controller_step_number,
+                                reason=f"qps_scaling_{direction}",
+                            )
+                            target_connections_total = effective_new
+                            last_qps_scaling_time = loop_time
+
                 if (
                     find_max_enabled
                     and status == "RUNNING"
@@ -2498,6 +2732,19 @@ class OrchestratorService:
                             find_max_step_number = 1
                             find_max_step_id = str(uuid.uuid4())
                             find_max_step_target = find_max_start
+
+                            effective_min = min_threads_per_worker * worker_group_count
+                            if find_max_step_target < effective_min:
+                                logger.info(
+                                    "FIND_MAX start_concurrency=%d < workers(%d) × min_connections(%d) = %d; "
+                                    "effective start will be %d",
+                                    find_max_start,
+                                    worker_group_count,
+                                    min_threads_per_worker,
+                                    effective_min,
+                                    effective_min,
+                                )
+
                             find_max_step_started_at = now
                             find_max_step_started_epoch_ms = int(
                                 datetime.now(UTC).timestamp() * 1000
@@ -2513,15 +2760,17 @@ class OrchestratorService:
                             find_max_step_start_ops = total_ops
                             find_max_step_start_errors = error_count
 
+                            await _ensure_workers_for_target(find_max_step_target)
+
                             find_max_step_target = await _apply_worker_targets(
                                 total_target=find_max_step_target,
                                 step_id=str(find_max_step_id),
                                 step_number=find_max_step_number,
                                 reason="step_start",
                             )
-                            find_max_best_concurrency = max(
-                                find_max_best_concurrency, int(find_max_step_target)
-                            )
+                            # NOTE: Do NOT update best_concurrency here at step start.
+                            # It should only be updated AFTER the step completes as stable
+                            # (handled in the step completion logic below).
 
                         step_elapsed = 0.0
                         if find_max_step_started_at is not None:
@@ -2665,9 +2914,14 @@ class OrchestratorService:
                             if find_max_baseline_p99 is None and aggregate_p99:
                                 find_max_baseline_p99 = float(aggregate_p99)
 
-                            if stable and step_qps >= find_max_best_qps:
-                                find_max_best_concurrency = int(find_max_step_target)
-                                find_max_best_qps = float(step_qps)
+                            if stable:
+                                # Update best_concurrency if this stable step has higher concurrency
+                                # (FIND_MAX seeks max sustainable concurrency, not max QPS)
+                                if int(find_max_step_target) > find_max_best_concurrency:
+                                    find_max_best_concurrency = int(find_max_step_target)
+                                # Always track best QPS among stable steps
+                                if step_qps >= find_max_best_qps:
+                                    find_max_best_qps = float(step_qps)
 
                             step_entry = {
                                 "step": int(find_max_step_number),
@@ -2747,6 +3001,8 @@ class OrchestratorService:
                                 )
                                 find_max_step_start_ops = total_ops
                                 find_max_step_start_errors = error_count
+
+                                await _ensure_workers_for_target(find_max_step_target)
 
                                 return await _apply_worker_targets(
                                     total_target=find_max_step_target,
@@ -2873,15 +3129,15 @@ class OrchestratorService:
 
                             # After midpoint step, stop regardless of outcome
                             if find_max_midpoint_attempted and stable and not should_stop:
-                                # Midpoint was stable - update best and stop
-                                if step_qps > find_max_best_qps:
+                                # Midpoint was stable - update best if higher concurrency
+                                if int(find_max_step_target) > find_max_best_concurrency:
                                     find_max_best_concurrency = int(find_max_step_target)
-                                    find_max_best_qps = float(step_qps)
                                     logger.info(
-                                        "FIND_MAX: Midpoint %d is better! New best: %.1f QPS",
+                                        "FIND_MAX: Midpoint %d is stable! New best concurrency.",
                                         find_max_step_target,
-                                        find_max_best_qps,
                                     )
+                                if step_qps > find_max_best_qps:
+                                    find_max_best_qps = float(step_qps)
                                 should_stop = True
                                 find_max_final_reason = (
                                     find_max_termination_reason or "Degradation detected"

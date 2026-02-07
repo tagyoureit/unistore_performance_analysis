@@ -28,10 +28,12 @@ window.DashboardMixins.historicalMetrics = {
 
       // Store per-worker metrics if available
       this._workerMetrics = null;
+      this._workerMetricsRunStartAt = null;
       if (workerResp.ok) {
         const workerData = await workerResp.json();
         if (workerData.available && workerData.workers && workerData.workers.length > 1) {
           this._workerMetrics = workerData.workers;
+          this._workerMetricsRunStartAt = workerData.run_start_at;
           console.log(`Loaded per-worker metrics for ${workerData.workers.length} workers`);
         }
       }
@@ -261,14 +263,31 @@ window.DashboardMixins.historicalMetrics = {
           "rgb(249, 115, 22)",   // orange
         ];
 
-        // Build time-indexed data for each worker
-        const workerDataByTime = {};  // elapsed_seconds -> { workerId: active_connections }
-        const workerTargetByTime = {}; // elapsed_seconds -> { workerId: target_workers }
+        // Build time-indexed data for each worker using ABSOLUTE timestamps
+        // This is critical for multi-worker runs where workers start at different times.
+        // We bucket by seconds since run_start to align with main metrics' elapsed_seconds.
+        const workerDataByTime = {};  // run-relative seconds -> { workerId: active_connections }
+        const workerTargetByTime = {}; // run-relative seconds -> { workerId: target_workers }
+        
+        // Parse the reference timestamp for converting absolute times to run-relative.
+        // Use run_start_at which is the first data timestamp from worker_metrics.
+        let referenceTime = null;
+        if (this._workerMetricsRunStartAt) {
+          referenceTime = new Date(this._workerMetricsRunStartAt).getTime();
+        }
         
         for (const worker of workerMetrics) {
           const workerId = worker.worker_id || worker.key;
           for (const snap of (worker.snapshots || [])) {
-            const bucket = Math.round(Number(snap.elapsed_seconds || 0));
+            let bucket;
+            if (referenceTime && snap.timestamp) {
+              // Use absolute timestamp converted to run-relative seconds
+              const snapTime = new Date(snap.timestamp).getTime();
+              bucket = Math.round((snapTime - referenceTime) / 1000);
+            } else {
+              // Fallback to per-worker elapsed_seconds (may be misaligned for multi-worker)
+              bucket = Math.round(Number(snap.elapsed_seconds || 0));
+            }
             if (!workerDataByTime[bucket]) {
               workerDataByTime[bucket] = {};
               workerTargetByTime[bucket] = {};

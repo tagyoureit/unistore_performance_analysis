@@ -4181,6 +4181,10 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
         if worker_rows:
             latency_aggregation_method = LATENCY_AGGREGATION_METHOD
 
+            # Use the earliest timestamp from the data as the reference point.
+            # This avoids timezone issues between RUN_STATUS and WORKER_METRICS_SNAPSHOTS.
+            run_start_time: Any = worker_rows[0][0] if worker_rows else None
+
             @dataclass
             class _Bucket:
                 timestamp: Any
@@ -4212,23 +4216,33 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
             ) in worker_rows:
                 phase_value = str(phase or "").strip().upper()
                 is_warmup = phase_value == "WARMUP"
-                is_measurement = phase_value == "MEASUREMENT"
-                if phase_value and phase_value not in ("WARMUP", "MEASUREMENT"):
+                is_measurement = phase_value in ("MEASUREMENT", "RUNNING")
+                if phase_value and phase_value not in ("WARMUP", "MEASUREMENT", "RUNNING"):
                     continue
                 if is_warmup and first_warmup_timestamp is None and timestamp:
                     first_warmup_timestamp = timestamp
                 if is_measurement and first_measurement_timestamp is None and timestamp:
                     first_measurement_timestamp = timestamp
                 try:
+                    # Compute run-relative elapsed time using absolute timestamp.
+                    # This ensures workers spawned at different times align correctly.
+                    if run_start_time and timestamp:
+                        # Both should be datetime objects from Snowflake
+                        delta = timestamp - run_start_time
+                        elapsed_from_start = delta.total_seconds() if hasattr(delta, 'total_seconds') else float(elapsed or 0)
+                    else:
+                        # Fallback to per-worker elapsed (may be misaligned for multi-worker)
+                        elapsed_from_start = float(elapsed or 0)
                     # Aggregate to whole-second buckets for history charts.
-                    bucket = round(float(elapsed or 0), 0)
+                    bucket = round(elapsed_from_start, 0)
                 except Exception:
                     bucket = 0.0
+                    elapsed_from_start = float(elapsed or 0)
                 agg = buckets.get(bucket)
                 if not agg:
                     agg = _Bucket(
                         timestamp=timestamp,
-                        elapsed_seconds=float(elapsed or 0),
+                        elapsed_seconds=elapsed_from_start,
                         ops_per_sec=0.0,
                         p50_latency_ms=[],
                         p95_latency_ms=[],
@@ -4246,17 +4260,13 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                     agg.has_measurement = True
                 if timestamp and agg.timestamp and timestamp < agg.timestamp:
                     agg.timestamp = timestamp
-                agg.elapsed_seconds = max(float(elapsed or 0), agg.elapsed_seconds)
+                agg.elapsed_seconds = max(elapsed_from_start, agg.elapsed_seconds)
                 agg.ops_per_sec += float(ops_per_sec or 0)
                 agg.p50_latency_ms.append(float(p50 or 0))
                 agg.p95_latency_ms.append(float(p95 or 0))
                 agg.p99_latency_ms.append(float(p99 or 0))
-                agg.active_connections = max(
-                    agg.active_connections, int(active_connections or 0)
-                )
-                agg.target_workers = max(
-                    agg.target_workers, int(target_connections or 0)
-                )
+                agg.active_connections += int(active_connections or 0)
+                agg.target_workers += int(target_connections or 0)
                 if custom_metrics:
                     agg.custom_metrics.append(custom_metrics)
 
@@ -4642,6 +4652,11 @@ async def get_worker_metrics(test_id: str) -> dict[str, Any]:
                 return 0.0
 
         workers: dict[str, dict[str, Any]] = {}
+        
+        # Use the first timestamp as reference for computing run-relative elapsed_seconds.
+        # This ensures all workers' data is aligned to the same timeline.
+        run_start_time: Any = rows[0][3] if rows else None
+        
         for row in rows:
             (
                 worker_id_from_row,
@@ -4691,12 +4706,20 @@ async def get_worker_metrics(test_id: str) -> dict[str, Any]:
                 snapshots = []
                 worker["snapshots"] = snapshots
             snapshots_list = cast(list[dict[str, Any]], snapshots)
+            
+            # Compute run-relative elapsed time using absolute timestamp.
+            if run_start_time and timestamp:
+                delta = timestamp - run_start_time
+                run_relative_elapsed = delta.total_seconds() if hasattr(delta, 'total_seconds') else float(elapsed_seconds or 0)
+            else:
+                run_relative_elapsed = float(elapsed_seconds or 0)
+            
             snapshots_list.append(
                 {
                     "timestamp": timestamp.isoformat()
                     if hasattr(timestamp, "isoformat")
                     else str(timestamp),
-                    "elapsed_seconds": float(elapsed_seconds or 0),
+                    "elapsed_seconds": run_relative_elapsed,
                     "qps": float(qps or 0),
                     "p50_latency": float(p50 or 0),
                     "p95_latency": float(p95 or 0),
@@ -4720,10 +4743,16 @@ async def get_worker_metrics(test_id: str) -> dict[str, Any]:
                 }
             )
 
+        first_data_timestamp: str | None = None
+        if rows and rows[0] and rows[0][3]:
+            ts = rows[0][3]
+            first_data_timestamp = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+
         return {
             "test_id": test_id,
             "parent_run_id": parent_run_id,
             "available": True,
+            "run_start_at": first_data_timestamp,
             "workers": list(workers.values()),
         }
     except Exception as e:
