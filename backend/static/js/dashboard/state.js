@@ -133,6 +133,7 @@ window.DashboardMixins.state = function (opts) {
     showWarmup: false, // Toggle for including warmup phase in charts
     metricsWarmupEndElapsed: null, // Global warmup end from /metrics API (for all charts)
     _metricsSnapshots: [], // Raw metrics snapshots for re-rendering with warmup toggle
+    _metricsSmoothingApplied: false, // Whether multi-worker smoothing was applied
     warehouseTsWarmupEndElapsed: null, // Seconds where warmup ends (for annotation)
     overheadTs: [],
     overheadTsLoading: false,
@@ -168,7 +169,6 @@ window.DashboardMixins.state = function (opts) {
     _warmupStartElapsed: 0,
     _runningStartElapsed: 0,
     _multiWorkerMetricsIntervalId: null,
-    _multiWorkerTestInfoIntervalId: null,
     aiAnalysisModal: false,
     aiAnalysisLoading: false,
     aiAnalysisError: null,
@@ -184,9 +184,14 @@ window.DashboardMixins.state = function (opts) {
     findMaxCountdownSeconds: null,
     _findMaxCountdownIntervalId: null,
     _findMaxCountdownTargetEpochMs: null,
+    _serverClockOffsetMs: 0,
+    // QPS Controller state (for QPS load mode)
+    qpsController: null,
+    qpsControllerCountdownSeconds: null,
+    _qpsControllerCountdownIntervalId: null,
+    _qpsControllerCountdownTargetEpochMs: null,
     enrichmentRetrying: false,
     enrichmentProgress: null,
-    _enrichmentPollIntervalId: null,
     _processingLogIntervalId: null,
     _processingLogStartMs: null,
     // Button loading states

@@ -389,8 +389,8 @@ function compareDetail() {
       // - Postgres tests: client-side in-flight (active_connections)
       const ttA = String(this.testA?.table_type || "").toUpperCase();
       const ttB = String(this.testB?.table_type || "").toUpperCase();
-      const isPgA = ["POSTGRES", "SNOWFLAKE_POSTGRES"].includes(ttA);
-      const isPgB = ["POSTGRES", "SNOWFLAKE_POSTGRES"].includes(ttB);
+      const isPgA = ttA === "POSTGRES";
+      const isPgB = ttB === "POSTGRES";
 
       const keyA = isPgA ? "active_connections" : "sf_running";
       const keyB = isPgB ? "active_connections" : "sf_running";

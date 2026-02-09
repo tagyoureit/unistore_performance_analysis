@@ -44,40 +44,6 @@ _DEFAULT_CUSTOM_QUERIES_POSTGRES: dict[str, str] = {
     "custom_update_query": "UPDATE {table} SET data = $1, timestamp = $2 WHERE id = $3",
 }
 
-_PRESET_PCTS: dict[str, dict[str, int]] = {
-    "READ_ONLY": {
-        "custom_point_lookup_pct": 50,
-        "custom_range_scan_pct": 50,
-        "custom_insert_pct": 0,
-        "custom_update_pct": 0,
-    },
-    "WRITE_ONLY": {
-        "custom_point_lookup_pct": 0,
-        "custom_range_scan_pct": 0,
-        "custom_insert_pct": 70,
-        "custom_update_pct": 30,
-    },
-    "READ_HEAVY": {
-        "custom_point_lookup_pct": 40,
-        "custom_range_scan_pct": 40,
-        "custom_insert_pct": 15,
-        "custom_update_pct": 5,
-    },
-    "WRITE_HEAVY": {
-        "custom_point_lookup_pct": 10,
-        "custom_range_scan_pct": 10,
-        "custom_insert_pct": 60,
-        "custom_update_pct": 20,
-    },
-    "MIXED": {
-        "custom_point_lookup_pct": 25,
-        "custom_range_scan_pct": 25,
-        "custom_insert_pct": 35,
-        "custom_update_pct": 15,
-    },
-}
-
-
 def upper_str(v: Any) -> str:
     """Convert value to uppercase string."""
     return str(v or "").strip().upper()
@@ -109,11 +75,10 @@ def quote_ident(name: str) -> str:
 def is_postgres_family_table_type(table_type_raw: Any) -> bool:
     """
     True when the template targets a Postgres-family backend:
-    - POSTGRES (standalone)
-    - SNOWFLAKE_POSTGRES (Snowflake Postgres protocol)
+    - POSTGRES
     """
     t = upper_str(table_type_raw)
-    return t in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+    return t == "POSTGRES"
 
 
 def pg_quote_ident(name: str) -> str:
@@ -199,60 +164,51 @@ def coerce_num(v: Any, *, label: str) -> float:
 
 def normalize_template_config(cfg: Any) -> dict[str, Any]:
     """
-    Normalize template config to an authoritative CUSTOM workload definition.
+    Normalize template config to the authoritative CUSTOM workload definition.
 
     Contract:
-    - Any preset workload_type (READ_ONLY/WRITE_ONLY/READ_HEAVY/WRITE_HEAVY/MIXED)
-      is rewritten to workload_type=CUSTOM with explicit custom_*_pct + custom_*_query.
-    - CUSTOM workloads are validated server-side (pct sum, required SQL).
+    - workload_type must be CUSTOM (or omitted).
+    - CUSTOM payload is validated server-side (pct sum, required SQL).
     """
     if not isinstance(cfg, dict):
         raise ValueError("Template config must be a JSON object")
 
     out: dict[str, Any] = dict(cfg)
     wt_raw = str(out.get("workload_type") or "").strip()
-    wt = wt_raw.upper() if wt_raw else "MIXED"
+    wt = wt_raw.upper() if wt_raw else "CUSTOM"
 
     if wt != "CUSTOM":
-        if wt not in _PRESET_PCTS:
-            raise ValueError(
-                f"Invalid workload_type: {wt_raw!r} (expected one of "
-                f"{sorted([*list(_PRESET_PCTS.keys()), 'CUSTOM'])})"
-            )
-        out["workload_type"] = "CUSTOM"
-        defaults = (
-            _DEFAULT_CUSTOM_QUERIES_POSTGRES
-            if is_postgres_family_table_type(out.get("table_type"))
-            else _DEFAULT_CUSTOM_QUERIES_SNOWFLAKE
+        raise ValueError("Invalid workload_type: expected 'CUSTOM'")
+    out["workload_type"] = "CUSTOM"
+
+    defaults = (
+        _DEFAULT_CUSTOM_QUERIES_POSTGRES
+        if is_postgres_family_table_type(out.get("table_type"))
+        else _DEFAULT_CUSTOM_QUERIES_SNOWFLAKE
+    )
+    for k in _CUSTOM_QUERY_FIELDS:
+        out[k] = str(out.get(k) or defaults.get(k) or "").strip()
+
+    for k in _CUSTOM_PCT_FIELDS:
+        out[k] = coerce_int(out.get(k) or 0, label=k)
+        if out[k] < 0 or out[k] > 100:
+            raise ValueError(f"{k} must be between 0 and 100 (got {out[k]})")
+
+    total = sum(int(out[k]) for k in _CUSTOM_PCT_FIELDS)
+    if total != 100:
+        raise ValueError(
+            f"Custom query percentages must sum to 100 (currently {total})."
         )
-        out.update(defaults)
-        out.update(_PRESET_PCTS[wt])
-    else:
-        out["workload_type"] = "CUSTOM"
 
-        for k in _CUSTOM_QUERY_FIELDS:
-            out[k] = str(out.get(k) or "").strip()
-
-        for k in _CUSTOM_PCT_FIELDS:
-            out[k] = coerce_int(out.get(k) or 0, label=k)
-            if out[k] < 0 or out[k] > 100:
-                raise ValueError(f"{k} must be between 0 and 100 (got {out[k]})")
-
-        total = sum(int(out[k]) for k in _CUSTOM_PCT_FIELDS)
-        if total != 100:
-            raise ValueError(
-                f"Custom query percentages must sum to 100 (currently {total})."
-            )
-
-        required_pairs = [
-            ("custom_point_lookup_pct", "custom_point_lookup_query"),
-            ("custom_range_scan_pct", "custom_range_scan_query"),
-            ("custom_insert_pct", "custom_insert_query"),
-            ("custom_update_pct", "custom_update_query"),
-        ]
-        for pct_k, sql_k in required_pairs:
-            if int(out.get(pct_k) or 0) > 0 and not str(out.get(sql_k) or "").strip():
-                raise ValueError(f"{sql_k} is required when {pct_k} > 0")
+    required_pairs = [
+        ("custom_point_lookup_pct", "custom_point_lookup_query"),
+        ("custom_range_scan_pct", "custom_range_scan_query"),
+        ("custom_insert_pct", "custom_insert_query"),
+        ("custom_update_pct", "custom_update_query"),
+    ]
+    for pct_k, sql_k in required_pairs:
+        if int(out.get(pct_k) or 0) > 0 and not str(out.get(sql_k) or "").strip():
+            raise ValueError(f"{sql_k} is required when {pct_k} > 0")
 
     # Normalize target fields
     target_fields = {

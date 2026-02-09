@@ -21,7 +21,6 @@ class TableType(str, Enum):
     INTERACTIVE = "interactive"  # True Interactive Tables (Unistore/HTAP) - requires Interactive Warehouse
     DYNAMIC = "dynamic"  # Dynamic Tables (materialized views with auto-refresh) - NOT Interactive Tables
     POSTGRES = "postgres"
-    SNOWFLAKE_POSTGRES = "snowflake_postgres"
 
 
 class IndexType(str, Enum):
@@ -88,6 +87,11 @@ class TableConfig(BaseModel):
     # Database/schema location
     database: Optional[str] = Field(None, description="Database name")
     schema_name: Optional[str] = Field(None, description="Schema name")
+    
+    # Connection ID for stored credentials (Postgres)
+    connection_id: Optional[str] = Field(
+        None, description="Connection ID for stored credentials"
+    )
 
     @model_validator(mode="after")
     def validate_table_requirements(self):
@@ -209,6 +213,18 @@ class TestScenario(BaseModel):
         None,
         description=(
             "Target throughput (ops/sec) when load_mode=QPS (app-side QPS across the template mix)."
+        ),
+    )
+    starting_threads: Optional[float] = Field(
+        None,
+        description=(
+            "Initial thread count when load_mode=QPS. If not set, ramps from min_threads."
+        ),
+    )
+    max_thread_increase: Optional[float] = Field(
+        None,
+        description=(
+            "Maximum threads to add per control interval (~10s) when load_mode=QPS. Default 15."
         ),
     )
     # Note: "min_threads_per_worker" is the new canonical name; "min_connections" is kept as alias

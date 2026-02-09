@@ -20,6 +20,14 @@
                class="py-2 px-4 rounded-md transition-colors {{ 'bg-blue-500 text-white' if request.path == '/history' else 'hover:bg-gray-50' }}">
                 History
             </a>
+            <a href="/settings" 
+               hx-get="/settings"
+               hx-target="#main-content"
+               hx-swap="innerHTML"
+               hx-push-url="true"
+               class="py-2 px-4 rounded-md transition-colors {{ 'bg-blue-500 text-white' if request.path == '/settings' else 'hover:bg-gray-50' }}">
+                Settings
+            </a>
         </nav>
     </div>
 </nav>

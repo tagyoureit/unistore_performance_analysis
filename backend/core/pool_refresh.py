@@ -81,7 +81,7 @@ async def refresh_key_pool_after_writes(
 
         # Use appropriate sampling strategy based on table type
         is_hybrid = table_type in ("HYBRID", "UNISTORE")
-        is_postgres = table_type in ("POSTGRES", "SNOWFLAKE_POSTGRES")
+        is_postgres = table_type == "POSTGRES"
 
         if is_postgres:
             # For Postgres tables, we need to use the Postgres pool, not Snowflake
@@ -198,28 +198,33 @@ def test_had_writes(scenario_config: dict[str, Any]) -> bool:
     Returns:
         True if the test includes INSERT, UPDATE, or DELETE operations
     """
-    workload_cfg = scenario_config.get("workload", {})
-    workload_type = str(workload_cfg.get("type", "")).lower()
+    workload_cfg_raw = scenario_config.get("workload", {})
+    workload_cfg = workload_cfg_raw if isinstance(workload_cfg_raw, dict) else {}
 
-    # Check workload type
-    if workload_type in ("write_only", "mixed", "write_heavy", "balanced"):
-        return True
-
-    # Check for custom queries with write operations
+    # Runtime is CUSTOM-only, but tolerate legacy key names in persisted rows.
     custom_queries = workload_cfg.get("custom_queries", [])
     if isinstance(custom_queries, list):
         for q in custom_queries:
             if isinstance(q, dict):
-                kind = str(q.get("kind", "")).upper()
-                weight = q.get("weight", 0)
-                if kind in ("INSERT", "UPDATE", "DELETE") and weight > 0:
+                kind = str(q.get("query_kind") or q.get("kind") or "").upper()
+                raw_weight = q.get("weight_pct", q.get("weight", 0))
+                try:
+                    weight = float(raw_weight)
+                except (TypeError, ValueError):
+                    weight = 0.0
+                normalized_weight = weight / 100.0 if weight > 1.0 else weight
+                if kind in ("INSERT", "UPDATE", "DELETE") and normalized_weight > 0:
                     return True
 
     # Check for insert/update ratio in AI workload
     ai_workload = scenario_config.get("ai_workload", {})
-    if ai_workload.get("insert_pct", 0) > 0:
-        return True
-    if ai_workload.get("update_pct", 0) > 0:
-        return True
+    if isinstance(ai_workload, dict):
+        try:
+            if float(ai_workload.get("insert_pct", ai_workload.get("custom_insert_pct", 0)) or 0) > 0:
+                return True
+            if float(ai_workload.get("update_pct", ai_workload.get("custom_update_pct", 0)) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
 
     return False

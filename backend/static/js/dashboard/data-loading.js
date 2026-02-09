@@ -37,6 +37,12 @@ window.DashboardMixins.dataLoading = {
       }
       this.duration = data.duration_seconds || 0;
       
+      // Populate QPS controller state from API response (for history mode)
+      // This enables the QPS Controller card to show step history on the history page
+      if (data.qps_controller_state && typeof data.qps_controller_state === "object") {
+        this.qpsController = data.qps_controller_state;
+      }
+      
       // apiElapsed already extracted above (line 18) for logging
       const hasApiElapsed = apiElapsed != null && Number.isFinite(Number(apiElapsed)) && Number(apiElapsed) >= 0;
       
@@ -110,16 +116,6 @@ window.DashboardMixins.dataLoading = {
         this.stopProcessingLogTimer();
       }
 
-      const wsOpen = this.websocket && this.websocket.readyState === 1;
-      const shouldPollEnrichment =
-        data.enrichment_status === "PENDING" &&
-        (this.mode === "history" || !wsOpen);
-      if (shouldPollEnrichment) {
-        this.startEnrichmentPolling();
-      } else {
-        this.stopEnrichmentPolling();
-      }
-
       if (this.mode === "live" && typeof this.updateLiveTransport === "function") {
         this.updateLiveTransport();
       }
@@ -156,7 +152,7 @@ window.DashboardMixins.dataLoading = {
           (canvas.__chart ||
             (window.Chart && Chart.getChart ? Chart.getChart(canvas) : null));
         const tableType = (this.templateInfo?.table_type || "").toLowerCase();
-        const isPostgres = ["postgres", "snowflake_postgres"].includes(tableType);
+        const isPostgres = tableType === "postgres";
         const ds =
           chart && chart.data && Array.isArray(chart.data.datasets)
             ? chart.data.datasets
@@ -209,10 +205,7 @@ window.DashboardMixins.dataLoading = {
       if (isTerminal && (statusUpper !== "COMPLETED" || this.isFinalMetricsReady())) {
         // Stop any running timer for terminal tests
         this.stopElapsedTimer();
-        // Stop HTTP polling - test is done
-        if (typeof this.stopMultiNodeTestInfoPolling === "function") {
-          this.stopMultiNodeTestInfoPolling();
-        }
+        // Stop metrics polling - test is done
         if (typeof this.stopMultiNodeMetricsPolling === "function") {
           this.stopMultiNodeMetricsPolling();
         }

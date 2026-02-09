@@ -472,6 +472,9 @@
         <div class="chart-container">
             <canvas id="throughputChart"></canvas>
         </div>
+        <div x-show="_metricsSmoothingApplied" style="margin-top: 0.5rem; color: #6b7280; font-size: 0.875rem;">
+            Note: Multi-worker smoothing applied to normalize sampling jitter.
+        </div>
     </div>
 
     <div class="card">
@@ -522,6 +525,9 @@
         </div>
         <div class="chart-container" style="margin-top: 0.75rem;">
             <canvas id="opsSecChart"></canvas>
+        </div>
+        <div x-show="_metricsSmoothingApplied" style="margin-top: 0.5rem; color: #6b7280; font-size: 0.875rem;">
+            Note: Multi-worker smoothing applied to normalize sampling jitter.
         </div>
     </div>
 
@@ -612,7 +618,7 @@
 
     <div
         class="card"
-        x-show="templateInfo && isFinalMetricsReady() && !['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())"
+        x-show="templateInfo && isFinalMetricsReady() && (templateInfo?.table_type || '').toLowerCase() !== 'postgres'"
     >
         <div class="card-title">Warehouse Queueing + MCW (post-processed)</div>
         <div style="color: #6b7280; margin-top: -0.25rem;">

@@ -1,6 +1,6 @@
 # Architecture Overview (Current)
 
-Last updated: 2026-02-01
+Last updated: 2026-02-08
 
 ## System Purpose
 
@@ -21,6 +21,38 @@ and throughput, and persists results to Snowflake.
 - **Live metrics cache**: populated by workers via `/api/runs/{run_id}/metrics/live`.
 - **Results store**: Snowflake (`FLAKEBENCH.TEST_RESULTS`).
 - **Postgres**: optional target for Postgres-family benchmarks.
+
+## Connection Architecture
+
+FlakeBench uses two types of database connections:
+
+### Control Plane Connections (Environment-Based)
+- **Source**: `settings.SNOWFLAKE_*` from `.env`
+- **Purpose**: Results storage, orchestrator state, telemetry
+- **Pool**: `snowflake_pool.get_default_pool()` in `orchestrator.py`
+- **Note**: Always uses environment credentials
+
+### Benchmark Execution Connections (Stored or Environment)
+- **Source**: Either stored connection (`CONNECTIONS` table) or `.env` fallback
+- **Purpose**: Running benchmark queries against target databases
+- **Pool**: Per-test pools created in `scripts/run_worker.py`
+- **Selection**: Via `connection_id` in template CONFIG (optional)
+
+### Connection Storage (`backend/core/connection_manager.py`)
+- Credentials encrypted with AES-256-GCM via Snowflake's `ENCRYPT_RAW`
+- Key from `FLAKEBENCH_CREDENTIAL_KEY` env var (32 bytes)
+- Stored in `CONNECTIONS` table as encrypted VARIANT
+- `get_connection_for_pool()` retrieves decrypted credentials for workers
+
+### Connection Model (Simplified)
+Connections store only authentication info:
+- `connection_type`: SNOWFLAKE or POSTGRES
+- `account`: Snowflake account identifier
+- `host`/`port`: Postgres host and port
+- `role`: Snowflake role
+- `credentials`: Encrypted username/password/private_key
+
+Database, schema, warehouse, and pool sizes are all configured per-template, not per-connection.
 
 ## High-Level Components
 

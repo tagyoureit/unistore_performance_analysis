@@ -407,3 +407,52 @@ See [file-based-query-logging.md](file-based-query-logging.md) for detailed impl
 - [x] Query records successfully loaded to QUERY_EXECUTIONS (205,910 rows)
 - [x] No orphaned files in stage after test completion
 - [x] PROCESSING phase duration acceptable (<60s for typical tests)
+
+## 2.26 Snowflake Settings Table Architecture ⬜
+
+See [snowflake-settings-table.md](snowflake-settings-table.md) for detailed implementation plan.
+
+**Summary**: Move application configuration from `.env` file to Snowflake-based settings tables with UI-driven settings menu and multi-connection support.
+
+**Key Features**:
+- Settings UI for pool sizes, timeouts, feature flags, cost defaults
+- Multi-connection support (multiple Snowflake accounts, Postgres instances)
+- Template-to-connection binding
+- Secure credential handling (browser localStorage, never in Snowflake)
+- Backward-compatible fallback to `.env`
+
+**Architecture Decision**:
+- **Bootstrap credentials** stay in `.env` (account, user, password)
+- **Non-sensitive settings** move to Snowflake `APP_SETTINGS` table
+- **Connection definitions** (non-creds) in Snowflake `CONNECTIONS` table
+- **Credentials** stored in browser localStorage per connection
+- **Cost defaults** in Snowflake, user overrides in localStorage
+
+### Phase 1: Schema & Backend Infrastructure ⬜
+- [ ] Create `SETTINGS.CONFIG` schema
+- [ ] Create `APP_SETTINGS` and `CONNECTIONS` tables
+- [ ] Create `backend/core/settings_manager.py`
+- [ ] Create `backend/core/connection_manager.py`
+- [ ] Implement fallback chain: Snowflake → `.env` → defaults
+
+### Phase 2: API Layer ⬜
+- [ ] Create `/api/settings` routes (GET, PUT)
+- [ ] Create `/api/connections` routes (CRUD + test)
+- [ ] Add connection_id to template endpoints
+
+### Phase 3: Frontend - Settings UI ⬜
+- [ ] Create settings page (`/settings`)
+- [ ] Connection management UI with secure credential input
+- [ ] Update template editor with connection selector
+
+### Phase 4: Migration & Cleanup ⬜
+- [ ] Create migration script for existing users
+- [ ] Update documentation
+- [ ] Update `env.example` to minimal bootstrap
+
+**Acceptance**:
+- [ ] Fresh install works with minimal `.env`
+- [ ] All non-credential settings manageable via UI
+- [ ] Multiple connections assignable to templates
+- [ ] Credentials never stored in Snowflake
+- [ ] Backward compatible with existing `.env` configs

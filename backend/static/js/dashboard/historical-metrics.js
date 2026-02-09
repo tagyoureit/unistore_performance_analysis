@@ -25,6 +25,7 @@ window.DashboardMixins.historicalMetrics = {
       this.metricsWarmupEndElapsed = data.warmup_end_elapsed_seconds != null
         ? Number(data.warmup_end_elapsed_seconds)
         : null;
+      this._metricsSmoothingApplied = data.smoothing_applied === true;
 
       // Store per-worker metrics if available
       this._workerMetrics = null;
@@ -127,7 +128,7 @@ window.DashboardMixins.historicalMetrics = {
     const resourcesHistoryChart = resourcesHistoryCanvas && (resourcesHistoryCanvas.__chart || (window.Chart && Chart.getChart ? Chart.getChart(resourcesHistoryCanvas) : null));
 
     const tableType = (this.templateInfo?.table_type || "").toLowerCase();
-    const isPostgres = ["postgres", "snowflake_postgres"].includes(tableType);
+    const isPostgres = tableType === "postgres";
 
     const labels = [];
     const throughputData = [];

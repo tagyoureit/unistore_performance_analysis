@@ -42,11 +42,10 @@ def _quote_ident(name: str) -> str:
 def _is_postgres_family_table_type(table_type_raw: Any) -> bool:
     """
     True when the template targets a Postgres-family backend:
-    - POSTGRES (standalone)
-    - SNOWFLAKE_POSTGRES (Snowflake Postgres protocol)
+    - POSTGRES
     """
     t = _upper_str(table_type_raw)
-    return t in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+    return t == "POSTGRES"
 
 
 def _pg_quote_ident(name: str) -> str:
@@ -114,31 +113,64 @@ def _enrich_postgres_instance_size(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     Enrich template config with postgres_instance_size for Postgres table types.
     
-    Looks up the actual instance size from the configured SNOWFLAKE_POSTGRES_HOST
-    and stores it in the template config so it doesn't need to be looked up at runtime.
+    Looks up the actual instance size from:
+    1. The stored connection's host (if connection_id is set)
+    2. The configured POSTGRES_HOST environment variable (fallback)
     
-    This is only populated for POSTGRES/SNOWFLAKE_POSTGRES table types.
+    This is only populated for POSTGRES table types.
     For other table types, postgres_instance_size is set to None.
     """
     table_type = str(cfg.get("table_type") or "").upper().strip()
     
-    if table_type not in ("POSTGRES", "SNOWFLAKE_POSTGRES"):
+    if table_type != "POSTGRES":
         # Not a Postgres template - clear any stale value
         cfg["postgres_instance_size"] = None
         return cfg
     
-    # Try to look up the actual instance size from the configured host
+    # Try to look up the actual instance size
     try:
         from backend.core.cost_calculator import get_postgres_instance_size_by_host
         
-        actual_size = get_postgres_instance_size_by_host(settings.SNOWFLAKE_POSTGRES_HOST)
-        if actual_size:
-            cfg["postgres_instance_size"] = actual_size
-            logger.debug(f"Set postgres_instance_size to {actual_size} from configured host")
+        # First try to get host from stored connection
+        connection_id = cfg.get("connection_id")
+        host_to_lookup = None
+        
+        if connection_id:
+            # Try to get host from connection (sync lookup via cached connections)
+            try:
+                import asyncio
+                from backend.core import connection_manager
+                
+                async def _get_host():
+                    conn_params = await connection_manager.get_connection_for_pool(connection_id)
+                    return conn_params.get("host") if conn_params else None
+                
+                # Try to run in existing event loop or create one
+                try:
+                    loop = asyncio.get_running_loop()
+                    # Can't await in sync context, fall back to env var
+                    host_to_lookup = settings.POSTGRES_HOST
+                except RuntimeError:
+                    # No running loop, create one
+                    host_to_lookup = asyncio.run(_get_host())
+            except Exception as e:
+                logger.debug(f"Could not get host from connection {connection_id}: {e}")
+                host_to_lookup = settings.POSTGRES_HOST
         else:
-            # Fall back to default from settings
+            # Fall back to environment variable
+            host_to_lookup = settings.POSTGRES_HOST
+        
+        if host_to_lookup:
+            actual_size = get_postgres_instance_size_by_host(host_to_lookup)
+            if actual_size:
+                cfg["postgres_instance_size"] = actual_size
+                logger.debug(f"Set postgres_instance_size to {actual_size} from host {host_to_lookup}")
+            else:
+                # Fall back to default from settings
+                cfg["postgres_instance_size"] = settings.POSTGRES_INSTANCE_SIZE or "STANDARD_M"
+                logger.debug(f"Using default postgres_instance_size: {cfg['postgres_instance_size']}")
+        else:
             cfg["postgres_instance_size"] = settings.POSTGRES_INSTANCE_SIZE or "STANDARD_M"
-            logger.debug(f"Using default postgres_instance_size: {cfg['postgres_instance_size']}")
     except Exception as e:
         logger.warning(f"Failed to lookup Postgres instance size: {e}")
         cfg["postgres_instance_size"] = settings.POSTGRES_INSTANCE_SIZE or "STANDARD_M"

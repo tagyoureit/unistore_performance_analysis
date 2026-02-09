@@ -75,12 +75,12 @@
                         <span x-text="testA ? (testA.table_full_name || testA.table_name || '') : ''"></span>
                         (<span x-text="testA ? (testA.table_type || '') : ''"></span>)
                     </div>
-                    <div class="mt-1" x-show="testA && !['POSTGRES', 'SNOWFLAKE_POSTGRES'].includes((testA.table_type || '').toUpperCase())">
+                    <div class="mt-1" x-show="testA && (testA.table_type || '').toUpperCase() !== 'POSTGRES'">
                         <strong>Warehouse:</strong>
                         <span x-text="testA ? (testA.warehouse || '') : ''"></span>
                         (<span x-text="testA ? (testA.warehouse_size || '') : ''"></span>)
                     </div>
-                    <div class="mt-1" x-show="testA && ['POSTGRES', 'SNOWFLAKE_POSTGRES'].includes((testA.table_type || '').toUpperCase())">
+                    <div class="mt-1" x-show="testA && (testA.table_type || '').toUpperCase() === 'POSTGRES'">
                         <strong>Database:</strong>
                         <span>Postgres</span>
                     </div>
@@ -125,12 +125,12 @@
                         <span x-text="testB ? (testB.table_full_name || testB.table_name || '') : ''"></span>
                         (<span x-text="testB ? (testB.table_type || '') : ''"></span>)
                     </div>
-                    <div class="mt-1" x-show="testB && !['POSTGRES', 'SNOWFLAKE_POSTGRES'].includes((testB.table_type || '').toUpperCase())">
+                    <div class="mt-1" x-show="testB && (testB.table_type || '').toUpperCase() !== 'POSTGRES'">
                         <strong>Warehouse:</strong>
                         <span x-text="testB ? (testB.warehouse || '') : ''"></span>
                         (<span x-text="testB ? (testB.warehouse_size || '') : ''"></span>)
                     </div>
-                    <div class="mt-1" x-show="testB && ['POSTGRES', 'SNOWFLAKE_POSTGRES'].includes((testB.table_type || '').toUpperCase())">
+                    <div class="mt-1" x-show="testB && (testB.table_type || '').toUpperCase() === 'POSTGRES'">>
                         <strong>Database:</strong>
                         <span>Postgres</span>
                     </div>

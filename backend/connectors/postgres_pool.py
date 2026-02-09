@@ -6,6 +6,7 @@ Manages async connection pooling for Postgres with health checks and retry logic
 
 import logging
 import random
+import ssl as ssl_module
 import time
 from typing import Optional, Any, Dict, List
 from contextlib import asynccontextmanager
@@ -47,6 +48,7 @@ class PostgresConnectionPool:
         retry_delay: float = 1.0,
         command_timeout: float = 60.0,
         pool_name: str = "default",
+        ssl: bool | ssl_module.SSLContext | None = None,
     ):
         """
         Initialize Postgres connection pool.
@@ -63,6 +65,8 @@ class PostgresConnectionPool:
             retry_delay: Delay between retries in seconds
             command_timeout: Command timeout in seconds
             pool_name: Descriptive name for logging (e.g., "catalog", "benchmark")
+            ssl: SSL context or True/False. For Snowflake Postgres, use an SSLContext
+                 with verify_mode=CERT_NONE for self-signed certificates.
         """
         self.host = host
         self.port = port
@@ -75,13 +79,14 @@ class PostgresConnectionPool:
         self.retry_delay = retry_delay
         self.command_timeout = command_timeout
         self.pool_name = pool_name
+        self.ssl = ssl
 
         self._pool: Optional[Pool] = None
         self._initialized = False
 
         logger.info(
             f"[{pool_name}] Postgres pool configured: {user}@{host}:{port}/{database}, "
-            f"size={min_size}-{max_size}"
+            f"size={min_size}-{max_size}, ssl={ssl is not None}"
         )
 
     async def initialize(self):
@@ -102,6 +107,7 @@ class PostgresConnectionPool:
                     min_size=self.min_size,
                     max_size=self.max_size,
                     command_timeout=self.command_timeout,
+                    ssl=self.ssl,
                 )
 
                 self._initialized = True
@@ -420,12 +426,11 @@ class PostgresConnectionPool:
             logger.info("Postgres pool closed")
 
 
-# Global connection pool instances (legacy - for backward compatibility)
+# Global connection pool instance (legacy - for backward compatibility)
 _default_pool: Optional[PostgresConnectionPool] = None
-_snowflake_postgres_pool: Optional[PostgresConnectionPool] = None
 
-# Dynamic pool cache: keyed by (pool_type, database, use_pgbouncer)
-_dynamic_pools: Dict[tuple[str, str, bool], PostgresConnectionPool] = {}
+# Dynamic pool cache: keyed by (database, use_pgbouncer)
+_dynamic_pools: Dict[tuple[str, bool], PostgresConnectionPool] = {}
 
 
 def get_default_pool() -> PostgresConnectionPool:
@@ -451,76 +456,37 @@ def get_default_pool() -> PostgresConnectionPool:
     return _default_pool
 
 
-def get_snowflake_postgres_pool() -> PostgresConnectionPool:
-    """
-    Get or create connection pool for Snowflake via Postgres protocol.
-
-    Returns:
-        PostgresConnectionPool: Snowflake Postgres pool
-    """
-    global _snowflake_postgres_pool
-
-    if _snowflake_postgres_pool is None:
-        if not settings.SNOWFLAKE_POSTGRES_HOST:
-            raise ValueError("SNOWFLAKE_POSTGRES_HOST not configured")
-
-        _snowflake_postgres_pool = PostgresConnectionPool(
-            host=settings.SNOWFLAKE_POSTGRES_HOST,
-            port=settings.SNOWFLAKE_POSTGRES_PORT,
-            database=settings.SNOWFLAKE_POSTGRES_DATABASE,
-            user=settings.SNOWFLAKE_POSTGRES_USER,
-            password=settings.SNOWFLAKE_POSTGRES_PASSWORD,
-            min_size=settings.POSTGRES_POOL_MIN_SIZE,
-            max_size=settings.POSTGRES_POOL_MAX_SIZE,
-        )
-
-    return _snowflake_postgres_pool
-
-
 def get_postgres_connection_params(
-    pool_type: str = "default",
     use_pgbouncer: bool = False,
 ) -> dict[str, Any]:
     """
     Get connection parameters for Postgres (without database).
 
     Args:
-        pool_type: "default" for standard Postgres, "snowflake_postgres" for Snowflake Postgres
         use_pgbouncer: If True, use PgBouncer port (5431) for better connection pooling.
                        If False, use direct Postgres port (5432). Defaults to False for safety.
-                       Only applies to snowflake_postgres; benchmark workers should pass True.
 
     Returns:
         Dict with host, port, user, password (no database)
     """
-    if pool_type == "snowflake_postgres":
-        # For Snowflake Postgres, select port based on use_pgbouncer setting
-        port = PGBOUNCER_PORT if use_pgbouncer else POSTGRES_DIRECT_PORT
-        return {
-            "host": settings.SNOWFLAKE_POSTGRES_HOST,
-            "port": port,
-            "user": settings.SNOWFLAKE_POSTGRES_USER,
-            "password": settings.SNOWFLAKE_POSTGRES_PASSWORD,
-            "use_pgbouncer": use_pgbouncer,
-        }
+    port = PGBOUNCER_PORT if use_pgbouncer else settings.POSTGRES_PORT
     return {
         "host": settings.POSTGRES_HOST,
-        "port": settings.POSTGRES_PORT,
+        "port": port,
         "user": settings.POSTGRES_USER,
         "password": settings.POSTGRES_PASSWORD,
-        "use_pgbouncer": False,  # Standard Postgres doesn't have built-in PgBouncer
+        "use_pgbouncer": use_pgbouncer,
     }
 
 
 def get_pool_for_database(
     database: str,
-    pool_type: str = "default",
     use_pgbouncer: bool = False,
 ) -> PostgresConnectionPool:
     """
     Get or create a connection pool for a specific database.
 
-    Pools are cached by (pool_type, database, use_pgbouncer) key and created lazily.
+    Pools are cached by (database, use_pgbouncer) key and created lazily.
     This enables dynamic database selection from templates without requiring
     POSTGRES_DATABASE to match.
 
@@ -530,7 +496,6 @@ def get_pool_for_database(
 
     Args:
         database: Database name to connect to
-        pool_type: "default" for standard Postgres, "snowflake_postgres" for Snowflake Postgres
         use_pgbouncer: If True, use PgBouncer port (5431). Defaults to False for catalog ops.
 
     Returns:
@@ -538,11 +503,11 @@ def get_pool_for_database(
     """
     global _dynamic_pools
 
-    cache_key = (pool_type, database, use_pgbouncer)
+    cache_key = (database, use_pgbouncer)
     if cache_key in _dynamic_pools:
         return _dynamic_pools[cache_key]
 
-    params = get_postgres_connection_params(pool_type, use_pgbouncer=use_pgbouncer)
+    params = get_postgres_connection_params(use_pgbouncer=use_pgbouncer)
     pool = PostgresConnectionPool(
         host=params["host"],
         port=params["port"],
@@ -562,7 +527,6 @@ async def fetch_from_database(
     database: str,
     query: str,
     *args,
-    pool_type: str = "default",
     use_pgbouncer: bool = False,
     timeout: float = 30.0,
 ) -> List[asyncpg.Record]:
@@ -577,14 +541,13 @@ async def fetch_from_database(
         database: Database name to connect to
         query: SQL query to execute
         *args: Query parameters
-        pool_type: "default" for standard Postgres, "snowflake_postgres" for Snowflake Postgres
         use_pgbouncer: If True, use PgBouncer port (5431). Defaults to False for catalog ops.
         timeout: Query timeout in seconds
 
     Returns:
         List of records
     """
-    params = get_postgres_connection_params(pool_type, use_pgbouncer=use_pgbouncer)
+    params = get_postgres_connection_params(use_pgbouncer=use_pgbouncer)
     conn = None
     try:
         conn = await asyncpg.connect(
@@ -603,25 +566,18 @@ async def fetch_from_database(
 
 async def close_all_pools():
     """Close all Postgres connection pools (legacy and dynamic)."""
-    global _default_pool, _snowflake_postgres_pool, _dynamic_pools
+    global _default_pool, _dynamic_pools
 
-    # Close legacy pools
-    legacy_pools = [
-        ("default", _default_pool),
-        ("snowflake_postgres", _snowflake_postgres_pool),
-    ]
-
-    for name, pool in legacy_pools:
-        if pool is not None:
-            logger.info(f"Closing {name} pool...")
-            await pool.close()
+    # Close legacy pool
+    if _default_pool is not None:
+        logger.info("Closing default pool...")
+        await _default_pool.close()
 
     _default_pool = None
-    _snowflake_postgres_pool = None
 
     # Close dynamic pools
-    for (pool_type, database), pool in list(_dynamic_pools.items()):
-        logger.info(f"Closing dynamic pool {pool_type}/{database}...")
+    for (database, use_pgbouncer), pool in list(_dynamic_pools.items()):
+        logger.info(f"Closing dynamic pool for {database} (pgbouncer={use_pgbouncer})...")
         await pool.close()
 
     _dynamic_pools = {}

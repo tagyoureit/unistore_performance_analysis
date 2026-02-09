@@ -11,6 +11,7 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
 from backend.core import results_store
+from backend.core.live_controller_state import live_controller_state
 from backend.core.live_metrics_cache import live_metrics_cache
 
 from .helpers import _parse_variant_dict
@@ -65,8 +66,8 @@ async def stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
     # WebSocket message has the correct phase (avoids fallback to status="RUNNING")
     cached_run_status = await fetch_run_status(test_id)
 
-    RUN_STATUS_TTL_TRANSITION = 1.0
-    RUN_STATUS_TTL_ACTIVE = 2.0
+    RUN_STATUS_TTL_TRANSITION = 0.5
+    RUN_STATUS_TTL_ACTIVE = 1.0
     RUN_STATUS_TTL_TERMINAL = 5.0
     PARENT_STATUS_TTL = 5.0
     TEST_IDS_TTL = 10.0
@@ -261,13 +262,85 @@ async def stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
             timing = {"elapsed_display_seconds": round(float(elapsed_seconds), 1)}
             run_snapshot["timing"] = timing
             payload["timing"] = timing
-        find_max_state = (
+        find_max_state_db = (
             _parse_variant_dict(run_status.get("find_max_state"))
             if run_status
             else None
         )
+        find_max_state_live_mem = await live_controller_state.get_find_max_state(
+            run_id=test_id
+        )
+        find_max_state = (
+            find_max_state_live_mem
+            if find_max_state_live_mem is not None
+            else find_max_state_db
+        )
+        # Debug: Log find_max sources
+        fmc_from_live = None
+        custom_metrics = metrics.get("custom_metrics") if metrics else None
+        if custom_metrics and isinstance(custom_metrics, dict):
+            fmc_from_live = custom_metrics.get("find_max_controller")
+        if find_max_state_db or find_max_state_live_mem or fmc_from_live:
+            db_step = (
+                find_max_state_db.get("current_step") if find_max_state_db else None
+            )
+            db_target = (
+                find_max_state_db.get("target_workers") if find_max_state_db else None
+            )
+            db_end_ms = (
+                find_max_state_db.get("step_end_at_epoch_ms")
+                if find_max_state_db
+                else None
+            )
+            mem_step = (
+                find_max_state_live_mem.get("current_step")
+                if find_max_state_live_mem
+                else None
+            )
+            mem_target = (
+                find_max_state_live_mem.get("target_workers")
+                if find_max_state_live_mem
+                else None
+            )
+            mem_end_ms = (
+                find_max_state_live_mem.get("step_end_at_epoch_ms")
+                if find_max_state_live_mem
+                else None
+            )
+            live_step = fmc_from_live.get("current_step") if fmc_from_live else None
+            live_target = fmc_from_live.get("target_workers") if fmc_from_live else None
+            live_end_ms = fmc_from_live.get("step_end_at_epoch_ms") if fmc_from_live else None
+            logger.info(
+                "[WS] find_max sources: DB(step=%s,target=%s,end_ms=%s) MEM(step=%s,target=%s,end_ms=%s) LIVE(step=%s,target=%s,end_ms=%s)",
+                db_step,
+                db_target,
+                db_end_ms,
+                mem_step,
+                mem_target,
+                mem_end_ms,
+                live_step,
+                live_target,
+                live_end_ms,
+            )
         if find_max_state is not None:
             payload["find_max"] = find_max_state
+
+        # QPS controller state (for FIXED/BOUNDED modes with target QPS)
+        qps_controller_state_db = (
+            _parse_variant_dict(run_status.get("qps_controller_state"))
+            if run_status
+            else None
+        )
+        qps_controller_state_live_mem = await live_controller_state.get_qps_state(
+            run_id=test_id
+        )
+        qps_controller_state = (
+            qps_controller_state_live_mem
+            if qps_controller_state_live_mem is not None
+            else qps_controller_state_db
+        )
+        if qps_controller_state is not None:
+            payload["qps_controller_state"] = qps_controller_state
 
         if cached_test_ids:
             known_test_ids = cached_test_ids
@@ -290,10 +363,7 @@ async def stream_run_metrics(websocket: WebSocket, test_id: str) -> None:
             enrichment_progress = cached_enrichment_progress
             if enrichment_progress:
                 payload["enrichment_progress"] = enrichment_progress
-        is_postgres_table = warehouse_table_type in (
-            "postgres",
-            "snowflake_postgres",
-        )
+        is_postgres_table = warehouse_table_type == "postgres"
         if warehouse_details_payload:
             payload["warehouse_details"] = warehouse_details_payload
             warehouse_details_payload = None

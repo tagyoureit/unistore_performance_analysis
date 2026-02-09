@@ -15,7 +15,7 @@ class TestStartRequest(BaseModel):
 
     duration: int = 300
     concurrent_connections: int = 10
-    workload_type: str = "MIXED"
+    workload_type: str = "CUSTOM"
     table_type: str = "STANDARD"
 
 

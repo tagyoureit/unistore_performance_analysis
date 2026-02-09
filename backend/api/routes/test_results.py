@@ -50,7 +50,7 @@ def _build_cost_fields(
         warehouse_size: Warehouse size string (e.g., "XSMALL", "MEDIUM")
         total_operations: Total operations executed (for efficiency metrics)
         qps: Queries per second (for efficiency metrics)
-        table_type: Table type (e.g., "HYBRID", "SNOWFLAKE_POSTGRES")
+        table_type: Table type (e.g., "HYBRID", "POSTGRES")
                    Postgres uses instance-based pricing, not warehouse credits
         postgres_instance_size: For Postgres, explicit instance size override.
                                If not provided, looks up from configured Postgres host.
@@ -64,9 +64,9 @@ def _build_cost_fields(
     effective_postgres_size = postgres_instance_size
     if not effective_postgres_size and table_type:
         table_type_upper = table_type.upper().strip()
-        if table_type_upper in ("POSTGRES", "SNOWFLAKE_POSTGRES"):
+        if table_type_upper == "POSTGRES":
             # Try to get actual instance size from configured Postgres host
-            actual_size = get_postgres_instance_size_by_host(settings.SNOWFLAKE_POSTGRES_HOST)
+            actual_size = get_postgres_instance_size_by_host(settings.POSTGRES_HOST)
             if actual_size:
                 effective_postgres_size = actual_size
             else:
@@ -87,7 +87,7 @@ def _build_cost_fields(
         "cost_per_hour": cost_info["cost_per_hour"],
         "credits_per_hour": cost_info.get("credits_per_hour", 0.0),
         "cost_calculation_method": cost_info["calculation_method"],
-        "postgres_instance_size": effective_postgres_size if table_type and table_type.upper().strip() in ("POSTGRES", "SNOWFLAKE_POSTGRES") else None,
+        "postgres_instance_size": effective_postgres_size if table_type and table_type.upper().strip() == "POSTGRES" else None,
     }
 
     # Add efficiency metrics if we have operation data AND have a cost to work with
@@ -530,12 +530,7 @@ async def _fetch_postgres_stats(
     if not database:
         return {"postgres_stats_available": False}
 
-    pool_type = (
-        "snowflake_postgres"
-        if str(table_type).upper() == "SNOWFLAKE_POSTGRES"
-        else "default"
-    )
-    pg_pool = postgres_pool.get_pool_for_database(database, pool_type=pool_type)
+    pg_pool = postgres_pool.get_pool_for_database(database, pool_type="default")
     stats = await pg_pool.get_pool_stats()
 
     max_connections = None
@@ -1852,6 +1847,61 @@ async def _fetch_worker_find_max_results(
     return results
 
 
+async def _fetch_qps_controller_step_history(
+    *, pool: Any, run_id: str
+) -> list[dict[str, Any]]:
+    """Fetch QPS controller step history for a run from CONTROLLER_STEP_HISTORY."""
+    prefix = _prefix()
+    rows = await pool.execute_query(
+        f"""
+        SELECT
+            STEP_NUMBER,
+            STEP_TYPE,
+            FROM_THREADS,
+            TO_THREADS,
+            DIRECTION,
+            STEP_START_TIME,
+            QPS,
+            TARGET_QPS,
+            QPS_ERROR_PCT,
+            OUTCOME
+        FROM {prefix}.CONTROLLER_STEP_HISTORY
+        WHERE RUN_ID = ?
+          AND STEP_TYPE = 'QPS_SCALING'
+        ORDER BY STEP_NUMBER ASC
+        """,
+        params=[run_id],
+    )
+    results = []
+    for row in rows:
+        (
+            step_number,
+            step_type,
+            from_threads,
+            to_threads,
+            direction,
+            step_start_time,
+            qps,
+            target_qps,
+            qps_error_pct,
+            outcome,
+        ) = row
+        results.append(
+            {
+                "step": step_number,
+                "from_threads": int(from_threads) if from_threads is not None else None,
+                "to_threads": int(to_threads) if to_threads is not None else None,
+                "direction": str(direction).lower() if direction else None,
+                "timestamp": step_start_time.isoformat() if hasattr(step_start_time, "isoformat") else str(step_start_time),
+                "qps": float(qps) if qps is not None else None,
+                "target_qps": float(target_qps) if target_qps is not None else None,
+                "qps_error_pct": float(qps_error_pct) if qps_error_pct is not None else None,
+                "reason": str(outcome).lower() if outcome else None,
+            }
+        )
+    return results
+
+
 async def _fetch_error_rates(
     *, pool: Any, run_id: str, test_id: str, is_parent_run: bool
 ) -> dict[str, Any]:
@@ -2170,7 +2220,7 @@ async def get_test(test_id: str) -> dict[str, Any]:
                     .strip()
                     .upper()
                 )
-                is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+                is_postgres = table_type_u == "POSTGRES"
                 table_full = (
                     f"{cfg.get('database')}.{cfg.get('schema')}.{cfg.get('table_name')}"
                     if cfg.get("database")
@@ -2524,7 +2574,7 @@ async def get_test(test_id: str) -> dict[str, Any]:
         if load_mode == "QPS" and min_connections is None:
             min_connections = 1
         table_type_u = str(table_type or "").strip().upper()
-        is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+        is_postgres = table_type_u == "POSTGRES"
         error_rate_pct = 0.0
         if total_operations:
             error_rate_pct = (
@@ -2817,7 +2867,16 @@ async def get_test(test_id: str) -> dict[str, Any]:
             )
         )
 
-        # 7. Postgres stats (postgres tables only)
+        # 7. QPS controller step history (for QPS mode parent runs)
+        if is_parent_run and load_mode == "QPS":
+            parallel_tasks.append(
+                (
+                    "qps_step_history",
+                    _fetch_qps_controller_step_history(pool=pool, run_id=str(run_id)),
+                )
+            )
+
+        # 8. Postgres stats (postgres tables only)
         if is_postgres:
             parallel_tasks.append(
                 (
@@ -2880,6 +2939,9 @@ async def get_test(test_id: str) -> dict[str, Any]:
                     payload.update(
                         {"cluster_breakdown_available": False, "cluster_breakdown": []}
                     )
+                elif task_name == "qps_step_history":
+                    # QPS step history failure - set empty qps_controller_state
+                    payload["qps_controller_state"] = {"step_history": []}
                 # postgres_stats and app_latency failures are silent (no defaults needed)
             else:
                 # Apply successful results
@@ -2913,6 +2975,14 @@ async def get_test(test_id: str) -> dict[str, Any]:
                     "pg_enrichment",
                 ):
                     payload.update(result)
+                elif task_name == "qps_step_history":
+                    # Build qps_controller_state from step history
+                    # This provides historical QPS controller data for history view
+                    payload["qps_controller_state"] = {
+                        "mode": "QPS",
+                        "target_qps": target_qps,
+                        "step_history": result,
+                    }
 
         # Set defaults for error_rates if not fetched (non-terminal states)
         if not is_terminal:
@@ -4171,13 +4241,16 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
             ACTIVE_CONNECTIONS,
             TARGET_CONNECTIONS,
             CUSTOM_METRICS,
-            PHASE
+            PHASE,
+            WORKER_ID,
+            WORKER_GROUP_COUNT
         FROM {_prefix()}.WORKER_METRICS_SNAPSHOTS
         WHERE RUN_ID = ?
         ORDER BY TIMESTAMP ASC
         """
         worker_rows = await pool.execute_query(worker_query, params=[str(run_id)])
         global_warmup_end_elapsed: float | None = None
+        smoothing_applied = False
         if worker_rows:
             latency_aggregation_method = LATENCY_AGGREGATION_METHOD
 
@@ -4198,6 +4271,8 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                 custom_metrics: list[Any]
                 has_warmup: bool
                 has_measurement: bool
+                worker_ids_seen: set[str]
+                expected_worker_count: int
 
             buckets: dict[float, _Bucket] = {}
             first_warmup_timestamp: Any = None
@@ -4213,6 +4288,8 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                 target_connections,
                 custom_metrics,
                 phase,
+                worker_id,
+                worker_group_count,
             ) in worker_rows:
                 phase_value = str(phase or "").strip().upper()
                 is_warmup = phase_value == "WARMUP"
@@ -4239,6 +4316,8 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                     bucket = 0.0
                     elapsed_from_start = float(elapsed or 0)
                 agg = buckets.get(bucket)
+                worker_id_str = str(worker_id or "unknown")
+                expected_count = int(worker_group_count or 1)
                 if not agg:
                     agg = _Bucket(
                         timestamp=timestamp,
@@ -4252,8 +4331,12 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                         custom_metrics=[],
                         has_warmup=is_warmup,
                         has_measurement=is_measurement,
+                        worker_ids_seen=set(),
+                        expected_worker_count=expected_count,
                     )
                     buckets[bucket] = agg
+                agg.worker_ids_seen.add(worker_id_str)
+                agg.expected_worker_count = max(agg.expected_worker_count, expected_count)
                 if is_warmup:
                     agg.has_warmup = True
                 if is_measurement:
@@ -4316,8 +4399,24 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                 except Exception:
                     pass
 
+            smoothing_applied = False
             aggregated_rows: list[tuple[Any, ...]] = []
-            for agg in buckets.values():
+            sorted_buckets = sorted(buckets.values(), key=lambda b: b.elapsed_seconds)
+            max_expected_workers = max((b.expected_worker_count for b in sorted_buckets), default=1)
+            if max_expected_workers > 1:
+                smoothing_applied = True
+                window_size = 5
+                raw_ops_list = [b.ops_per_sec for b in sorted_buckets]
+                smoothed_ops_list: list[float] = []
+                for i in range(len(raw_ops_list)):
+                    start_idx = max(0, i - window_size // 2)
+                    end_idx = min(len(raw_ops_list), i + window_size // 2 + 1)
+                    window = raw_ops_list[start_idx:end_idx]
+                    smoothed_ops_list.append(sum(window) / len(window))
+            else:
+                smoothed_ops_list = [b.ops_per_sec for b in sorted_buckets]
+            for idx, agg in enumerate(sorted_buckets):
+                normalized_ops = smoothed_ops_list[idx]
                 custom_list = [_normalize_metrics(cm) for cm in agg.custom_metrics]
                 app_ops_list = [
                     cm.get("app_ops_breakdown", {})
@@ -4362,7 +4461,7 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
                     (
                         agg.timestamp,
                         agg.elapsed_seconds,
-                        agg.ops_per_sec,
+                        normalized_ops,
                         _avg(agg.p50_latency_ms),
                         _max(agg.p95_latency_ms),
                         _max(agg.p99_latency_ms),
@@ -4441,16 +4540,20 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
             # Use smoothed or windowed QPS when raw QPS is an outlier.
             # This handles the case where a burst of errors at test end
             # causes an unrealistically high instantaneous QPS.
-            if qps_data:
-                raw_qps = float(ops_per_sec or 0)
-                smoothed_qps = float(qps_data.get("smoothed") or 0)
-                windowed_qps = float(qps_data.get("windowed") or 0)
-                # If raw QPS is more than 3x the smoothed value, use smoothed
-                if smoothed_qps > 0 and raw_qps > smoothed_qps * 3:
-                    ops_per_sec = smoothed_qps
-                # Fallback to windowed if smoothed is 0 but raw is suspiciously high
-                elif windowed_qps > 0 and smoothed_qps == 0 and raw_qps > windowed_qps * 3:
-                    ops_per_sec = windowed_qps
+            # NOTE: This logic is DISABLED for multi-worker runs because the smoothed/windowed
+            # values in qps_data are per-worker averages, not totals. Using them would incorrectly
+            # replace the aggregated total QPS with a single worker's value.
+            # TODO: Fix qps_data to contain properly aggregated smoothed values for multi-worker runs.
+            # if qps_data:
+            #     raw_qps = float(ops_per_sec or 0)
+            #     smoothed_qps = float(qps_data.get("smoothed") or 0)
+            #     windowed_qps = float(qps_data.get("windowed") or 0)
+            #     # If raw QPS is more than 3x the smoothed value, use smoothed
+            #     if smoothed_qps > 0 and raw_qps > smoothed_qps * 3:
+            #         ops_per_sec = smoothed_qps
+            #     # Fallback to windowed if smoothed is 0 but raw is suspiciously high
+            #     elif windowed_qps > 0 and smoothed_qps == 0 and raw_qps > windowed_qps * 3:
+            #         ops_per_sec = windowed_qps
 
             def _to_int(v: Any) -> int:
                 try:
@@ -4590,6 +4693,7 @@ async def get_test_metrics(test_id: str) -> dict[str, Any]:
             "count": len(snapshots),
             "latency_aggregation_method": latency_aggregation_method,
             "warmup_end_elapsed_seconds": warmup_end_elapsed_seconds,
+            "smoothing_applied": smoothing_applied,
         }
     except Exception as e:
         raise http_exception("get test metrics", e)
@@ -5956,7 +6060,7 @@ def _build_concurrency_prompt(
     
     # Determine if this is a Postgres test
     table_type_u = str(table_type or "").upper().strip()
-    is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+    is_postgres = table_type_u == "POSTGRES"
 
     logs_section = ""
     if execution_logs:
@@ -6086,7 +6190,7 @@ def _build_qps_prompt(
     
     # Determine if this is a Postgres test
     table_type_u = str(table_type or "").upper().strip()
-    is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+    is_postgres = table_type_u == "POSTGRES"
 
     logs_section = ""
     if execution_logs:
@@ -6216,7 +6320,7 @@ def _build_find_max_prompt(
     
     # Determine if this is a Postgres test
     table_type_u = str(table_type or "").upper().strip()
-    is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+    is_postgres = table_type_u == "POSTGRES"
 
     logs_section = ""
     if execution_logs:
@@ -6434,7 +6538,7 @@ async def ai_analysis(
             else None
         )
         table_type_u = str(table_type or "").strip().upper()
-        is_postgres = table_type_u in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+        is_postgres = table_type_u == "POSTGRES"
         load_mode = "CONCURRENCY"
         target_qps = None
         min_connections = 1

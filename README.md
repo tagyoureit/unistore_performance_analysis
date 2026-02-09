@@ -105,7 +105,10 @@ Navigate to: <http://localhost:8000>
 
 1. Click **"New Test"** in the navigation
 2. Select table type (Standard/Hybrid/Interactive/Postgres)
-3. Configure settings:
+3. **Select a Connection** (optional):
+   - Choose a stored connection from the dropdown, OR
+   - Leave blank to use credentials from `.env` (backward compatible)
+4. Configure settings:
    - **Table:** Choose an existing database/schema/table (or view) from dropdowns
    - **Warehouse:** Size, multi-cluster, scaling policy
    - **Test Parameters:** Duration + load mode (fixed workers or auto-scale target)
@@ -116,9 +119,9 @@ Navigate to: <http://localhost:8000>
        (point lookup / range scan / insert / update) to match the selected table
        and backend (Snowflake vs Postgres-family).
      - Preview-only: **no DB writes happen until you save the template**
-     - If a usable key/time column can’t be detected, the affected SQL will be
+     - If a usable key/time column can't be detected, the affected SQL will be
        blank and its % set to 0 (toast will be yellow with details)
-4. Click **"Start Test"**
+5. Click **"Start Test"**
 
 **Note:** Views are supported for benchmarking, but they are read-only. Use
 `READ_ONLY` workloads when selecting a view.
@@ -231,6 +234,23 @@ unistore_performance_analysis/
 ```
 
 ## 🔧 Configuration
+
+### Connection Management
+
+FlakeBench supports two methods for database authentication:
+
+**1. Environment Variables (`.env`):**
+- Used by the control plane (results storage, orchestrator)
+- Fallback for templates without a stored connection
+- Configure `SNOWFLAKE_*` and `POSTGRES_*` variables
+
+**2. Stored Connections (Settings → Connections):**
+- Managed via the UI with credentials encrypted in Snowflake (AES-256-GCM)
+- Select per-template on the Configure page
+- Supports multiple connections to different accounts/databases
+
+Connections store only authentication details (account, user, password, role).
+Database, schema, and warehouse are configured per-template.
 
 ### Table Type Configurations
 

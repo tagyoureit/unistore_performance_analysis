@@ -33,7 +33,7 @@ from backend.models import (
 from backend.config import settings
 from backend.connectors import snowflake_pool
 from backend.core.mode_config import ModeConfig
-from backend.core.table_managers import create_table_manager, TableManager
+from backend.core.table_managers import create_table_manager, TableManager, PostgresTableManager
 from backend.core.worker_pool import WorkerPool
 from backend.core.table_profiler import (
     TableProfile,
@@ -697,7 +697,12 @@ class TestExecutor:
             pg_pool_override = getattr(self, "_postgres_pool_override", None)
             if pg_pool_override is not None:
                 for manager in self.table_managers:
-                    if hasattr(manager, "pool") and hasattr(
+                    # For PostgresTableManager, always apply the override since the pool
+                    # is lazily initialized and may be None at this point
+                    if isinstance(manager, PostgresTableManager):
+                        cast(Any, manager).pool = pg_pool_override
+                        manager._pool_initialized = True
+                    elif hasattr(manager, "pool") and hasattr(
                         manager.pool, "execute_query"
                     ):
                         cast(Any, manager).pool = pg_pool_override
@@ -763,6 +768,10 @@ class TestExecutor:
                             manager.object_type,
                             manager._stats.get("row_count"),
                         )
+                        # Ensure Postgres pool is initialized even with cached validation
+                        # (pool is lazy-initialized and setup() calls it via table_exists/validate_schema)
+                        if hasattr(manager, "_ensure_pool"):
+                            await manager._ensure_pool()
                     else:
                         # Fallback to full setup if not in cache
                         logger.info(
@@ -949,7 +958,7 @@ class TestExecutor:
 
                         state.profile = replace(state.profile, id_max=int(base))
                     logger.info(
-                        "INSERT ID sequence starts at %d for %s (max_db_id=%s, max_key_pool=%s, profile.id_max=%s)",
+                        "INSERT ID base starts at %d for %s (shared base before per-worker sharding; max_db_id=%s, max_key_pool=%s, profile.id_max=%s)",
                         int(insert_start),
                         full_name,
                         str(max_db_id) if max_db_id is not None else "None",
@@ -1647,9 +1656,14 @@ class TestExecutor:
                                 above_target_streak = 0
                                 under_target_streak = 0
                                 self._qps_controller_state = {
+                                    "mode": "QPS",
                                     "phase": "WARMUP" if warmup else "RUNNING",
                                     "target_mode": "QPS",
                                     "target_qps": float(target_qps),
+                                    "current_qps": float(qps_used),
+                                    "current_threads": int(current_running),
+                                    "min_threads": int(min_workers),
+                                    "max_threads": int(max_workers),
                                     "observed_qps_raw": float(qps_raw),
                                     "observed_qps_smoothed": float(qps_smoothed),
                                     "observed_qps_windowed": float(qps_windowed),
@@ -1659,6 +1673,8 @@ class TestExecutor:
                                     "live_workers": int(current_live),
                                     "desired_workers": int(current_running),
                                     "control_interval_seconds": float(control_interval),
+                                    "evaluation_interval_seconds": float(control_interval),
+                                    "next_evaluation_epoch_ms": int((time.time() + control_interval) * 1000),
                                     "above_target_streak": int(above_target_streak),
                                     "under_target_streak": int(under_target_streak),
                                 }
@@ -1719,9 +1735,14 @@ class TestExecutor:
                                     )
                                     last_logged_target = int(desired)
                                 self._qps_controller_state = {
+                                    "mode": "QPS",
                                     "phase": "WARMUP" if warmup else "RUNNING",
                                     "target_mode": "QPS",
                                     "target_qps": float(current_target_qps),
+                                    "current_qps": float(qps_used),
+                                    "current_threads": int(now_running),
+                                    "min_threads": int(min_workers),
+                                    "max_threads": int(max_workers),
                                     "observed_qps_raw": float(qps_raw),
                                     "observed_qps_smoothed": float(qps_smoothed),
                                     "observed_qps_windowed": float(qps_windowed),
@@ -1731,15 +1752,22 @@ class TestExecutor:
                                     "live_workers": int(now_live),
                                     "desired_workers": int(desired),
                                     "control_interval_seconds": float(control_interval),
+                                    "evaluation_interval_seconds": float(control_interval),
+                                    "next_evaluation_epoch_ms": int((time.time() + control_interval) * 1000),
                                     "above_target_streak": int(above_target_streak),
                                     "under_target_streak": int(under_target_streak),
                                     "autoscale_worker_count": autoscale_worker_count,
                                 }
                             else:
                                 self._qps_controller_state = {
+                                    "mode": "QPS",
                                     "phase": "WARMUP" if warmup else "RUNNING",
                                     "target_mode": "QPS",
                                     "target_qps": float(current_target_qps),
+                                    "current_qps": float(qps_used),
+                                    "current_threads": int(current_running),
+                                    "min_threads": int(min_workers),
+                                    "max_threads": int(max_workers),
                                     "observed_qps_raw": float(qps_raw),
                                     "observed_qps_smoothed": float(qps_smoothed),
                                     "observed_qps_windowed": float(qps_windowed),
@@ -1749,6 +1777,8 @@ class TestExecutor:
                                     "live_workers": int(current_live),
                                     "desired_workers": int(desired),
                                     "control_interval_seconds": float(control_interval),
+                                    "evaluation_interval_seconds": float(control_interval),
+                                    "next_evaluation_epoch_ms": int((time.time() + control_interval) * 1000),
                                     "above_target_streak": int(above_target_streak),
                                     "under_target_streak": int(under_target_streak),
                                     "autoscale_worker_count": autoscale_worker_count,
@@ -2101,8 +2131,48 @@ class TestExecutor:
                         f"FIND_MAX: {step_label} - Testing {cc} workers for {step_dur}s..."
                     )
 
+                    try:
+                        step_started_at_epoch_ms: int | None = int(time.time() * 1000)
+                    except Exception:
+                        step_started_at_epoch_ms = None
+                    step_end_at_epoch_ms: int | None = (
+                        int(step_started_at_epoch_ms + (step_dur * 1000))
+                        if step_started_at_epoch_ms is not None
+                        else None
+                    )
+                    next_planned_concurrency = int(
+                        min(max_cc, int(cc) + int(increment))
+                    )
+                    self._find_max_controller_state = {
+                        "mode": "FIND_MAX_CONCURRENCY",
+                        "status": "STEP_STARTING",
+                        "current_step": int(step_num),
+                        "current_concurrency": int(cc),
+                        "target_workers": int(cc),
+                        "active_worker_count": int(_fmc_active_worker_count()),
+                        "next_planned_concurrency": int(next_planned_concurrency),
+                        "step_duration_seconds": int(step_dur),
+                        "step_started_at_epoch_ms": step_started_at_epoch_ms,
+                        "step_end_at_epoch_ms": step_end_at_epoch_ms,
+                        "is_backoff": bool(is_backoff),
+                        "start_concurrency": int(start_cc),
+                        "concurrency_increment": int(increment),
+                        "max_concurrency": int(max_cc),
+                        "qps_stability_pct": float(qps_stability_pct),
+                        "latency_stability_pct": float(latency_stability_pct),
+                        "max_error_rate_pct": float(max_error_rate_pct),
+                        "best_concurrency": int(best_concurrency),
+                        "best_qps": float(best_qps),
+                        "baseline_p95_latency_ms": baseline_p95_latency,
+                        "baseline_p99_latency_ms": baseline_p99_latency,
+                        "step_history": _build_step_history(),
+                    }
+
                     # Scale to current concurrency level
                     await _fmc_scale_to(target=cc, warmup=False)
+
+                    self._find_max_controller_state["status"] = "STEP_RUNNING"
+                    self._find_max_controller_state["active_worker_count"] = int(_fmc_active_worker_count())
 
                     # Clear latency buffer for fresh per-step measurement
                     async with self._metrics_lock:
@@ -2128,52 +2198,10 @@ class TestExecutor:
                                 self._find_max_step_ops_by_kind[k] = 0
                                 self._find_max_step_errors_by_kind[k] = 0
 
-                    # Reset per-step metrics
+                    # Reset per-step metrics (measurement starts AFTER scaling completes)
                     step_start_ops = self.metrics.total_operations
                     step_start_errors = self.metrics.failed_operations
                     step_start_time = asyncio.get_running_loop().time()
-
-                    # Publish controller timing/state so the dashboard can show a live countdown
-                    # (WebSocket payloads are driven by the metrics loop; we include absolute times
-                    # here so the UI can tick locally between payloads).
-                    try:
-                        step_started_at_epoch_ms: int | None = int(time.time() * 1000)
-                    except Exception:
-                        step_started_at_epoch_ms = None
-                    step_end_at_epoch_ms: int | None = (
-                        int(step_started_at_epoch_ms + (step_dur * 1000))
-                        if step_started_at_epoch_ms is not None
-                        else None
-                    )
-                    next_planned_concurrency = int(
-                        min(max_cc, int(cc) + int(increment))
-                    )
-                    self._find_max_controller_state = {
-                        "mode": "FIND_MAX_CONCURRENCY",
-                        "status": "STEP_RUNNING",
-                        "current_step": int(step_num),
-                        "current_concurrency": int(cc),
-                        "active_worker_count": int(_fmc_active_worker_count()),
-                        "next_planned_concurrency": int(next_planned_concurrency),
-                        "step_duration_seconds": int(step_dur),
-                        "step_started_at_epoch_ms": step_started_at_epoch_ms,
-                        "step_end_at_epoch_ms": step_end_at_epoch_ms,
-                        "is_backoff": bool(is_backoff),
-                        # Controller configuration (for UI display/debugging)
-                        "start_concurrency": int(start_cc),
-                        "concurrency_increment": int(increment),
-                        "max_concurrency": int(max_cc),
-                        "qps_stability_pct": float(qps_stability_pct),
-                        "latency_stability_pct": float(latency_stability_pct),
-                        "max_error_rate_pct": float(max_error_rate_pct),
-                        # Rolling best + baseline (baseline established after step 1)
-                        "best_concurrency": int(best_concurrency),
-                        "best_qps": float(best_qps),
-                        "baseline_p95_latency_ms": baseline_p95_latency,
-                        "baseline_p99_latency_ms": baseline_p99_latency,
-                        # Completed steps so far
-                        "step_history": _build_step_history(),
-                    }
 
                     # Run for step duration, collecting metrics
                     step_elapsed = 0.0
@@ -3246,6 +3274,11 @@ class TestExecutor:
                         # Use per-worker insert sequences to avoid PK conflicts
                         if state.insert_id_seqs is None:
                             state.insert_id_seqs = {}
+                            logger.info(
+                                "INSERT ID sharding enabled for %s (worker_group_id=%d; worker-specific offsets applied at bind time)",
+                                full_name,
+                                self._worker_group_id,
+                            )
                         if worker_id not in state.insert_id_seqs:
                             # Partition ID space by worker process AND worker_id within process.
                             # Each worker process gets a separate ID range, and within that,
@@ -3268,14 +3301,24 @@ class TestExecutor:
                             worker_offset = worker_id * per_worker_range
                             start_id = base + group_offset + worker_offset
                             state.insert_id_seqs[worker_id] = count(start_id)
-                            logger.debug(
-                                "Per-worker INSERT seq (CUSTOM path) group=%d worker=%d: start_id=%d (id_max=%s, group_range=%d)",
-                                self._worker_group_id,
-                                worker_id,
-                                start_id,
-                                profile.id_max if profile else None,
-                                group_range,
-                            )
+                            if worker_id == 0:
+                                logger.info(
+                                    "Per-worker INSERT seq (CUSTOM path) group=%d worker=%d: start_id=%d (id_max=%s, group_range=%d)",
+                                    self._worker_group_id,
+                                    worker_id,
+                                    start_id,
+                                    profile.id_max if profile else None,
+                                    group_range,
+                                )
+                            else:
+                                logger.debug(
+                                    "Per-worker INSERT seq (CUSTOM path) group=%d worker=%d: start_id=%d (id_max=%s, group_range=%d)",
+                                    self._worker_group_id,
+                                    worker_id,
+                                    start_id,
+                                    profile.id_max if profile else None,
+                                    group_range,
+                                )
                         params.append(next(state.insert_id_seqs[worker_id]))
                     else:
                         params.append(str(uuid4()))
@@ -3955,6 +3998,15 @@ class TestExecutor:
                     if self._find_max_controller_state:
                         custom["find_max_controller"] = dict(
                             self._find_max_controller_state
+                        )
+                        # Debug: Log when worker reports find_max_controller
+                        fmc = self._find_max_controller_state
+                        logger.debug(
+                            "[Worker %s] Reporting find_max_controller: step=%s target=%s end_ms=%s",
+                            self._worker_id,
+                            fmc.get("current_step"),
+                            fmc.get("target_workers"),
+                            fmc.get("step_end_at_epoch_ms"),
                         )
                     # NOTE: Warehouse MCW status (started_clusters) is NOT included here.
                     # It's polled by the orchestrator only and stored in WAREHOUSE_POLL_SNAPSHOTS.

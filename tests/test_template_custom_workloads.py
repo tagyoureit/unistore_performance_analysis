@@ -1,34 +1,11 @@
 import pytest
 
 
-def test_templates_normalize_preset_to_custom():
+def test_templates_reject_non_custom_workload_type():
     from backend.api.routes import templates as templates_api
 
-    cfg = {
-        "workload_type": "MIXED",
-        # Old UI/defaults could have drifted; preset must win.
-        "custom_point_lookup_pct": 25,
-        "custom_range_scan_pct": 25,
-        "custom_insert_pct": 25,
-        "custom_update_pct": 25,
-        # Targets (required for non-zero weights after normalization).
-        "target_point_lookup_p95_latency_ms": 100,
-        "target_range_scan_p95_latency_ms": 300,
-        "target_insert_p95_latency_ms": 500,
-        "target_update_p95_latency_ms": 700,
-        "target_point_lookup_error_rate_pct": 0,
-        "target_range_scan_error_rate_pct": 0,
-        "target_insert_error_rate_pct": 0,
-        "target_update_error_rate_pct": 0,
-    }
-
-    out = templates_api._normalize_template_config(cfg)
-    assert out["workload_type"] == "CUSTOM"
-    assert out["custom_point_lookup_pct"] == 25
-    assert out["custom_range_scan_pct"] == 25
-    assert out["custom_insert_pct"] == 35
-    assert out["custom_update_pct"] == 15
-    assert "SELECT * FROM {table}" in out["custom_point_lookup_query"]
+    with pytest.raises(ValueError, match="expected 'CUSTOM'"):
+        templates_api._normalize_template_config({"workload_type": "MIXED"})
 
 
 def test_templates_normalize_custom_requires_sum_100():
@@ -71,7 +48,11 @@ def test_templates_normalize_qps_scaling_min_connections():
     from backend.api.routes import templates as templates_api
 
     cfg = {
-        "workload_type": "MIXED",
+        "workload_type": "CUSTOM",
+        "custom_point_lookup_pct": 25,
+        "custom_range_scan_pct": 25,
+        "custom_insert_pct": 35,
+        "custom_update_pct": 15,
         "load_mode": "QPS",
         "target_qps": 100,
         "concurrent_connections": 10,
@@ -86,7 +67,11 @@ def test_templates_rejects_min_concurrency():
     from backend.api.routes import templates as templates_api
 
     cfg = {
-        "workload_type": "MIXED",
+        "workload_type": "CUSTOM",
+        "custom_point_lookup_pct": 25,
+        "custom_range_scan_pct": 25,
+        "custom_insert_pct": 35,
+        "custom_update_pct": 15,
         "load_mode": "QPS",
         "target_qps": 10,
         "min_concurrency": 2,

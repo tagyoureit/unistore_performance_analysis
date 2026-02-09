@@ -66,14 +66,6 @@ class Settings(BaseSettings):
     # Default is False so local development doesn't error/hang when Postgres isn't running.
     POSTGRES_CONNECT_ON_STARTUP: bool = False
 
-    # Snowflake Postgres interface
-    SNOWFLAKE_POSTGRES_HOST: str = ""
-    SNOWFLAKE_POSTGRES_PORT: int = 5432
-    # Fallback database if template config doesn't specify one.
-    SNOWFLAKE_POSTGRES_DATABASE: str = ""
-    SNOWFLAKE_POSTGRES_USER: str = ""
-    SNOWFLAKE_POSTGRES_PASSWORD: str = ""
-
     # ========================================================================
     # Application Settings
     # ========================================================================

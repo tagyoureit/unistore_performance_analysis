@@ -32,8 +32,14 @@ function templatesManager() {
       return String(template?.config?.table_type || "").trim().toUpperCase();
     },
 
+    isPostgresType(template) {
+      const t = this.tableTypeKey(template);
+      return t === "POSTGRES" || t === "SNOWFLAKE_POSTGRES";
+    },
+
     tableTypeLabel(template) {
       const t = this.tableTypeKey(template);
+      // Consolidate SNOWFLAKE_POSTGRES to POSTGRES for display
       if (t === "POSTGRES" || t === "SNOWFLAKE_POSTGRES") return "POSTGRES";
       if (t === "HYBRID") return "HYBRID";
       if (t === "STANDARD") return "STANDARD";
@@ -217,22 +223,27 @@ function templatesManager() {
       return `BOUNDED<br><span style="color: #6b7280; font-size: 0.85em;">${workerPart} × ${connPart}</span>`;
     },
 
-    // Show warehouse info
+    // Show warehouse size for Snowflake or instance size for Postgres
     warehouseDisplay(template) {
       const config = template?.config;
       if (!config) return "—";
       
       const tableType = String(config.table_type || "").toUpperCase();
       if (tableType === "POSTGRES" || tableType === "SNOWFLAKE_POSTGRES") {
-        return "Postgres";
+        // Show Postgres instance size (e.g., STANDARD_M)
+        const instanceSize = config.postgres_instance_size || "—";
+        return instanceSize;
       }
 
-      const name = config.warehouse_name || config.warehouse || "—";
+      // For Snowflake, show warehouse size (and name if there's room)
+      const name = config.warehouse_name || config.warehouse || "";
       const size = config.warehouse_size || "";
-      if (size) {
-        return `${name} (${size})`;
+      if (size && name) {
+        return `${size}<br><span style="color: #6b7280; font-size: 0.85em;">${name}</span>`;
       }
-      return name;
+      if (size) return size;
+      if (name) return name;
+      return "—";
     },
 
     createNewTemplate() {
@@ -243,9 +254,7 @@ function templatesManager() {
       if (this.preparingTemplateId) return; // Already preparing
       
       const tableType = String(template?.config?.table_type || "").toUpperCase();
-      const isPostgres =
-        tableType === "POSTGRES" ||
-        tableType === "SNOWFLAKE_POSTGRES";
+      const isPostgres = tableType === "POSTGRES" || tableType === "SNOWFLAKE_POSTGRES";
 
       this.preparingTemplateId = template.template_id;
       try {
@@ -372,7 +381,4 @@ function templatesManager() {
         this.deletingTemplateId = null;
       }
     },
-  };
-}
-
-
+  }}

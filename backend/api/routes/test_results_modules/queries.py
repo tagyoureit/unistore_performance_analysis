@@ -203,12 +203,7 @@ async def fetch_postgres_stats(
     if not database:
         return {"postgres_stats_available": False}
 
-    pool_type = (
-        "snowflake_postgres"
-        if str(table_type).upper() == "SNOWFLAKE_POSTGRES"
-        else "default"
-    )
-    pg_pool = postgres_pool.get_pool_for_database(database, pool_type=pool_type)
+    pg_pool = postgres_pool.get_pool_for_database(database, pool_type="default")
     stats = await pg_pool.get_pool_stats()
 
     max_connections = None

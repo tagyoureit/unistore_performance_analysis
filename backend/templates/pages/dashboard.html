@@ -376,7 +376,7 @@
         </div>
     </div>
 
-    <div class="card" x-show="!['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())">
+    <div class="card" x-show="(templateInfo?.table_type || '').toLowerCase() !== 'postgres'">
         <div class="card-title">MCW Active Clusters (real-time)</div>
         <div class="text-gray-500 -mt-1">
             Sampled every ~5 seconds from <code>SHOW WAREHOUSES</code>. Shows started clusters (MCW nodes).
@@ -387,7 +387,7 @@
     </div>
 
     <!-- Postgres Running Queries (shown only for Postgres tests) -->
-    <div class="card" x-show="['postgres', 'snowflake_postgres'].includes((templateInfo?.table_type || '').toLowerCase())">
+    <div class="card" x-show="(templateInfo?.table_type || '').toLowerCase() === 'postgres'">
         <div class="flex justify-between items-center gap-3 flex-wrap">
             <div class="card-title mb-0">Postgres Running Queries (Server)</div>
             <div class="flex gap-2 flex-wrap items-center">

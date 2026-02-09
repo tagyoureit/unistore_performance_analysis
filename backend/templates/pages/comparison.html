@@ -106,7 +106,7 @@
                         <td class="font-semibold">Warehouse Size</td>
                         <template x-for="test in selectedTests" :key="test.test_id">
                             <td
-                                x-text="['POSTGRES', 'SNOWFLAKE_POSTGRES'].includes((test.table_type || '').toUpperCase()) ? '—' : test.warehouse_size"
+                                x-text="(test.table_type || '').toUpperCase() === 'POSTGRES' ? '—' : test.warehouse_size"
                             ></td>
                         </template>
                     </tr>
@@ -282,7 +282,7 @@ function comparison() {
             const headers = ['Metric', ...this.selectedTests.map(t => t.test_name)];
             const rows = [
                 ['Table Type', ...this.selectedTests.map(t => t.table_type)],
-                ['Warehouse Size', ...this.selectedTests.map(t => (['POSTGRES', 'SNOWFLAKE_POSTGRES'].includes((t.table_type || '').toUpperCase()) ? '—' : t.warehouse_size))],
+                ['Warehouse Size', ...this.selectedTests.map(t => ((t.table_type || '').toUpperCase() === 'POSTGRES' ? '—' : t.warehouse_size))],
                 ['Operations/sec', ...this.selectedTests.map(t => t.ops_per_sec.toFixed(0))],
                 ['P50 Latency (ms)', ...this.selectedTests.map(t => t.p50_latency.toFixed(2))],
                 ['P95 Latency (ms)', ...this.selectedTests.map(t => t.p95_latency.toFixed(2))],

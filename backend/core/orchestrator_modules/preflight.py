@@ -34,30 +34,27 @@ async def generate_preflight_warnings(
         scenario_config.get("table_type", "standard")
     ).lower()
     workload_cfg = scenario_config.get("workload", {})
-    workload_type = str(workload_cfg.get("workload_type", "read_only")).lower()
+    custom_queries = workload_cfg.get("custom_queries", [])
     total_threads = int(scenario_config.get("total_threads", 10))
     table_name = str(scenario_config.get("table_name", ""))
 
-    # Calculate write percentage based on workload type
+    # Calculate write percentage from CUSTOM query weights.
+    # Runtime is CUSTOM-only, but tolerate legacy key names in persisted rows.
     write_pct = 0.0
-    if workload_type == "read_only":
-        write_pct = 0.0
-    elif workload_type == "write_only":
-        write_pct = 1.0
-    elif workload_type == "read_heavy":
-        write_pct = 0.2  # 80% read, 20% write
-    elif workload_type == "write_heavy":
-        write_pct = 0.8  # 20% read, 80% write
-    elif workload_type == "mixed":
-        write_pct = 0.5  # 50/50
-    elif workload_type == "custom":
-        # Parse custom_queries for write operations
-        custom_queries = workload_cfg.get("custom_queries", [])
+    if isinstance(custom_queries, list):
         for q in custom_queries:
-            kind = str(q.get("query_kind", "")).upper()
-            weight = float(q.get("weight_pct", 0)) / 100.0
-            if kind in ("INSERT", "UPDATE", "DELETE"):
-                write_pct += weight
+            if not isinstance(q, dict):
+                continue
+            kind = str(q.get("query_kind") or q.get("kind") or "").upper()
+            raw_weight = q.get("weight_pct", q.get("weight", 0))
+            try:
+                weight = float(raw_weight)
+            except (TypeError, ValueError):
+                weight = 0.0
+            normalized_weight = weight / 100.0 if weight > 1.0 else weight
+            if kind in ("INSERT", "UPDATE", "DELETE") and normalized_weight > 0:
+                write_pct += normalized_weight
+    write_pct = max(0.0, min(write_pct, 1.0))
 
     # Calculate expected concurrent writers
     expected_concurrent_writes = total_threads * write_pct
@@ -80,7 +77,7 @@ async def generate_preflight_warnings(
             "recommendations": [
                 "Use a HYBRID table for concurrent write workloads (row-level locking)",
                 f"Reduce concurrency to ≤{int(LOCK_WAITER_LIMIT / write_pct) if write_pct > 0 else total_threads} threads",
-                "Use READ_ONLY workload to benchmark read performance separately",
+                "For read-only benchmarking, keep CUSTOM and set INSERT/UPDATE mix to 0%",
             ],
             "details": {
                 "table_type": table_type,

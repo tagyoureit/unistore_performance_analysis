@@ -23,6 +23,7 @@ from backend.config import settings
 from backend.core import results_store
 from backend.core.live_metrics_cache import live_metrics_cache
 from backend.core.test_registry import registry
+from backend.core.connection_manager import is_using_default_encryption_key
 from backend.connectors import snowflake_pool
 
 # Configure logging
@@ -496,6 +497,18 @@ async def templates_page(request: Request):
     )
 
 
+@app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
+async def settings_page(request: Request):
+    """
+    Settings page - manage database connections and application configuration.
+    """
+    is_htmx = request.headers.get("HX-Request") == "true"
+    template = "pages/settings.html"
+    return templates.TemplateResponse(
+        template, {"request": request, "is_htmx": is_htmx}
+    )
+
+
 @app.get("/health")
 async def health_check():
     """
@@ -555,6 +568,15 @@ async def api_info():
     Returns:
         dict: Application configuration and capabilities
     """
+    # Build security warnings list
+    security_warnings = []
+    if is_using_default_encryption_key():
+        security_warnings.append({
+            "code": "DEFAULT_ENCRYPTION_KEY",
+            "message": "Using default encryption key for credentials. Set FLAKEBENCH_CREDENTIAL_KEY for production.",
+            "severity": "warning",
+        })
+    
     return {
         "name": "Unistore Benchmark",
         "version": "0.1.0",
@@ -573,6 +595,7 @@ async def api_info():
             "configure": "/configure",
             "history": "/history",
         },
+        "security_warnings": security_warnings,
     }
 
 
@@ -587,6 +610,7 @@ from backend.api.routes import templates as templates_router  # noqa: E402
 from backend.api.routes import warehouses  # noqa: E402
 from backend.api.routes import catalog  # noqa: E402
 from backend.api.routes import test_results  # noqa: E402
+from backend.api.routes import connections  # noqa: E402
 
 app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
 app.include_router(tests.router, prefix="/api/test", tags=["tests"])
@@ -594,6 +618,7 @@ app.include_router(templates_router.router, prefix="/api/templates", tags=["temp
 app.include_router(warehouses.router, prefix="/api/warehouses", tags=["warehouses"])
 app.include_router(catalog.router, prefix="/api/catalog", tags=["catalog"])
 app.include_router(test_results.router, prefix="/api/tests", tags=["test_results"])
+app.include_router(connections.router, prefix="/api/connections", tags=["connections"])
 
 # TODO: Import additional routers as they're created
 # from backend.api.routes import comparison, history

@@ -2,7 +2,7 @@
 Template management API routes package.
 
 This package provides:
-- Constants: SQL templates, preset percentages, regex patterns
+- Constants: SQL templates and regex patterns
 - Utils: Identifier validation, quoting, type coercion
 - Models: Pydantic request/response models
 - Config normalizer: Template configuration validation
@@ -17,7 +17,6 @@ from .constants import (
     _CUSTOM_PCT_FIELDS,
     _DEFAULT_CUSTOM_QUERIES_SNOWFLAKE,
     _DEFAULT_CUSTOM_QUERIES_POSTGRES,
-    _PRESET_PCTS,
 )
 
 # Utility functions
@@ -58,7 +57,6 @@ __all__ = [
     "_CUSTOM_PCT_FIELDS",
     "_DEFAULT_CUSTOM_QUERIES_SNOWFLAKE",
     "_DEFAULT_CUSTOM_QUERIES_POSTGRES",
-    "_PRESET_PCTS",
     # Utils
     "_upper_str",
     "_validate_ident",

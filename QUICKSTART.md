@@ -57,13 +57,81 @@ SNOWFLAKE_WAREHOUSE=COMPUTE_WH
 SNOWFLAKE_DATABASE=FLAKEBENCH
 ```
 
+### Security Settings
+
+```bash
+# Encryption key for stored credentials (32 characters)
+# If not set, a default key is used (not secure for production!)
+FLAKEBENCH_CREDENTIAL_KEY=YourSecure32CharacterKeyHere!!!
+```
+
+**Important:** Connection credentials (passwords, private keys) are encrypted using AES-256-GCM before storage in Snowflake. 
+
+| Scenario | Behavior |
+|----------|----------|
+| No key set | Uses default key, shows warning in UI |
+| Key set | Uses your key, no warning |
+| Key changed after credentials stored | **Existing credentials become unreadable** - you'll need to re-enter them |
+
+For production deployments, always set `FLAKEBENCH_CREDENTIAL_KEY` to a unique 32-character value.
+
 ### Optional Settings
 
-- Postgres connection details
-- Connection pool sizes
 - Test defaults (duration, concurrency)
 - Logging configuration
 - Feature flags
+
+## 🔐 Connection Management
+
+FlakeBench supports two ways to configure database connections:
+
+### 1. Environment Variables (Default/Fallback)
+
+Configure credentials in `.env` for the control plane and backward-compatible templates:
+
+```bash
+# Snowflake connection (for results storage and legacy benchmarks)
+SNOWFLAKE_ACCOUNT=your_account.region
+SNOWFLAKE_USER=your_username
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+
+# Optional: Postgres connection
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_USER=your_user
+POSTGRES_PASSWORD=your_password
+```
+
+### 2. Stored Connections (Recommended for Benchmarks)
+
+Stored connections allow you to:
+- Manage multiple database connections in the UI
+- Select which connection to use per benchmark template
+- Keep credentials encrypted in Snowflake (not in local files)
+
+**To add a connection:**
+1. Go to **Settings** → **Connections**
+2. Click **Add Connection**
+3. Enter connection details:
+   - **Name**: A friendly identifier (e.g., "Production Snowflake")
+   - **Type**: SNOWFLAKE or POSTGRES
+   - **Account/Host**: Snowflake account identifier or Postgres hostname
+   - **Role**: Snowflake role (optional)
+   - **Credentials**: Username and password (encrypted at rest)
+
+**Using connections in benchmarks:**
+1. When creating or editing a template on the **Configure** page
+2. Select a connection from the **Connection** dropdown
+3. The benchmark will use credentials from the stored connection
+4. If no connection is selected, credentials from `.env` are used (backward compatible)
+
+### Architecture Notes
+
+- **Control plane** (results storage, orchestrator) always uses `.env` credentials
+- **Benchmark execution** can use either stored connections or `.env` credentials
+- **Database/schema/warehouse** are configured per-template, not per-connection
+- Connections only store authentication credentials (account, user, password, role)
 
 ## 🧪 Testing
 

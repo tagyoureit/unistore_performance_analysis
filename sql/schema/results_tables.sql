@@ -390,15 +390,21 @@ CREATE OR ALTER TABLE WAREHOUSE_POLL_SNAPSHOTS (
 );
 
 -- =============================================================================
--- FIND_MAX_STEP_HISTORY: Step-by-step history for Find Max runs
+-- CONTROLLER_STEP_HISTORY: Step-by-step history for controller modes (FIND_MAX, QPS)
 -- =============================================================================
-CREATE OR ALTER TABLE FIND_MAX_STEP_HISTORY (
+CREATE OR ALTER TABLE CONTROLLER_STEP_HISTORY (
     step_id VARCHAR(36) NOT NULL,
     run_id VARCHAR(36) NOT NULL,
     step_number INTEGER NOT NULL,
     
+    -- Step Type (FIND_MAX or QPS_SCALING)
+    step_type VARCHAR(20) NOT NULL DEFAULT 'FIND_MAX',
+    
     -- Step Configuration
     target_workers INTEGER NOT NULL,
+    from_threads INTEGER,           -- For QPS scaling: previous thread count
+    to_threads INTEGER,             -- For QPS scaling: new thread count
+    direction VARCHAR(10),          -- For QPS scaling: 'up' or 'down'
     step_start_time TIMESTAMP_NTZ NOT NULL,
     step_end_time TIMESTAMP_NTZ,
     step_duration_seconds FLOAT,
@@ -406,24 +412,38 @@ CREATE OR ALTER TABLE FIND_MAX_STEP_HISTORY (
     -- Aggregate Metrics (worst-worker for P95/P99)
     total_queries INTEGER,
     qps FLOAT,
+    target_qps FLOAT,               -- For QPS mode: target QPS
     p50_latency_ms FLOAT,
     p95_latency_ms FLOAT,
     p99_latency_ms FLOAT,
     error_count INTEGER,
     error_rate FLOAT,
     
-    -- Stability Evaluation
+    -- Stability Evaluation (FIND_MAX specific)
     qps_vs_prior_pct FLOAT,         -- % change vs prior step
     p95_vs_baseline_pct FLOAT,      -- % change vs baseline (step 1)
     queue_detected BOOLEAN DEFAULT FALSE,
     
+    -- QPS Controller specific
+    qps_error_pct FLOAT,            -- (target - current) / target * 100
+    
     -- Outcome
-    outcome VARCHAR(50),            -- STABLE, DEGRADED, ERROR_THRESHOLD, QUEUE_DETECTED
+    outcome VARCHAR(50),            -- STABLE, DEGRADED, ERROR_THRESHOLD, QUEUE_DETECTED, under_target, over_target
     stop_reason TEXT,               -- Populated if this step triggered stop
     
     -- Audit
     created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
+
+-- Backward compatibility alias for FIND_MAX_STEP_HISTORY queries
+CREATE OR REPLACE VIEW FIND_MAX_STEP_HISTORY AS
+SELECT 
+    step_id, run_id, step_number, target_workers, step_start_time, step_end_time,
+    step_duration_seconds, total_queries, qps, p50_latency_ms, p95_latency_ms,
+    p99_latency_ms, error_count, error_rate, qps_vs_prior_pct, p95_vs_baseline_pct,
+    queue_detected, outcome, stop_reason, created_at
+FROM CONTROLLER_STEP_HISTORY
+WHERE step_type = 'FIND_MAX';
 
 -- =============================================================================
 -- Note: Indexes removed - Snowflake Standard Tables use automatic clustering

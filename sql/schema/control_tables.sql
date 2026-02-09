@@ -163,3 +163,7 @@ ALTER TABLE RUN_STATUS ADD COLUMN IF NOT EXISTS CANCELLATION_REASON TEXT;
 -- This tracks when warmup actually begins (after workers are READY), distinct from START_TIME
 -- which includes PREPARING phase. Required for accurate warmup duration calculation.
 ALTER TABLE RUN_STATUS ADD COLUMN IF NOT EXISTS WARMUP_START_TIME TIMESTAMP_NTZ;
+
+-- Add QPS_CONTROLLER_STATE column to RUN_STATUS (if not exists)
+-- Stores live QPS controller state for UI display (target_qps, current_qps, threads, etc.)
+ALTER TABLE RUN_STATUS ADD COLUMN IF NOT EXISTS QPS_CONTROLLER_STATE VARIANT;

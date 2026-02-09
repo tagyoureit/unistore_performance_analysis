@@ -73,10 +73,14 @@ class PoolSizeConfig:
             (initial_pool, effective_max_workers)
         """
         # Cap at PgBouncer client limit
-        effective_max = min(self.max_workers, PGBOUNCER_CLIENT_CAP)
+        effective_max = max(1, min(self.max_workers, PGBOUNCER_CLIENT_CAP))
 
-        # Start smaller, let pool grow on demand
-        initial_pool = min(PGBOUNCER_INITIAL_CAP, max(1, self.initial_target))
+        # Start smaller, let pool grow on demand; never exceed effective max.
+        initial_pool = min(
+            effective_max,
+            PGBOUNCER_INITIAL_CAP,
+            max(1, self.initial_target),
+        )
 
         return (initial_pool, effective_max)
 

@@ -268,6 +268,14 @@ def _aggregate_workers(
             custom_metrics.get("find_max_controller"), dict
         ):
             find_max_controller = custom_metrics.get("find_max_controller")
+            # Debug: Log when we pick up find_max_controller from a worker
+            logger.info(
+                "[LiveCache] Picked find_max_controller from worker %s: step=%s target=%s end_ms=%s",
+                snapshot.worker_id,
+                find_max_controller.get("current_step"),
+                find_max_controller.get("target_workers"),
+                find_max_controller.get("step_end_at_epoch_ms"),
+            )
         if qps_controller is None and isinstance(
             custom_metrics.get("qps_controller"), dict
         ):

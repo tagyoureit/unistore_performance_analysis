@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- feat(connections): simplified connection model - removed database_name, schema_name,
+  pool_size, max_overflow, pool_timeout fields from connections (these belong in
+  template configuration).
+- feat(connections): connection selection per template - templates can now specify a
+  `connection_id` to use stored credentials for benchmark execution.
+- feat(ui): connection dropdown on Configure page with type-aware filtering (shows
+  Snowflake connections for Snowflake table types, Postgres for Postgres types).
+- feat(worker): benchmark workers can now use stored connection credentials via
+  `connection_manager.get_connection_for_pool()` instead of requiring `.env` vars.
+- feat(security): credential encryption warning toast shown only when clicking
+  "Add Connection" in Settings (not globally).
 - Dashboard log panel now supports source badges, level filtering, and a
   verbose logger toggle.
 - feat(orchestrator): persist run creation in `RUN_STATUS` and parent

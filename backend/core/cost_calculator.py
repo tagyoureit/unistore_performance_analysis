@@ -6,7 +6,7 @@ based on warehouse size and test duration.
 
 IMPORTANT: All Snowflake compute uses credits, but with different rates:
 - STANDARD / HYBRID / INTERACTIVE: Use standard warehouse credit rates
-- SNOWFLAKE_POSTGRES: Uses Postgres Compute credit rates (much lower per hour)
+- POSTGRES: Uses Postgres Compute credit rates (much lower per hour)
 
 From Snowflake Service Consumption Table (February 2026):
 - Table 1(a): Standard Warehouse credits per hour
@@ -47,7 +47,7 @@ WAREHOUSE_CREDIT_TABLE_TYPES = {"STANDARD", "HYBRID"}
 INTERACTIVE_TABLE_TYPES = {"INTERACTIVE"}
 
 # Table types that use Postgres compute credit pricing
-POSTGRES_TABLE_TYPES = {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+POSTGRES_TABLE_TYPES = {"POSTGRES"}
 
 
 # Table 1(a): Standard Warehouse - Credits consumed per hour
@@ -142,7 +142,7 @@ def get_table_type_category(table_type: Optional[str]) -> str:
     Determine the pricing category for a table type.
 
     Args:
-        table_type: Table type string (e.g., "HYBRID", "SNOWFLAKE_POSTGRES", "INTERACTIVE")
+        table_type: Table type string (e.g., "HYBRID", "POSTGRES", "INTERACTIVE")
 
     Returns:
         Category string: "warehouse", "interactive", or "postgres"
@@ -330,7 +330,7 @@ def calculate_estimated_cost(
         warehouse_size: Warehouse size string (for warehouse-based pricing)
         dollars_per_credit: Cost per Snowflake credit in dollars
         actual_credits_used: If available, use actual credits from query history
-        table_type: Table type (e.g., "HYBRID", "SNOWFLAKE_POSTGRES", "INTERACTIVE")
+        table_type: Table type (e.g., "HYBRID", "POSTGRES", "INTERACTIVE")
         postgres_instance_size: For Postgres, the instance size (e.g., "STANDARD_M")
 
     Returns:

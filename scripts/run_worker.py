@@ -413,11 +413,22 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
             find_max_cfg.get("start_concurrency") if find_max_cfg else None,
             default=1,
         )
-        initial_target = max(1, find_max_start)
+        initial_target = max(
+            1,
+            _compute_initial_target(
+                total_connections=find_max_start,
+                worker_group_id=worker_group_id,
+                worker_group_count=worker_group_count,
+                per_worker_connections=None,
+            ),
+        )
         logger.info(
-            "FIND_MAX mode: initial_target=%d (from find_max.start_concurrency), "
+            "FIND_MAX mode: initial_target=%d (worker_group_id=%d/%d from find_max.start_concurrency=%d), "
             "ignoring concurrent_connections=%d",
             initial_target,
+            worker_group_id,
+            worker_group_count,
+            find_max_start,
             total_connections,
         )
     per_worker_cap = _resolve_per_worker_cap(
@@ -435,6 +446,13 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
             else None
         ),
     )
+    if initial_target > per_worker_cap:
+        logger.info(
+            "Clamping initial_target from %d to per_worker_cap=%d",
+            initial_target,
+            per_worker_cap,
+        )
+        initial_target = int(per_worker_cap)
 
     target_qps = workload_cfg.get("target_qps", scenario_data.get("target_qps"))
     per_worker_target_qps = target_qps
@@ -560,11 +578,11 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
     executor.set_query_logger(query_logger)
 
     table_type = str(template_config.get("table_type") or "STANDARD").strip().upper()
-    is_postgres = table_type in {
-        TableType.POSTGRES.value.upper(),
-        TableType.SNOWFLAKE_POSTGRES.value.upper(),
-    }
+    is_postgres = table_type == TableType.POSTGRES.value.upper()
     warehouse = None
+    # Extract database and schema from template config for Snowflake connections
+    sf_database = str(template_config.get("database") or "").strip()
+    sf_schema = str(template_config.get("schema") or "").strip()
     if not is_postgres:
         try:
             warehouse = registry._warehouse_from_config(template_config)
@@ -671,30 +689,84 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
         bench_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="sf-bench"
         )
-        per_test_pool = snowflake_pool.SnowflakeConnectionPool(
-            account=settings.SNOWFLAKE_ACCOUNT,
-            user=settings.SNOWFLAKE_USER,
-            password=settings.SNOWFLAKE_PASSWORD,
-            warehouse=warehouse,
-            database=settings.SNOWFLAKE_DATABASE,
-            schema=settings.SNOWFLAKE_SCHEMA,
-            role=settings.SNOWFLAKE_ROLE,
-            pool_size=initial_pool,
-            max_overflow=overflow,
-            timeout=settings.SNOWFLAKE_POOL_TIMEOUT,
-            recycle=settings.SNOWFLAKE_POOL_RECYCLE,
-            executor=bench_executor,
-            owns_executor=True,
-            max_parallel_creates=settings.SNOWFLAKE_POOL_MAX_PARALLEL_CREATES,
-            connect_login_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_LOGIN_TIMEOUT,
-            connect_network_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_NETWORK_TIMEOUT,
-            connect_socket_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_SOCKET_TIMEOUT,
-            session_parameters={
-                "USE_CACHED_RESULT": "TRUE" if use_cached_result else "FALSE",
-                "QUERY_TAG": benchmark_query_tag_warmup,
-            },
-            pool_name="benchmark",
-        )
+        
+        # Check if template specifies a connection_id to use stored credentials
+        connection_id = template_config.get("connection_id")
+        if connection_id:
+            # Use stored connection credentials
+            from backend.core import connection_manager
+            
+            conn_params = await connection_manager.get_connection_for_pool(connection_id)
+            if not conn_params:
+                logger.error(f"Connection {connection_id} not found")
+                query_logger.cleanup_on_error()
+                return 1
+            
+            # Validate connection type
+            conn_type = conn_params.get("connection_type", "")
+            if conn_type != "SNOWFLAKE":
+                logger.error(
+                    f"Connection {connection_id} is type {conn_type}, expected SNOWFLAKE"
+                )
+                query_logger.cleanup_on_error()
+                return 1
+            
+            logger.info(
+                "[benchmark] Using stored connection: %s (user=%s)",
+                connection_id,
+                conn_params.get("user"),
+            )
+            
+            per_test_pool = snowflake_pool.SnowflakeConnectionPool(
+                account=conn_params["account"],
+                user=conn_params["user"],
+                password=conn_params["password"],
+                warehouse=warehouse,     # From template config
+                database=sf_database,    # From template config
+                schema=sf_schema,        # From template config
+                role=conn_params.get("role") or settings.SNOWFLAKE_ROLE,
+                pool_size=initial_pool,
+                max_overflow=overflow,
+                timeout=settings.SNOWFLAKE_POOL_TIMEOUT,
+                recycle=settings.SNOWFLAKE_POOL_RECYCLE,
+                executor=bench_executor,
+                owns_executor=True,
+                max_parallel_creates=settings.SNOWFLAKE_POOL_MAX_PARALLEL_CREATES,
+                connect_login_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_LOGIN_TIMEOUT,
+                connect_network_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_NETWORK_TIMEOUT,
+                connect_socket_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_SOCKET_TIMEOUT,
+                session_parameters={
+                    "USE_CACHED_RESULT": "TRUE" if use_cached_result else "FALSE",
+                    "QUERY_TAG": benchmark_query_tag_warmup,
+                },
+                pool_name="benchmark",
+            )
+        else:
+            # Fallback to environment variables (backward compat)
+            per_test_pool = snowflake_pool.SnowflakeConnectionPool(
+                account=settings.SNOWFLAKE_ACCOUNT,
+                user=settings.SNOWFLAKE_USER,
+                password=settings.SNOWFLAKE_PASSWORD,
+                warehouse=warehouse,
+                database=settings.SNOWFLAKE_DATABASE,
+                schema=settings.SNOWFLAKE_SCHEMA,
+                role=settings.SNOWFLAKE_ROLE,
+                pool_size=initial_pool,
+                max_overflow=overflow,
+                timeout=settings.SNOWFLAKE_POOL_TIMEOUT,
+                recycle=settings.SNOWFLAKE_POOL_RECYCLE,
+                executor=bench_executor,
+                owns_executor=True,
+                max_parallel_creates=settings.SNOWFLAKE_POOL_MAX_PARALLEL_CREATES,
+                connect_login_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_LOGIN_TIMEOUT,
+                connect_network_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_NETWORK_TIMEOUT,
+                connect_socket_timeout=settings.SNOWFLAKE_BENCHMARK_CONNECT_SOCKET_TIMEOUT,
+                session_parameters={
+                    "USE_CACHED_RESULT": "TRUE" if use_cached_result else "FALSE",
+                    "QUERY_TAG": benchmark_query_tag_warmup,
+                },
+                pool_name="benchmark",
+            )
         executor._snowflake_pool_override = per_test_pool  # type: ignore[attr-defined]
     else:
         # =========================================================================
@@ -734,39 +806,88 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
             use_pgbouncer,
         )
 
-        # Determine pool type and database from template config
-        pg_pool_type = (
-            "snowflake_postgres"
-            if table_type == TableType.SNOWFLAKE_POSTGRES.value.upper()
-            else "default"
-        )
         pg_database = str(template_config.get("database") or "").strip()
-        if not pg_database:
-            pg_database = (
-                settings.SNOWFLAKE_POSTGRES_DATABASE
-                if pg_pool_type == "snowflake_postgres"
-                else settings.POSTGRES_DATABASE
+        
+        # Check if template specifies a connection_id to use stored credentials
+        connection_id = template_config.get("connection_id")
+        if connection_id:
+            # Use stored connection credentials
+            from backend.core import connection_manager
+            
+            conn_params = await connection_manager.get_connection_for_pool(connection_id)
+            if not conn_params:
+                logger.error(f"Connection {connection_id} not found")
+                query_logger.cleanup_on_error()
+                return 1
+            
+            # Validate connection type
+            conn_type = conn_params.get("connection_type", "")
+            if conn_type != "POSTGRES":
+                logger.error(
+                    f"Connection {connection_id} is type {conn_type}, expected POSTGRES"
+                )
+                query_logger.cleanup_on_error()
+                return 1
+            
+            # Use database from template config if set, otherwise fall back to env vars
+            if not pg_database:
+                pg_database = settings.POSTGRES_DATABASE
+            
+            # Determine port based on PgBouncer setting
+            pg_port = conn_params.get("port") or 5432
+            if use_pgbouncer:
+                # Use connection's pgbouncer_port if set, otherwise default to 5431
+                pg_port = conn_params.get("pgbouncer_port") or 5431
+            
+            logger.info(
+                "[benchmark] Using stored connection: %s (user=%s, host=%s, port=%d)",
+                connection_id,
+                conn_params.get("user"),
+                conn_params.get("host"),
+                pg_port,
             )
+            
+            # Create SSL context for Snowflake Postgres (self-signed certs)
+            import ssl
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            per_test_pg_pool = postgres_pool.PostgresConnectionPool(
+                host=conn_params["host"],
+                port=pg_port,
+                database=pg_database,
+                user=conn_params["user"],
+                password=conn_params["password"],
+                min_size=initial_pool,
+                max_size=effective_max_workers,
+                pool_name="benchmark",
+                ssl=ssl_context,
+            )
+        else:
+            # Fallback to environment variables (backward compat)
+            if not pg_database:
+                pg_database = settings.POSTGRES_DATABASE
 
-        # Get connection params and create a properly-sized pool for this worker
-        pg_params = postgres_pool.get_postgres_connection_params(
-            pg_pool_type, use_pgbouncer=use_pgbouncer
-        )
-        logger.info(
-            "[benchmark] Postgres connection: use_pgbouncer=%s, port=%d",
-            use_pgbouncer,
-            pg_params["port"],
-        )
-        per_test_pg_pool = postgres_pool.PostgresConnectionPool(
-            host=pg_params["host"],
-            port=pg_params["port"],
-            database=pg_database,
-            user=pg_params["user"],
-            password=pg_params["password"],
-            min_size=initial_pool,
-            max_size=effective_max_workers,
-            pool_name="benchmark",
-        )
+            # Get connection params from settings
+            pg_params = postgres_pool.get_postgres_connection_params(
+                use_pgbouncer=use_pgbouncer
+            )
+            logger.info(
+                "[benchmark] Postgres connection: use_pgbouncer=%s, port=%d",
+                use_pgbouncer,
+                pg_params["port"],
+            )
+            per_test_pg_pool = postgres_pool.PostgresConnectionPool(
+                host=pg_params["host"],
+                port=pg_params["port"],
+                database=pg_database,
+                user=pg_params["user"],
+                password=pg_params["password"],
+                min_size=initial_pool,
+                max_size=effective_max_workers,
+                pool_name="benchmark",
+            )
         executor._postgres_pool_override = per_test_pg_pool  # type: ignore[attr-defined]
 
     current_phase = run_status_phase or "PREPARING"
@@ -1295,6 +1416,10 @@ async def _run_worker_control_plane(args: argparse.Namespace) -> int:
                         ramp_seconds = _coerce_float(
                             event_data.get("ramp_seconds"), default=0.0
                         )
+                        # FIND_MAX step boundaries should apply target changes quickly;
+                        # long ramps here are perceived as phase transition lag.
+                        if load_mode == "FIND_MAX_CONCURRENCY":
+                            ramp_seconds = 0.0
                         if new_target < 1:
                             logger.warning("Received very low target: %s", new_target)
                         if ramp_seconds > 0:

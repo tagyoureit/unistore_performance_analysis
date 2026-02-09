@@ -9,6 +9,7 @@ see `SKILL.md`.
 - `operations-and-runbooks.md` — how to run, validate, troubleshoot, and front-end dev
 - `data-flow-and-lifecycle.md` — lifecycle, control-plane state, metrics flow
 - `metrics-streaming-debug.md` — debugging guide for metrics streaming and phase transitions
+- `find-max-transition-lag-postmortem.md` — deep dive on FIND_MAX countdown/transition lag and final fixes
 - `log-streaming-architecture.md` — log flow from workers to UI, current limitations
 - `ui-architecture.md` — UI contracts and dashboard behavior
 - `scaling.md` — scaling model, guardrails, and sharding

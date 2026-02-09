@@ -116,12 +116,6 @@ function dashboard(opts) {
       if (typeof this.stopMultiNodeMetricsPolling === "function") {
         this.stopMultiNodeMetricsPolling();
       }
-      if (typeof this.stopMultiNodeTestInfoPolling === "function") {
-        this.stopMultiNodeTestInfoPolling();
-      }
-      if (typeof this.stopEnrichmentPolling === "function") {
-        this.stopEnrichmentPolling();
-      }
       if (typeof this.stopElapsedTimer === "function") {
         this.stopElapsedTimer();
       }
@@ -135,14 +129,6 @@ function dashboard(opts) {
       if (this._multiWorkerMetricsIntervalId) {
         clearInterval(this._multiWorkerMetricsIntervalId);
         this._multiWorkerMetricsIntervalId = null;
-      }
-      if (this._multiWorkerTestInfoIntervalId) {
-        clearInterval(this._multiWorkerTestInfoIntervalId);
-        this._multiWorkerTestInfoIntervalId = null;
-      }
-      if (this._enrichmentPollIntervalId) {
-        clearInterval(this._enrichmentPollIntervalId);
-        this._enrichmentPollIntervalId = null;
       }
       if (this._elapsedIntervalId) {
         clearInterval(this._elapsedIntervalId);
@@ -179,39 +165,19 @@ function dashboard(opts) {
         if (statusUpper === "COMPLETED" && phaseUpper === "PROCESSING") {
           this._debugLog("TRANSPORT", "COMPLETED_BUT_PROCESSING", { status: statusUpper, phase: phaseUpper });
           // Don't disconnect WebSocket yet - keep it open for enrichment updates
-          // Enrichment polling is also started in data-loading.js as backup
           return;
         }
         
-        // Fully terminal - disconnect WebSocket and stop all polling
+        // Fully terminal - disconnect WebSocket
         if (typeof this.disconnectWebSocket === "function") {
           this.disconnectWebSocket();
         }
-        if (typeof this.stopMultiNodeTestInfoPolling === "function") {
-          this.stopMultiNodeTestInfoPolling();
-        }
         return;
       }
 
-      const useWebSocket =
-        typeof this.shouldUseWebSocket === "function"
-          ? this.shouldUseWebSocket()
-          : false;
-      if (useWebSocket) {
-        if (typeof this.stopMultiNodeTestInfoPolling === "function") {
-          this.stopMultiNodeTestInfoPolling();
-        }
-        if (!this.websocket && typeof this.connectWebSocket === "function") {
-          this.connectWebSocket();
-        }
-        return;
-      }
-
-      if (typeof this.disconnectWebSocket === "function") {
-        this.disconnectWebSocket();
-      }
-      if (typeof this.startMultiNodeTestInfoPolling === "function") {
-        this.startMultiNodeTestInfoPolling();
+      // Active test - use WebSocket
+      if (!this.websocket && typeof this.connectWebSocket === "function") {
+        this.connectWebSocket();
       }
     },
 
@@ -454,7 +420,7 @@ function dashboard(opts) {
         if (concurrencyCtx) {
           // Check if this is a Postgres table type
           const tableType = (this.templateInfo?.table_type || "").toLowerCase();
-          const isPostgres = ["postgres", "snowflake_postgres"].includes(tableType);
+          const isPostgres = tableType === "postgres";
 
           // Target workers dataset (common to all modes)
           const targetWorkersDataset = {
@@ -1193,6 +1159,19 @@ function dashboard(opts) {
           this.applyWarehouseDetails(normalized.warehouse_details);
         }
         payload = normalized;
+        const payloadTimestampMs = payload.timestamp
+          ? Date.parse(payload.timestamp)
+          : NaN;
+        if (Number.isFinite(payloadTimestampMs)) {
+          const measuredOffsetMs = payloadTimestampMs - Date.now();
+          const previousOffsetMs = Number(this._serverClockOffsetMs);
+          if (Number.isFinite(previousOffsetMs)) {
+            // Smooth small network jitter while still converging quickly.
+            this._serverClockOffsetMs = (previousOffsetMs * 0.8) + (measuredOffsetMs * 0.2);
+          } else {
+            this._serverClockOffsetMs = measuredOffsetMs;
+          }
+        }
         if ("latency_aggregation_method" in payload) {
           this.latencyAggregationMethod = payload.latency_aggregation_method;
         }
@@ -1301,10 +1280,7 @@ function dashboard(opts) {
 
         if (isTerminal) {
           this.stopElapsedTimer();
-          // Stop HTTP polling - test is done
-          if (typeof this.stopMultiNodeTestInfoPolling === "function") {
-            this.stopMultiNodeTestInfoPolling();
-          }
+          // Stop metrics polling - test is done
           if (typeof this.stopMultiNodeMetricsPolling === "function") {
             this.stopMultiNodeMetricsPolling();
           }
@@ -1393,12 +1369,7 @@ function dashboard(opts) {
         }
 
         const custom = payload.custom_metrics;
-        if (custom) {
-          const fmc = custom.find_max_controller;
-          if (fmc && typeof fmc === "object") {
-            this.findMaxController = fmc;
-          }
-        }
+        // NOTE: find_max_controller is handled below in the merge section with payload.find_max
         const warehousePayload = payload.warehouse || (custom && typeof custom === "object" ? custom.warehouse : null);
         if (warehousePayload) {
           this.metrics.sf_running = warehousePayload.running || 0;
@@ -1478,12 +1449,63 @@ function dashboard(opts) {
             this.metrics.cgroup_memory_percent = resources.cgroup_memory_percent ?? this.metrics.cgroup_memory_percent;
           }
         }
-        const findMax = payload.find_max;
-        if (findMax && typeof findMax === "object") {
-          this.findMaxController = findMax;
+        // FIND_MAX controller state
+        // Merge both sources: real-time from test executor + orchestrator DB state
+        // Executor path (custom_metrics.find_max_controller) is fresher for live runs
+        const fmcFromExecutor = custom && custom.find_max_controller;
+        const fmcFromOrchestrator = payload.find_max;
+        if (fmcFromExecutor || fmcFromOrchestrator) {
+          // Debug logging for FIND_MAX state sources
+          if (this.debug) {
+            console.log('[FM Debug] Sources:', {
+              executor: fmcFromExecutor ? {
+                step: fmcFromExecutor.current_step,
+                target: fmcFromExecutor.target_workers,
+                end_ms: fmcFromExecutor.step_end_at_epoch_ms,
+                status: fmcFromExecutor.status
+              } : null,
+              orchestrator: fmcFromOrchestrator ? {
+                step: fmcFromOrchestrator.current_step,
+                target: fmcFromOrchestrator.target_workers,
+                end_ms: fmcFromOrchestrator.step_end_at_epoch_ms,
+                status: fmcFromOrchestrator.status
+              } : null
+            });
+          }
+          // Start with orchestrator state (has step_history), overlay executor's real-time data
+          // Executor data includes step_end_at_epoch_ms which drives the countdown timer
+          const merged = { ...(fmcFromOrchestrator || {}), ...(fmcFromExecutor || {}) };
+          // Ensure step_history comes from orchestrator if executor doesn't have it
+          if (!merged.step_history && fmcFromOrchestrator && fmcFromOrchestrator.step_history) {
+            merged.step_history = fmcFromOrchestrator.step_history;
+          }
+          if (this.debug) {
+            console.log('[FM Debug] Merged result:', {
+              step: merged.current_step,
+              target: merged.target_workers,
+              end_ms: merged.step_end_at_epoch_ms,
+              status: merged.status
+            });
+          }
+          this.findMaxController = merged;
+        }
+
+        // QPS controller state (for FIXED/BOUNDED modes with target QPS)
+        // Merge both sources: real-time from test executor + step_history from orchestrator
+        const qpsFromExecutor = custom && custom.qps_controller;
+        const qpsFromOrchestrator = payload.qps_controller_state;
+        if (qpsFromExecutor || qpsFromOrchestrator) {
+          // Start with orchestrator state (has step_history), overlay executor's real-time data
+          const merged = { ...(qpsFromOrchestrator || {}), ...(qpsFromExecutor || {}) };
+          // Ensure step_history comes from orchestrator if executor doesn't have it
+          if (!merged.step_history && qpsFromOrchestrator && qpsFromOrchestrator.step_history) {
+            merged.step_history = qpsFromOrchestrator.step_history;
+          }
+          this.qpsController = merged;
         }
 
         this.syncFindMaxCountdown();
+        this.syncQpsCountdown();
 
         // Update charts
         const throughputChart2 = throughputCanvas && (throughputCanvas.__chart || (window.Chart && Chart.getChart ? Chart.getChart(throughputCanvas) : null));

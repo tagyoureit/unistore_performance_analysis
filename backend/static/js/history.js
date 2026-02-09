@@ -97,7 +97,7 @@ function testHistory() {
 
   const tableTypeLabel = (test) => {
     const t = tableTypeKey(test);
-    if (t === "POSTGRES" || t === "SNOWFLAKE_POSTGRES") return "POSTGRES";
+    if (t === "POSTGRES") return "POSTGRES";
     if (t === "HYBRID") return "HYBRID";
     if (t === "STANDARD") return "STANDARD";
     if (t === "INTERACTIVE") return "INTERACTIVE";
@@ -106,7 +106,7 @@ function testHistory() {
 
   const tableTypeIconSrc = (test) => {
     const t = tableTypeKey(test);
-    if (t === "POSTGRES" || t === "SNOWFLAKE_POSTGRES") {
+    if (t === "POSTGRES") {
       return "/static/img/postgres_elephant.svg";
     }
     if (t === "HYBRID") {

@@ -23,6 +23,8 @@ class QPSControllerState:
 
     # Configuration
     target_qps: float = 0.0
+    starting_threads: float = 0.0  # Initial thread count (0 = ramp from min_threads)
+    max_thread_increase: float = 15.0  # Max threads to add per ~10s interval (default 15, max 200)
     min_threads: int = 1
     max_threads: int = 100
     control_interval_seconds: float = 5.0
@@ -40,10 +42,6 @@ class QPSControllerState:
     streak_threshold_up: int = 1  # Scale up after 1 under-target reading
     streak_threshold_down: int = 2  # Scale down after 2 consecutive over-target
 
-    # Rate limiting: max percentage change per control tick
-    # Set to 25% to allow faster convergence (orchestrator loop is slow ~5-6s)
-    max_change_pct: float = 0.25  # 25% max change per tick
-
     # Current state
     current_threads: int = 0
     last_observed_qps: float = 0.0
@@ -53,6 +51,8 @@ class QPSControllerState:
         """Serialize state for persistence/debugging."""
         return {
             "target_qps": float(self.target_qps),
+            "starting_threads": float(self.starting_threads),
+            "max_thread_increase": float(self.max_thread_increase),
             "min_threads": int(self.min_threads),
             "max_threads": int(self.max_threads),
             "control_interval_seconds": float(self.control_interval_seconds),
@@ -85,35 +85,47 @@ def compute_desired_threads(
     avg_latency_ms: float | None,
     min_threads: int,
     max_threads: int,
-) -> int:
+    max_thread_increase: float = 15.0,
+) -> tuple[int, dict]:
     """
     Compute desired thread count based on observed vs target QPS.
 
-    Uses proportional control with variable gain based on error magnitude.
-    Includes latency-based estimation as a secondary signal.
+    Uses gap-closing approach: estimate how many threads needed to hit target,
+    then decide what fraction of that gap to close based on error magnitude.
+    More aggressive when far from target, conservative when close.
 
     Args:
         current_threads: Current number of threads
         current_qps: Observed QPS from metrics
         target_qps: Target QPS to achieve
-        avg_latency_ms: Average latency in ms (optional, for estimation)
+        avg_latency_ms: Average latency for estimation (optional)
         min_threads: Minimum allowed threads
         max_threads: Maximum allowed threads
+        max_thread_increase: Maximum threads to add per tick
 
     Returns:
-        Desired thread count (clamped to [min_threads, max_threads])
+        Tuple of (desired thread count, debug info dict)
     """
+    debug = {}
+    
     if current_threads <= 0:
-        return min_threads
+        return min_threads, {"reason": "no_current_threads"}
 
     if (
         target_qps is None
         or not math.isfinite(target_qps)
         or target_qps <= 0
     ):
-        return current_threads
+        return current_threads, {"reason": "invalid_target_qps"}
 
-    # If no QPS observed, use latency-based estimation
+    # Calculate error metrics
+    error = target_qps - current_qps
+    error_ratio = error / target_qps if target_qps > 0 else 0
+    abs_error_ratio = abs(error_ratio)
+    debug["error_ratio"] = error_ratio
+    debug["abs_error_ratio"] = abs_error_ratio
+
+    # If no QPS observed, use latency-based estimation for cold start
     if (
         current_qps is None
         or not math.isfinite(current_qps)
@@ -126,44 +138,94 @@ def compute_desired_threads(
         ):
             ops_per_thread = 1000.0 / avg_latency_ms
             theoretical = int(math.ceil(target_qps / ops_per_thread))
-            return max(min_threads, min(max_threads, theoretical))
-        return current_threads
+            debug["cold_start_latency_estimate"] = theoretical
+            return max(min_threads, min(max_threads, theoretical)), debug
+        return current_threads, {"reason": "no_qps_no_latency"}
 
-    # Proportional control with variable gain
-    error = target_qps - current_qps
-    error_ratio = error / target_qps
-    abs_error_ratio = abs(error_ratio)
-
-    # Gain selection based on error magnitude
-    # More aggressive when far from target, conservative when close
-    # Increased gains from v1 to account for orchestrator's slower control loop
-    if abs_error_ratio > 0.50:
-        gain = 0.70  # Very aggressive when very far off (>50% error)
-    elif abs_error_ratio > 0.30:
-        gain = 0.55  # Aggressive when far off (>30% error)
-    elif abs_error_ratio > 0.15:
-        gain = 0.40
-    elif abs_error_ratio > 0.05:
-        gain = 0.30  # Still responsive in 5-15% range
+    # Estimate QPS per thread from current observations
+    qps_per_thread = current_qps / current_threads
+    debug["qps_per_thread"] = qps_per_thread
+    
+    # Estimate how many threads we'd need to hit target (ideal case)
+    if qps_per_thread > 0:
+        estimated_target_threads = target_qps / qps_per_thread
     else:
-        gain = 0.15  # Conservative near target (<5%)
-
-    adjustment_ratio = error_ratio * gain
-    desired_float = float(current_threads) * (1.0 + adjustment_ratio)
-
-    # Use latency-based estimate as guidance when under target
+        estimated_target_threads = current_threads
+    debug["estimated_target_threads"] = estimated_target_threads
+    
+    # Calculate the thread gap (how far we are from estimated target)
+    thread_gap = estimated_target_threads - current_threads
+    debug["thread_gap"] = thread_gap
+    
+    # Determine what fraction of the gap to close based on error magnitude
+    # When far from target: close a larger fraction (more aggressive)
+    # When close to target: close a smaller fraction (conservative)
+    #
+    # These values are tuned for ~10 second control intervals.
+    # Modeled after v1 gains (0.10 - 0.35) but adapted for gap-closing approach.
+    #
+    # At >50% error: close 25% of gap
+    # At >30% error: close 20% of gap  
+    # At >15% error: close 15% of gap
+    # At >5% error:  close 10% of gap
+    # At <5% error:  close 6% of gap - very conservative near target
+    if abs_error_ratio > 0.50:
+        gap_fraction = 0.25
+    elif abs_error_ratio > 0.30:
+        gap_fraction = 0.20
+    elif abs_error_ratio > 0.15:
+        gap_fraction = 0.15
+    elif abs_error_ratio > 0.05:
+        gap_fraction = 0.10
+    else:
+        gap_fraction = 0.06
+    
+    debug["gap_fraction"] = gap_fraction
+    
+    # Calculate desired threads by closing that fraction of the gap
+    adjustment = thread_gap * gap_fraction
+    debug["raw_adjustment"] = adjustment
+    
+    # Apply caps on adjustment
+    # max_thread_increase directly limits how many threads can be added per tick
+    max_down = -8  # Max threads to remove per tick
+    max_up = max_thread_increase  # Directly use as thread limit (default 15)
+    debug["max_up"] = max_up
+    
+    if adjustment > max_up:
+        adjustment = max_up
+        debug["capped_up"] = True
+    elif adjustment < max_down:
+        adjustment = max_down
+        debug["capped_down"] = True
+    
+    desired_float = current_threads + adjustment
+    debug["adjustment"] = adjustment
+    debug["desired_float"] = desired_float
+    
+    # Use latency-based estimate as a floor when significantly under target
+    # This helps when qps_per_thread is underestimated
     if (
         avg_latency_ms
         and math.isfinite(avg_latency_ms)
         and avg_latency_ms > 0
+        and error_ratio > 0.20  # Under target by >20%
     ):
-        ops_per_thread = 1000.0 / avg_latency_ms
-        theoretical = target_qps / ops_per_thread
-        if error_ratio > 0.10:  # Under target by >10%
-            desired_float = max(desired_float, theoretical * 0.9)
+        ops_per_thread_latency = 1000.0 / avg_latency_ms
+        theoretical = target_qps / ops_per_thread_latency
+        # Use 70% of theoretical as a floor (conservative)
+        latency_floor = theoretical * 0.70 * gap_fraction + current_threads * (1 - gap_fraction)
+        debug["latency_theoretical"] = theoretical
+        debug["latency_floor"] = latency_floor
+        if latency_floor > desired_float:
+            desired_float = latency_floor
+            debug["used_latency_floor"] = True
 
     desired = int(round(desired_float))
-    return max(min_threads, min(max_threads, desired))
+    desired = max(min_threads, min(max_threads, desired))
+    debug["final_desired"] = desired
+    
+    return desired, debug
 
 
 def evaluate_qps_scaling(
@@ -207,8 +269,17 @@ def evaluate_qps_scaling(
 
     if current_threads <= 0:
         decision.should_scale = True
-        decision.new_target = state.min_threads
-        decision.reason = "no_threads_running"
+        # If starting_threads is set, use it directly
+        if state.starting_threads > 0:
+            initial_threads = int(state.starting_threads)
+            # Clamp to valid range
+            initial_threads = max(state.min_threads, min(initial_threads, state.max_threads))
+            decision.new_target = initial_threads
+            decision.reason = "initial_from_starting_threads"
+            decision.debug_info["starting_threads"] = state.starting_threads
+        else:
+            decision.new_target = state.min_threads
+            decision.reason = "no_threads_running"
         return decision
 
     # Calculate deadband thresholds
@@ -258,32 +329,23 @@ def evaluate_qps_scaling(
         decision.reason = "over_target_streak_not_met"
         return decision
 
-    # Compute desired threads
-    desired = compute_desired_threads(
+    # Compute desired threads using gap-closing approach
+    desired, compute_debug = compute_desired_threads(
         current_threads=current_threads,
         current_qps=current_qps,
         target_qps=state.target_qps,
         avg_latency_ms=avg_latency_ms,
         min_threads=state.min_threads,
         max_threads=state.max_threads,
+        max_thread_increase=state.max_thread_increase,
     )
 
-    decision.debug_info["raw_desired"] = desired
-
-    # Rate limiting: max N% change per tick
-    max_change = max(2, int(current_threads * state.max_change_pct))
-    if abs(desired - current_threads) > max_change:
-        if desired > current_threads:
-            desired = current_threads + max_change
-        else:
-            desired = current_threads - max_change
-
-    decision.debug_info["rate_limited_desired"] = desired
-    decision.debug_info["max_change"] = max_change
+    decision.debug_info["compute_debug"] = compute_debug
+    decision.debug_info["desired"] = desired
 
     # Only scale if there's an actual change
     if desired == current_threads:
-        decision.reason = "no_change_after_rate_limit"
+        decision.reason = "no_change_needed"
         return decision
 
     # At ceiling or floor?

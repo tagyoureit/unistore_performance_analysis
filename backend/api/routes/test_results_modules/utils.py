@@ -49,7 +49,7 @@ def build_cost_fields(
         warehouse_size: Warehouse size string (e.g., "XSMALL", "MEDIUM")
         total_operations: Total operations executed (for efficiency metrics)
         qps: Queries per second (for efficiency metrics)
-        table_type: Table type (e.g., "HYBRID", "SNOWFLAKE_POSTGRES")
+        table_type: Table type (e.g., "HYBRID", "POSTGRES")
         postgres_instance_size: For Postgres, explicit instance size override.
 
     Returns:
@@ -65,8 +65,8 @@ def build_cost_fields(
     effective_postgres_size = postgres_instance_size
     if not effective_postgres_size and table_type:
         table_type_upper = table_type.upper().strip()
-        if table_type_upper in ("POSTGRES", "SNOWFLAKE_POSTGRES"):
-            actual_size = get_postgres_instance_size_by_host(settings.SNOWFLAKE_POSTGRES_HOST)
+        if table_type_upper == "POSTGRES":
+            actual_size = get_postgres_instance_size_by_host(settings.POSTGRES_HOST)
             if actual_size:
                 effective_postgres_size = actual_size
             else:
@@ -88,7 +88,7 @@ def build_cost_fields(
         "cost_calculation_method": cost_info["calculation_method"],
         "postgres_instance_size": (
             effective_postgres_size
-            if table_type and table_type.upper().strip() in ("POSTGRES", "SNOWFLAKE_POSTGRES")
+            if table_type and table_type.upper().strip() == "POSTGRES"
             else None
         ),
     }

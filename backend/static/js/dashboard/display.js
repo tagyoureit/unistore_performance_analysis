@@ -7,7 +7,7 @@ window.DashboardMixins = window.DashboardMixins || {};
 window.DashboardMixins.display = {
   tableTypeLabel() {
     const tableType = (this.templateInfo?.table_type || "").toUpperCase();
-    if (tableType === "POSTGRES" || tableType === "SNOWFLAKE_POSTGRES") return "POSTGRES";
+    if (tableType === "POSTGRES") return "POSTGRES";
     if (tableType === "HYBRID") return "HYBRID";
     if (tableType === "STANDARD") return "STANDARD";
     if (tableType === "INTERACTIVE") return "INTERACTIVE";
@@ -16,7 +16,7 @@ window.DashboardMixins.display = {
 
   tableTypeIconSrc() {
     const tableType = (this.templateInfo?.table_type || "").toUpperCase();
-    if (tableType === "POSTGRES" || tableType === "SNOWFLAKE_POSTGRES") {
+    if (tableType === "POSTGRES") {
       return "/static/img/postgres_elephant.svg";
     }
     if (tableType === "HYBRID") {
@@ -154,9 +154,10 @@ window.DashboardMixins.display = {
 
     if (loadMode === "QPS") {
       const targetQps = info.target_qps ?? "";
-      const minConn = info.min_connections ?? 1;
-      const maxConn = info.concurrent_connections ?? "";
-      return `QPS Mode: Target ${targetQps} QPS (${minConn}-${maxConn} threads)`;
+      // Support both new and old field names
+      const startingThreads = info.starting_threads ?? info.starting_qps ?? 0;
+      const maxThreadIncrease = info.max_thread_increase ?? info.max_qps_increase ?? 15;
+      return `QPS Mode: Target ${targetQps} QPS (start: ${startingThreads}, ±${maxThreadIncrease}/~10s)`;
     }
 
     // CONCURRENCY mode - just show threads
@@ -182,7 +183,7 @@ window.DashboardMixins.display = {
     if (!sc) return mode;
 
     // Default applied by backend for AUTO and BOUNDED modes (no max_workers default)
-    const DEFAULT_MAX_CONN = 250;
+    const DEFAULT_MAX_CONN = 200;
 
     // Get connections per worker info
     const minConn = Number(sc.min_connections ?? sc.minConnections ?? 1);

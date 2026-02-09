@@ -1614,6 +1614,7 @@ async def enrich_query_executions_with_retry(
     target_ratio: float = 0.90,
     max_wait_seconds: int = 120,
     poll_interval_seconds: int = 10,
+    table_type: str | None = None,
 ) -> EnrichmentStats:
     """
     Enrich QUERY_EXECUTIONS with retries until target_ratio of queries are enriched.
@@ -1625,13 +1626,23 @@ async def enrich_query_executions_with_retry(
     The number of pagination pages is calculated dynamically based on actual query
     count in QUERY_EXECUTIONS (10k queries per page, with 20% buffer).
 
+    For hybrid tables, enrichment is minimal (~0.1%) because hybrid workloads don't
+    emit per-query QUERY_HISTORY rows. We use shorter timeouts for these cases.
+
     Args:
         test_id: The test ID to enrich (single worker, for backward compatibility)
         run_id: The run ID to enrich (all workers in run - preferred for multi-worker)
         target_ratio: Stop when this ratio of queries are enriched (default 0.90)
         max_wait_seconds: Maximum time to wait for enrichment (default 120)
         poll_interval_seconds: Time between enrichment attempts (default 10)
+        table_type: Table type (hybrid, interactive, standard, etc.) - affects timeouts
     """
+    table_type_upper = (table_type or "").strip().upper()
+    is_sampled_analysis = table_type_upper in {"HYBRID", "UNISTORE"}
+    if is_sampled_analysis:
+        max_wait_seconds = min(max_wait_seconds, 45)
+        target_ratio = min(target_ratio, 0.05)
+        poll_interval_seconds = min(poll_interval_seconds, 8)
     id_for_log = run_id or test_id
     start = datetime.now(UTC)
     deadline = start + timedelta(seconds=max_wait_seconds)
@@ -1700,11 +1711,15 @@ async def enrich_query_executions_with_retry(
 
         if progress == 0:
             stalled_attempts += 1
-            if stalled_attempts >= 3 and stats.enrichment_ratio > 0.5:
+            stall_threshold = 2 if is_sampled_analysis else 3
+            ratio_threshold = 0.0 if is_sampled_analysis else 0.5
+            if stalled_attempts >= stall_threshold and stats.enrichment_ratio > ratio_threshold:
                 logger.warning(
-                    "⚠️ Enrichment stalled for %s at %.1f%% - hybrid workload may not emit per-query QUERY_HISTORY rows",
+                    "⚠️ Enrichment stalled for %s at %.1f%% - %s",
                     id_for_log,
                     stats.enrichment_ratio * 100,
+                    "hybrid workload (limited QUERY_HISTORY)" if is_sampled_analysis
+                    else "workload may not emit per-query QUERY_HISTORY rows",
                 )
                 break
         else:

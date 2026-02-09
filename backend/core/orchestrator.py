@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,8 @@ from typing import Any
 from backend.config import settings
 from backend.connectors import snowflake_pool
 from backend.core import results_store
+from backend.core.live_controller_state import live_controller_state
+from backend.core.live_metrics_cache import live_metrics_cache
 from backend.core.mode_config import ModeConfig
 from backend.core.pool_refresh import refresh_key_pool_after_writes, test_had_writes
 from backend.core.postgres_stats import (
@@ -235,34 +238,56 @@ class OrchestratorService:
             asyncpg connection or None if connection fails
         """
         import asyncpg
+        import ssl
 
         from backend.connectors.postgres_pool import get_postgres_connection_params
+        from backend.core import connection_manager
 
         target_cfg = scenario_config.get("target", {})
         table_type = str(target_cfg.get("table_type", "")).strip().upper()
         database = str(target_cfg.get("database", "")).strip()
+        connection_id = target_cfg.get("connection_id")
 
         if not database:
             logger.warning("No database configured for Postgres stats capture")
             return None
 
-        # Determine pool type based on table type
-        pool_type = (
-            "snowflake_postgres" if table_type == "SNOWFLAKE_POSTGRES" else "default"
-        )
-
         try:
-            # Stats connections should always use direct PostgreSQL (port 5432),
-            # not PgBouncer, since they query system views like pg_stat_statements
-            params = get_postgres_connection_params(pool_type, use_pgbouncer=False)
-            conn = await asyncpg.connect(
-                host=params["host"],
-                port=params["port"],
-                database=database,
-                user=params["user"],
-                password=params["password"],
-                timeout=10.0,
-            )
+            # Stats connections should always use direct PostgreSQL (not PgBouncer),
+            # since they query system views like pg_stat_statements
+            
+            if connection_id:
+                # Use stored connection credentials
+                conn_params = await connection_manager.get_connection_for_pool(connection_id)
+                if not conn_params:
+                    logger.warning(f"Connection {connection_id} not found for stats capture")
+                    return None
+                
+                # Create SSL context for Snowflake Postgres (self-signed certs)
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                conn = await asyncpg.connect(
+                    host=conn_params["host"],
+                    port=conn_params["port"],  # Direct port, not PgBouncer
+                    database=database,
+                    user=conn_params["user"],
+                    password=conn_params["password"],
+                    timeout=10.0,
+                    ssl=ssl_context,
+                )
+            else:
+                # Fallback to environment variables (backward compat)
+                params = get_postgres_connection_params(use_pgbouncer=False)
+                conn = await asyncpg.connect(
+                    host=params["host"],
+                    port=params["port"],
+                    database=database,
+                    user=params["user"],
+                    password=params["password"],
+                    timeout=10.0,
+                )
             return conn
         except Exception as e:
             logger.warning(
@@ -336,30 +361,27 @@ class OrchestratorService:
         # Extract relevant config values
         table_type = str(scenario_config.get("table_type", "standard")).lower()
         workload_cfg = scenario_config.get("workload", {})
-        workload_type = str(workload_cfg.get("workload_type", "read_only")).lower()
+        custom_queries = workload_cfg.get("custom_queries", [])
         total_threads = int(scenario_config.get("total_threads", 10))
         table_name = str(scenario_config.get("table_name", ""))
 
-        # Calculate write percentage based on workload type
+        # Calculate write percentage from CUSTOM query weights.
+        # Runtime is CUSTOM-only, but we tolerate legacy key names for old rows.
         write_pct = 0.0
-        if workload_type == "read_only":
-            write_pct = 0.0
-        elif workload_type == "write_only":
-            write_pct = 1.0
-        elif workload_type == "read_heavy":
-            write_pct = 0.2  # 80% read, 20% write
-        elif workload_type == "write_heavy":
-            write_pct = 0.8  # 20% read, 80% write
-        elif workload_type == "mixed":
-            write_pct = 0.5  # 50/50
-        elif workload_type == "custom":
-            # Parse custom_queries for write operations
-            custom_queries = workload_cfg.get("custom_queries", [])
+        if isinstance(custom_queries, list):
             for q in custom_queries:
-                kind = str(q.get("query_kind", "")).upper()
-                weight = float(q.get("weight_pct", 0)) / 100.0
-                if kind in ("INSERT", "UPDATE", "DELETE"):
-                    write_pct += weight
+                if not isinstance(q, dict):
+                    continue
+                kind = str(q.get("query_kind") or q.get("kind") or "").upper()
+                raw_weight = q.get("weight_pct", q.get("weight", 0))
+                try:
+                    weight = float(raw_weight)
+                except (TypeError, ValueError):
+                    weight = 0.0
+                normalized_weight = weight / 100.0 if weight > 1.0 else weight
+                if kind in ("INSERT", "UPDATE", "DELETE") and normalized_weight > 0:
+                    write_pct += normalized_weight
+        write_pct = max(0.0, min(write_pct, 1.0))
 
         # Calculate expected concurrent writers
         expected_concurrent_writes = total_threads * write_pct
@@ -383,7 +405,7 @@ class OrchestratorService:
                     "recommendations": [
                         "Use a HYBRID table for concurrent write workloads (row-level locking)",
                         f"Reduce concurrency to ≤{int(LOCK_WAITER_LIMIT / write_pct) if write_pct > 0 else total_threads} threads",
-                        "Use READ_ONLY workload to benchmark read performance separately",
+                        "For read-only benchmarking, keep CUSTOM and set INSERT/UPDATE mix to 0%",
                     ],
                     "details": {
                         "table_type": table_type,
@@ -490,10 +512,7 @@ class OrchestratorService:
         table_cfg = scenario.table_configs[0]
         table_type_raw = getattr(table_cfg.table_type, "value", table_cfg.table_type)
         table_type = str(table_type_raw).upper()
-        is_postgres = table_type in {
-            TableType.POSTGRES.value.upper(),
-            TableType.SNOWFLAKE_POSTGRES.value.upper(),
-        }
+        is_postgres = table_type == TableType.POSTGRES.value.upper()
         warehouse = None
         if not is_postgres:
             warehouse = str(template_config.get("warehouse_name") or "").strip()
@@ -532,10 +551,7 @@ class OrchestratorService:
         )
 
         # Universal default for max connections per worker.
-        # Each Snowflake connection spawns 3-4 internal threads, so 200 connections
-        # = 600-800 threads per worker process. Higher values risk hitting OS thread
-        # limits ("can't start new thread" errors). For higher total concurrency,
-        # use multiple worker processes.
+        # Must match frontend DEFAULT_MAX_CONN in display.js for UI consistency.
         DEFAULT_MAX_THREADS_PER_WORKER = 200
 
         if max_threads_per_worker is None:
@@ -564,8 +580,17 @@ class OrchestratorService:
                     "FIXED mode requires scaling.min_threads_per_worker to be set"
                 )
 
-        # Extract total_threads early for optimal worker count calculation
+        load_mode = _mode_cfg.load_mode
+
+        # Extract thread targets early for optimal worker count calculation.
+        # In FIND_MAX mode, size workers from start_concurrency (not legacy total_threads).
         total_threads = int(scenario.total_threads)
+        find_max_start_threads = int(scenario.start_concurrency)
+        worker_sizing_target = (
+            find_max_start_threads
+            if load_mode == "FIND_MAX_CONCURRENCY"
+            else total_threads
+        )
 
         worker_group_count = int(
             template_config.get("worker_group_count")
@@ -579,8 +604,8 @@ class OrchestratorService:
             worker_group_count = min_workers
         elif scaling_mode in {"AUTO", "BOUNDED"} and max_threads_per_worker is not None:
             # For AUTO and BOUNDED modes, compute optimal worker count
-            # ceil(total_threads / max_threads_per_worker) gives minimum workers needed
-            optimal_workers = math.ceil(total_threads / max_threads_per_worker)
+            # ceil(worker_sizing_target / max_threads_per_worker) gives minimum workers needed
+            optimal_workers = math.ceil(worker_sizing_target / max_threads_per_worker)
             # Clamp between min_workers and max_workers
             worker_group_count = max(optimal_workers, min_workers)
             if max_workers is not None:
@@ -603,17 +628,15 @@ class OrchestratorService:
         if per_worker_threads is not None:
             per_worker_threads = int(per_worker_threads)
 
-        load_mode = _mode_cfg.load_mode
         if scaling_mode == "FIXED" and load_mode == "CONCURRENCY":
             total_threads = int(min_workers) * int(min_threads_per_worker)
 
         def _resolve_effective_max_threads_per_worker() -> int | None:
             per_worker_cap = None
-            if load_mode == "QPS":
-                per_worker_cap = int(scenario.total_threads)
-                if per_worker_cap == -1:
-                    per_worker_cap = None
-            elif per_worker_threads is not None:
+            # For QPS mode, total_threads is just the starting concurrency, not a cap.
+            # The max threads per worker should come from scaling config (max_connections).
+            # Only non-QPS modes should use total_threads as a cap.
+            if load_mode != "QPS" and per_worker_threads is not None:
                 per_worker_cap = int(per_worker_threads)
             if max_threads_per_worker is not None:
                 if per_worker_cap is None:
@@ -625,9 +648,14 @@ class OrchestratorService:
         if max_workers is not None and effective_max_threads_per_worker is not None:
             max_total = int(max_workers) * int(effective_max_threads_per_worker)
             if load_mode in {"CONCURRENCY", "FIND_MAX_CONCURRENCY"}:
-                if total_threads > max_total:
+                target_threads = (
+                    find_max_start_threads
+                    if load_mode == "FIND_MAX_CONCURRENCY"
+                    else total_threads
+                )
+                if target_threads > max_total:
                     raise ValueError(
-                        f"Target threads {total_threads} unreachable with max {max_workers} workers × {effective_max_threads_per_worker} threads"
+                        f"Target threads {target_threads} unreachable with max {max_workers} workers × {effective_max_threads_per_worker} threads"
                     )
             elif load_mode == "QPS":
                 target_qps_total = scenario.target_qps
@@ -646,15 +674,26 @@ class OrchestratorService:
                 "warehouse": warehouse,
                 "database": str(table_cfg.database or ""),
                 "schema": str(table_cfg.schema_name or ""),
+                "connection_id": table_cfg.connection_id,
             },
             "workload": {
                 "load_mode": load_mode,
-                "concurrent_connections": int(total_threads),
+                "concurrent_connections": int(worker_sizing_target),
                 "duration_seconds": int(scenario.duration_seconds),
                 "warmup_seconds": int(scenario.warmup_seconds),
                 "target_qps": (
                     float(scenario.target_qps)
                     if scenario.target_qps is not None
+                    else None
+                ),
+                "starting_threads": (
+                    float(scenario.starting_threads)
+                    if scenario.starting_threads is not None
+                    else None
+                ),
+                "max_thread_increase": (
+                    float(scenario.max_thread_increase)
+                    if scenario.max_thread_increase is not None
                     else None
                 ),
                 "workload_type": getattr(
@@ -1038,6 +1077,7 @@ class OrchestratorService:
         table_type_str = str(target_cfg.get("table_type") or "").strip().upper()
         database = str(target_cfg.get("database") or "").strip()
         schema = str(target_cfg.get("schema") or "").strip()
+        connection_id = target_cfg.get("connection_id")
 
         # Map string to TableType enum
         type_map = {
@@ -1045,7 +1085,6 @@ class OrchestratorService:
             "HYBRID": TableType.HYBRID,
             "INTERACTIVE": TableType.INTERACTIVE,
             "POSTGRES": TableType.POSTGRES,
-            "SNOWFLAKE_POSTGRES": TableType.SNOWFLAKE_POSTGRES,
         }
         table_type = type_map.get(table_type_str)
         if not table_type:
@@ -1062,6 +1101,7 @@ class OrchestratorService:
                 table_type=table_type,
                 database=database or None,
                 schema_name=schema or None,
+                connection_id=connection_id,
                 columns={},  # Will be populated by validate_schema()
             )
 
@@ -1415,9 +1455,7 @@ class OrchestratorService:
             _coerce_optional_int(scaling_cfg.get("bounds_patience_intervals"))
             or bounds_patience_intervals
         )
-        find_max_enabled = (
-            bool(find_max_cfg.get("enabled")) and load_mode == "FIND_MAX_CONCURRENCY"
-        )
+        find_max_enabled = load_mode == "FIND_MAX_CONCURRENCY"
         worker_group_count = max(1, int(ctx.worker_group_count or 1))
 
         per_worker_threads = _coerce_optional_int(
@@ -1427,9 +1465,17 @@ class OrchestratorService:
         )
         per_worker_cap = per_worker_threads
         if per_worker_cap is None:
-            per_worker_cap = _coerce_optional_int(
-                workload_cfg.get("concurrent_connections"), allow_unbounded=True
-            )
+            if find_max_enabled:
+                # FIND_MAX mode: Use scaling.max_connections if set, otherwise use a high default
+                # to allow unrestricted scaling. DO NOT use workload.concurrent_connections
+                # as that may be a low default value (10) from the model.
+                per_worker_cap = _coerce_optional_int(
+                    scaling_cfg.get("max_connections"), allow_unbounded=True
+                ) or 200  # Default to 200 per worker for FIND_MAX exploration
+            else:
+                per_worker_cap = _coerce_optional_int(
+                    workload_cfg.get("concurrent_connections"), allow_unbounded=True
+                )
         effective_max_threads_per_worker = per_worker_cap
         if max_threads_per_worker is not None:
             effective_max_threads_per_worker = (
@@ -1437,21 +1483,45 @@ class OrchestratorService:
                 if per_worker_cap is not None
                 else int(max_threads_per_worker)
             )
+        root_cfg = ctx.scenario_config or {}
         find_max_start = (
-            _coerce_optional_int(find_max_cfg.get("start_concurrency")) or 1
+            _coerce_optional_int(find_max_cfg.get("start_concurrency"))
+            or _coerce_optional_int(root_cfg.get("start_concurrency"))
+            or 1
         )
         find_max_increment = (
-            _coerce_optional_int(find_max_cfg.get("concurrency_increment")) or 1
+            _coerce_optional_int(find_max_cfg.get("concurrency_increment"))
+            or _coerce_optional_int(root_cfg.get("concurrency_increment"))
+            or 1
         )
         find_max_step_seconds = (
-            _coerce_optional_int(find_max_cfg.get("step_duration_seconds")) or 30
+            _coerce_optional_int(find_max_cfg.get("step_duration_seconds"))
+            or _coerce_optional_int(root_cfg.get("step_duration_seconds"))
+            or 30
         )
-        find_max_qps_stability_pct = float(find_max_cfg.get("qps_stability_pct") or 5.0)
+        find_max_qps_stability_pct = float(
+            find_max_cfg.get("qps_stability_pct")
+            or root_cfg.get("qps_stability_pct")
+            or 5.0
+        )
         find_max_latency_stability_pct = float(
-            find_max_cfg.get("latency_stability_pct") or 20.0
+            find_max_cfg.get("latency_stability_pct")
+            or root_cfg.get("latency_stability_pct")
+            or 20.0
         )
-        find_max_max_error_pct = float(find_max_cfg.get("max_error_rate_pct") or 1.0)
+        find_max_max_error_pct = float(
+            find_max_cfg.get("max_error_rate_pct")
+            or root_cfg.get("max_error_rate_pct")
+            or 1.0
+        )
         target_qps_total = _coerce_optional_float(workload_cfg.get("target_qps"))
+        # Support both new and old field names for backwards compatibility
+        starting_threads = _coerce_optional_float(
+            workload_cfg.get("starting_threads") or workload_cfg.get("starting_qps")
+        )
+        max_thread_increase = _coerce_optional_float(
+            workload_cfg.get("max_thread_increase") or workload_cfg.get("max_qps_increase")
+        )
 
         # Calculate max_concurrency ceiling for FIND_MAX mode
         # IMPORTANT: For FIND_MAX mode, we need a high ceiling to discover the true maximum.
@@ -1511,14 +1581,33 @@ class OrchestratorService:
         last_metrics_ts: datetime | None = None
         last_heartbeat_update: datetime | None = None
         last_parent_rollup_status: str | None = None
+        parent_rollup_interval_active_seconds = 10.0
+        last_parent_rollup_mono: float | None = None
+        parent_rollup_task: asyncio.Task | None = None
+        find_max_history_tasks: set[asyncio.Task[Any]] = set()
+        run_status_rollup_interval_active_seconds = 4.0
+        last_run_status_rollup_mono: float | None = None
         last_warehouse_poll_mono: float | None = None
         warehouse_poll_task: asyncio.Task | None = None
+        worker_health_poll_interval_seconds = 2.0
+        last_worker_health_poll_mono: float | None = None
+        worker_health_task: asyncio.Task[tuple[int, int, int, int, int, Any, float | None, float | None]] | None = None
+        workers_registered = 0
+        workers_active = 0
+        workers_completed = 0
+        dead_workers = 0
+        workers_ready = 0
+        heartbeat_updated_at = None
+        max_cpu_seen = None
+        max_memory_seen = None
         bounds_under_target_intervals = 0
 
         # QPS controller state for orchestrator-driven scaling
         qps_controller_state: QPSControllerState | None = None
         qps_controller_step_number = 0
+        qps_controller_step_history: list[dict[str, Any]] = []
         last_qps_scaling_time: float | None = None
+        last_qps_evaluation_time: float | None = None
 
         find_max_step_number = 0
         find_max_step_id: str | None = None
@@ -1541,12 +1630,144 @@ class OrchestratorService:
         find_max_termination_reason: str | None = None
         find_max_failed_concurrency: int | None = None  # Track where degradation occurred
         find_max_midpoint_attempted = False  # Track if midpoint has been tried
+        find_max_running_state_persist_interval_seconds = 3.0
+        last_find_max_running_state_persist_mono: float | None = None
+
+        def _track_parent_rollup_task(task: asyncio.Task[Any]) -> None:
+            nonlocal parent_rollup_task
+
+            def _done(t: asyncio.Task[Any]) -> None:
+                nonlocal parent_rollup_task
+                parent_rollup_task = None
+                try:
+                    t.result()
+                except Exception as exc:
+                    logger.debug(
+                        "Background parent rollup failed for %s: %s",
+                        run_id,
+                        exc,
+                    )
+
+            task.add_done_callback(_done)
+
+        def _track_find_max_history_task(
+            task: asyncio.Task[Any], *, step_number: int
+        ) -> None:
+            find_max_history_tasks.add(task)
+
+            def _done(t: asyncio.Task[Any]) -> None:
+                find_max_history_tasks.discard(t)
+                try:
+                    t.result()
+                    logger.info(
+                        "FIND_MAX step %d: history insert SUCCESS", step_number
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "FIND_MAX step %d: history insert FAILED: %s",
+                        step_number,
+                        exc,
+                    )
+
+            task.add_done_callback(_done)
+
+        async def _refresh_worker_health_snapshot() -> tuple[
+            int, int, int, int, int, Any, float | None, float | None
+        ]:
+            await self._pool.execute_query(
+                f"""
+                UPDATE {prefix}.WORKER_HEARTBEATS
+                SET STATUS = 'DEAD',
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHERE RUN_ID = ?
+                  AND STATUS NOT IN ('DEAD', 'COMPLETED')
+                  AND TIMESTAMPDIFF('second', LAST_HEARTBEAT, CURRENT_TIMESTAMP()) > 60
+                """,
+                params=[run_id],
+            )
+
+            await self._pool.execute_query(
+                f"""
+                UPDATE {prefix}.WORKER_HEARTBEATS
+                SET STATUS = 'STALE',
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHERE RUN_ID = ?
+                  AND STATUS NOT IN ('STALE', 'DEAD', 'COMPLETED')
+                  AND TIMESTAMPDIFF('second', LAST_HEARTBEAT, CURRENT_TIMESTAMP()) > 30
+                """,
+                params=[run_id],
+            )
+
+            heartbeat_rows = await self._pool.execute_query(
+                f"""
+                SELECT
+                    COUNT(*) AS worker_count,
+                    SUM(
+                        CASE
+                            WHEN STATUS IN (
+                                'STARTING', 'WAITING', 'RUNNING', 'DRAINING', 'STALE', 'READY', 'INITIALIZING'
+                            ) THEN 1
+                            ELSE 0
+                        END
+                    ) AS active_count,
+                    SUM(
+                        CASE
+                            WHEN STATUS IN ('COMPLETED', 'DEAD') THEN 1
+                            ELSE 0
+                        END
+                    ) AS completed_count,
+                    SUM(CASE WHEN STATUS = 'DEAD' THEN 1 ELSE 0 END) AS dead_count,
+                    SUM(CASE WHEN STATUS = 'READY' THEN 1 ELSE 0 END) AS ready_count,
+                    MAX(UPDATED_AT) AS last_update,
+                    MAX(COALESCE(CPU_PERCENT, 0)) AS max_cpu_percent,
+                    MAX(COALESCE(MEMORY_PERCENT, 0)) AS max_memory_percent
+                FROM {prefix}.WORKER_HEARTBEATS
+                WHERE RUN_ID = ?
+                """,
+                params=[run_id],
+            )
+
+            (
+                workers_registered_raw,
+                workers_active_raw,
+                workers_completed_raw,
+                dead_workers_raw,
+                workers_ready_raw,
+                heartbeat_updated_at_raw,
+                max_cpu_seen_raw,
+                max_memory_seen_raw,
+            ) = heartbeat_rows[0] if heartbeat_rows else (None,) * 8
+
+            return (
+                int(workers_registered_raw or 0),
+                int(workers_active_raw or 0),
+                int(workers_completed_raw or 0),
+                int(dead_workers_raw or 0),
+                int(workers_ready_raw or 0),
+                heartbeat_updated_at_raw,
+                float(max_cpu_seen_raw) if max_cpu_seen_raw is not None else None,
+                float(max_memory_seen_raw) if max_memory_seen_raw is not None else None,
+            )
+
+        def _apply_worker_health_snapshot(
+            snapshot: tuple[int, int, int, int, int, Any, float | None, float | None]
+        ) -> None:
+            nonlocal workers_registered, workers_active, workers_completed
+            nonlocal dead_workers, workers_ready, heartbeat_updated_at
+            nonlocal max_cpu_seen, max_memory_seen
+            (
+                workers_registered,
+                workers_active,
+                workers_completed,
+                dead_workers,
+                workers_ready,
+                heartbeat_updated_at,
+                max_cpu_seen,
+                max_memory_seen,
+            ) = snapshot
 
         # Postgres stats capture setup
-        is_postgres_test = str(target_cfg.get("table_type", "")).strip().upper() in {
-            "POSTGRES",
-            "SNOWFLAKE_POSTGRES",
-        }
+        is_postgres_test = str(target_cfg.get("table_type", "")).strip().upper() == "POSTGRES"
         pg_stats_conn = None
         pg_stats_enabled = False
 
@@ -1614,6 +1835,11 @@ class OrchestratorService:
         ) -> int:
             effective_total, targets = _build_worker_targets(total_target)
             effective_at = datetime.now(UTC).isoformat()
+            # FIND_MAX step transitions should apply promptly; a long target ramp
+            # makes phase handoffs look delayed in the UI.
+            ramp_seconds = 0
+            if str(load_mode or "").upper() != "FIND_MAX_CONCURRENCY":
+                ramp_seconds = 5
 
             for worker_id, target in targets.items():
                 await self._pool.execute_query(
@@ -1639,7 +1865,7 @@ class OrchestratorService:
                     "step_id": step_id,
                     "step_number": int(step_number),
                     "effective_at": effective_at,
-                    "ramp_seconds": 5,
+                    "ramp_seconds": ramp_seconds,
                     "reason": reason,
                 }
                 if target.get("target_qps") is not None:
@@ -1726,6 +1952,7 @@ class OrchestratorService:
             return worker_group_count
 
         async def _persist_find_max_state(state: dict[str, Any]) -> None:
+            await live_controller_state.set_find_max_state(run_id=run_id, state=state)
             await self._pool.execute_query(
                 f"""
                 UPDATE {prefix}.RUN_STATUS
@@ -1759,10 +1986,11 @@ class OrchestratorService:
         ) -> None:
             await self._pool.execute_query(
                 f"""
-                INSERT INTO {prefix}.FIND_MAX_STEP_HISTORY (
+                INSERT INTO {prefix}.CONTROLLER_STEP_HISTORY (
                     STEP_ID,
                     RUN_ID,
                     STEP_NUMBER,
+                    STEP_TYPE,
                     TARGET_WORKERS,
                     STEP_START_TIME,
                     STEP_END_TIME,
@@ -1780,7 +2008,7 @@ class OrchestratorService:
                     OUTCOME,
                     STOP_REASON
                 )
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                SELECT ?, ?, ?, 'FIND_MAX', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 """,
                 params=[
                     step_id,
@@ -1834,6 +2062,107 @@ class OrchestratorService:
                 params=[json.dumps(state), run_id, run_id],
             )
 
+        async def _persist_qps_controller_state(state: dict[str, Any]) -> None:
+            """Persist QPS controller live state for UI display."""
+            await live_controller_state.set_qps_state(run_id=run_id, state=state)
+            await self._pool.execute_query(
+                f"""
+                UPDATE {prefix}.RUN_STATUS
+                SET QPS_CONTROLLER_STATE = PARSE_JSON(?),
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHERE RUN_ID = ?
+                """,
+                params=[json.dumps(state), run_id],
+            )
+
+        async def _insert_controller_step_history(
+            *,
+            step_id: str,
+            step_number: int,
+            step_type: str,
+            target_workers: int,
+            step_start_time: datetime,
+            step_end_time: datetime | None = None,
+            step_duration_seconds: float | None = None,
+            from_threads: int | None = None,
+            to_threads: int | None = None,
+            direction: str | None = None,
+            total_queries: int | None = None,
+            qps: float | None = None,
+            target_qps: float | None = None,
+            p50_latency_ms: float | None = None,
+            p95_latency_ms: float | None = None,
+            p99_latency_ms: float | None = None,
+            error_count: int | None = None,
+            error_rate: float | None = None,
+            qps_vs_prior_pct: float | None = None,
+            p95_vs_baseline_pct: float | None = None,
+            queue_detected: bool = False,
+            qps_error_pct: float | None = None,
+            outcome: str | None = None,
+            stop_reason: str | None = None,
+        ) -> None:
+            """Insert a step into the unified CONTROLLER_STEP_HISTORY table."""
+            await self._pool.execute_query(
+                f"""
+                INSERT INTO {prefix}.CONTROLLER_STEP_HISTORY (
+                    STEP_ID,
+                    RUN_ID,
+                    STEP_NUMBER,
+                    STEP_TYPE,
+                    TARGET_WORKERS,
+                    FROM_THREADS,
+                    TO_THREADS,
+                    DIRECTION,
+                    STEP_START_TIME,
+                    STEP_END_TIME,
+                    STEP_DURATION_SECONDS,
+                    TOTAL_QUERIES,
+                    QPS,
+                    TARGET_QPS,
+                    P50_LATENCY_MS,
+                    P95_LATENCY_MS,
+                    P99_LATENCY_MS,
+                    ERROR_COUNT,
+                    ERROR_RATE,
+                    QPS_VS_PRIOR_PCT,
+                    P95_VS_BASELINE_PCT,
+                    QUEUE_DETECTED,
+                    QPS_ERROR_PCT,
+                    OUTCOME,
+                    STOP_REASON
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                """,
+                params=[
+                    step_id,
+                    run_id,
+                    int(step_number),
+                    str(step_type),
+                    int(target_workers),
+                    int(from_threads) if from_threads is not None else None,
+                    int(to_threads) if to_threads is not None else None,
+                    str(direction) if direction else None,
+                    step_start_time,
+                    step_end_time,
+                    float(step_duration_seconds) if step_duration_seconds is not None else None,
+                    int(total_queries) if total_queries is not None else None,
+                    float(qps) if qps is not None else None,
+                    float(target_qps) if target_qps is not None else None,
+                    float(p50_latency_ms) if p50_latency_ms is not None else None,
+                    float(p95_latency_ms) if p95_latency_ms is not None else None,
+                    float(p99_latency_ms) if p99_latency_ms is not None else None,
+                    int(error_count) if error_count is not None else None,
+                    float(error_rate) if error_rate is not None else None,
+                    float(qps_vs_prior_pct) if qps_vs_prior_pct is not None else None,
+                    float(p95_vs_baseline_pct) if p95_vs_baseline_pct is not None else None,
+                    bool(queue_detected),
+                    float(qps_error_pct) if qps_error_pct is not None else None,
+                    str(outcome) if outcome else None,
+                    stop_reason,
+                ],
+            )
+
         async def _mark_run_completed() -> None:
             # First transition to PROCESSING phase for enrichment.
             # Note: END_TIME is NOT set here - it will be set when phase→COMPLETED
@@ -1878,7 +2207,7 @@ class OrchestratorService:
             # table_type is nested under target.table_type in scenario_config
             target_cfg = scenario_config.get("target", {})
             table_type_str = str(target_cfg.get("table_type", "")).strip().upper()
-            is_postgres_test = table_type_str in {"POSTGRES", "SNOWFLAKE_POSTGRES"}
+            is_postgres_test = table_type_str == "POSTGRES"
 
             try:
                 if is_postgres_test:
@@ -1948,12 +2277,13 @@ class OrchestratorService:
                             error="Postgres: pg_stat_statements unavailable or no data captured",
                         )
                 else:
-                    logger.info("Starting enrichment for run %s", test_id)
+                    logger.info("Starting enrichment for run %s (table_type=%s)", test_id, table_type_str or "unknown")
                     await enrich_query_executions_with_retry(
                         run_id=test_id,
                         target_ratio=0.90,
                         max_wait_seconds=240,
                         poll_interval_seconds=10,
+                        table_type=table_type_str,
                     )
                     await update_test_overhead_percentiles(run_id=test_id)
                     await update_enrichment_status(
@@ -2067,6 +2397,7 @@ class OrchestratorService:
         try:
             while True:
                 await asyncio.sleep(1.0)
+                loop_cycle_started_mono = asyncio.get_running_loop().time()
 
                 status_rows = await self._pool.execute_query(
                     f"""
@@ -2095,8 +2426,8 @@ class OrchestratorService:
                 )
                 now = datetime.now(UTC)
 
+                now_mono = asyncio.get_running_loop().time()
                 if warehouse_name:
-                    now_mono = asyncio.get_running_loop().time()
                     if (
                         last_warehouse_poll_mono is None
                         or now_mono - last_warehouse_poll_mono >= 5.0
@@ -2107,79 +2438,37 @@ class OrchestratorService:
                                 _poll_warehouse(elapsed_seconds)
                             )
 
-                await self._pool.execute_query(
-                    f"""
-                    UPDATE {prefix}.WORKER_HEARTBEATS
-                    SET STATUS = 'DEAD',
-                        UPDATED_AT = CURRENT_TIMESTAMP()
-                    WHERE RUN_ID = ?
-                      AND STATUS NOT IN ('DEAD', 'COMPLETED')
-                      AND TIMESTAMPDIFF('second', LAST_HEARTBEAT, CURRENT_TIMESTAMP()) > 60
-                    """,
-                    params=[run_id],
-                )
+                # Consume completed worker health refresh first (if any).
+                if worker_health_task is not None and worker_health_task.done():
+                    try:
+                        _apply_worker_health_snapshot(worker_health_task.result())
+                    except Exception as exc:
+                        logger.debug(
+                            "Worker health refresh failed for %s: %s", run_id, exc
+                        )
+                    finally:
+                        worker_health_task = None
 
-                await self._pool.execute_query(
-                    f"""
-                    UPDATE {prefix}.WORKER_HEARTBEATS
-                    SET STATUS = 'STALE',
-                        UPDATED_AT = CURRENT_TIMESTAMP()
-                    WHERE RUN_ID = ?
-                      AND STATUS NOT IN ('STALE', 'DEAD', 'COMPLETED')
-                      AND TIMESTAMPDIFF('second', LAST_HEARTBEAT, CURRENT_TIMESTAMP()) > 30
-                    """,
-                    params=[run_id],
+                # Worker heartbeat maintenance is relatively expensive in Snowflake.
+                # During STARTING, run inline for prompt READY->RUNNING transition.
+                # During active phases, refresh asynchronously to avoid blocking the
+                # FIND_MAX control loop.
+                should_refresh_worker_health = (
+                    last_worker_health_poll_mono is None
+                    or now_mono - last_worker_health_poll_mono
+                    >= worker_health_poll_interval_seconds
+                    or status == "STARTING"
                 )
-
-                heartbeat_rows = await self._pool.execute_query(
-                    f"""
-                    SELECT
-                        COUNT(*) AS worker_count,
-                        SUM(
-                            CASE
-                                WHEN STATUS IN (
-                                    'STARTING', 'WAITING', 'RUNNING', 'DRAINING', 'STALE', 'READY', 'INITIALIZING'
-                                ) THEN 1
-                                ELSE 0
-                            END
-                        ) AS active_count,
-                        SUM(
-                            CASE
-                                WHEN STATUS IN ('COMPLETED', 'DEAD') THEN 1
-                                ELSE 0
-                            END
-                        ) AS completed_count,
-                        SUM(CASE WHEN STATUS = 'DEAD' THEN 1 ELSE 0 END) AS dead_count,
-                        SUM(CASE WHEN STATUS = 'READY' THEN 1 ELSE 0 END) AS ready_count,
-                        MAX(UPDATED_AT) AS last_update,
-                        MAX(COALESCE(CPU_PERCENT, 0)) AS max_cpu_percent,
-                        MAX(COALESCE(MEMORY_PERCENT, 0)) AS max_memory_percent
-                    FROM {prefix}.WORKER_HEARTBEATS
-                    WHERE RUN_ID = ?
-                    """,
-                    params=[run_id],
-                )
-
-                (
-                    workers_registered,
-                    workers_active,
-                    workers_completed,
-                    dead_workers,
-                    workers_ready,
-                    heartbeat_updated_at,
-                    max_cpu_seen,
-                    max_memory_seen,
-                ) = heartbeat_rows[0] if heartbeat_rows else (None,) * 8
-
-                workers_registered = int(workers_registered or 0)
-                workers_active = int(workers_active or 0)
-                workers_completed = int(workers_completed or 0)
-                dead_workers = int(dead_workers or 0)
-                workers_ready = int(workers_ready or 0)
-                max_cpu_seen = float(max_cpu_seen) if max_cpu_seen is not None else None
-                max_memory_seen = (
-                    float(max_memory_seen) if max_memory_seen is not None else None
-                )
+                if should_refresh_worker_health:
+                    last_worker_health_poll_mono = now_mono
+                    if status == "STARTING":
+                        _apply_worker_health_snapshot(
+                            await _refresh_worker_health_snapshot()
+                        )
+                    elif worker_health_task is None:
+                        worker_health_task = asyncio.create_task(
+                            _refresh_worker_health_snapshot()
+                        )
 
                 if status == "STARTING" and workers_ready >= worker_group_count:
                     logger.info(
@@ -2507,61 +2796,112 @@ class OrchestratorService:
                 aggregate_p99 = None
 
                 if phase == "MEASUREMENT":
-                    metrics_rows = await self._pool.execute_query(
-                        f"""
-                        WITH latest AS (
-                            SELECT
-                                *,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY WORKER_ID
-                                    ORDER BY TIMESTAMP DESC
-                                ) AS RN
-                            FROM {prefix}.WORKER_METRICS_SNAPSHOTS
-                            WHERE RUN_ID = ?
-                              AND PHASE = 'MEASUREMENT'
-                        )
-                        SELECT
-                            SUM(l.TOTAL_QUERIES) AS TOTAL_OPS,
-                            SUM(l.ERROR_COUNT) AS ERROR_COUNT,
-                            SUM(l.QPS) AS CURRENT_QPS,
-                            SUM(l.TARGET_CONNECTIONS) AS TARGET_CONNECTIONS,
-                            MAX(l.TIMESTAMP) AS LATEST_TS,
-                            AVG(IFF(l.TOTAL_QUERIES > 0, l.P50_LATENCY_MS, NULL))
-                                AS P50_LATENCY_MS,
-                            MAX(IFF(l.TOTAL_QUERIES > 0, l.P95_LATENCY_MS, NULL))
-                                AS P95_LATENCY_MS,
-                            MAX(IFF(l.TOTAL_QUERIES > 0, l.P99_LATENCY_MS, NULL))
-                                AS P99_LATENCY_MS
-                        FROM latest l
-                        LEFT JOIN {prefix}.WORKER_HEARTBEATS h
-                          ON h.RUN_ID = l.RUN_ID
-                         AND h.WORKER_ID = l.WORKER_ID
-                        WHERE l.RN = 1
-                          AND (h.STATUS IS NULL OR UPPER(h.STATUS) <> 'DEAD')
-                        """,
-                        params=[run_id],
+                    metrics_loaded_from_live = False
+                    live_snapshot = await live_metrics_cache.get_run_snapshot(
+                        run_id=run_id
                     )
-                    if metrics_rows:
-                        total_ops = int(metrics_rows[0][0] or 0)
-                        error_count = int(metrics_rows[0][1] or 0)
-                        current_qps = float(metrics_rows[0][2] or 0.0)
-                        target_connections_total = int(metrics_rows[0][3] or 0)
-                        latest_metrics_ts = metrics_rows[0][4]
+                    if live_snapshot and isinstance(live_snapshot.metrics, dict):
+                        live_metrics = live_snapshot.metrics
+                        ops_obj = (
+                            live_metrics.get("ops")
+                            if isinstance(live_metrics.get("ops"), dict)
+                            else {}
+                        )
+                        errors_obj = (
+                            live_metrics.get("errors")
+                            if isinstance(live_metrics.get("errors"), dict)
+                            else {}
+                        )
+                        connections_obj = (
+                            live_metrics.get("connections")
+                            if isinstance(live_metrics.get("connections"), dict)
+                            else {}
+                        )
+                        latency_obj = (
+                            live_metrics.get("latency")
+                            if isinstance(live_metrics.get("latency"), dict)
+                            else {}
+                        )
+                        total_ops = int(ops_obj.get("total") or 0)
+                        error_count = int(errors_obj.get("count") or 0)
+                        current_qps = float(ops_obj.get("current_per_sec") or 0.0)
+                        target_connections_total = int(
+                            connections_obj.get("target") or 0
+                        )
+                        latest_metrics_ts = live_snapshot.updated_at
                         aggregate_p50 = (
-                            float(metrics_rows[0][5])
-                            if metrics_rows[0][5] is not None
+                            float(latency_obj.get("p50"))
+                            if latency_obj.get("p50") is not None
                             else None
                         )
                         aggregate_p95 = (
-                            float(metrics_rows[0][6])
-                            if metrics_rows[0][6] is not None
+                            float(latency_obj.get("p95"))
+                            if latency_obj.get("p95") is not None
                             else None
                         )
                         aggregate_p99 = (
-                            float(metrics_rows[0][7])
-                            if metrics_rows[0][7] is not None
+                            float(latency_obj.get("p99"))
+                            if latency_obj.get("p99") is not None
                             else None
                         )
+                        metrics_loaded_from_live = True
+
+                    if not metrics_loaded_from_live:
+                        metrics_rows = await self._pool.execute_query(
+                            f"""
+                            WITH latest AS (
+                                SELECT
+                                    *,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY WORKER_ID
+                                        ORDER BY TIMESTAMP DESC
+                                    ) AS RN
+                                FROM {prefix}.WORKER_METRICS_SNAPSHOTS
+                                WHERE RUN_ID = ?
+                                  AND PHASE = 'MEASUREMENT'
+                            )
+                            SELECT
+                                SUM(l.TOTAL_QUERIES) AS TOTAL_OPS,
+                                SUM(l.ERROR_COUNT) AS ERROR_COUNT,
+                                SUM(l.QPS) AS CURRENT_QPS,
+                                SUM(l.TARGET_CONNECTIONS) AS TARGET_CONNECTIONS,
+                                MAX(l.TIMESTAMP) AS LATEST_TS,
+                                AVG(IFF(l.TOTAL_QUERIES > 0, l.P50_LATENCY_MS, NULL))
+                                    AS P50_LATENCY_MS,
+                                MAX(IFF(l.TOTAL_QUERIES > 0, l.P95_LATENCY_MS, NULL))
+                                    AS P95_LATENCY_MS,
+                                MAX(IFF(l.TOTAL_QUERIES > 0, l.P99_LATENCY_MS, NULL))
+                                    AS P99_LATENCY_MS
+                            FROM latest l
+                            LEFT JOIN {prefix}.WORKER_HEARTBEATS h
+                              ON h.RUN_ID = l.RUN_ID
+                             AND h.WORKER_ID = l.WORKER_ID
+                            WHERE l.RN = 1
+                              AND (h.STATUS IS NULL OR UPPER(h.STATUS) <> 'DEAD')
+                            """,
+                            params=[run_id],
+                        )
+                        if metrics_rows:
+                            total_ops = int(metrics_rows[0][0] or 0)
+                            error_count = int(metrics_rows[0][1] or 0)
+                            current_qps = float(metrics_rows[0][2] or 0.0)
+                            target_connections_total = int(metrics_rows[0][3] or 0)
+                            latest_metrics_ts = metrics_rows[0][4]
+                            aggregate_p50 = (
+                                float(metrics_rows[0][5])
+                                if metrics_rows[0][5] is not None
+                                else None
+                            )
+                            aggregate_p95 = (
+                                float(metrics_rows[0][6])
+                                if metrics_rows[0][6] is not None
+                                else None
+                            )
+                            aggregate_p99 = (
+                                float(metrics_rows[0][7])
+                                if metrics_rows[0][7] is not None
+                                else None
+                            )
 
                 if (
                     load_mode == "QPS"
@@ -2653,42 +2993,61 @@ class OrchestratorService:
                             min_total = int(min_threads_per_worker) * int(worker_group_count)
                         else:
                             # BOUNDED/AUTO: can scale workers too
-                            worker_cap = (
-                                int(max_workers)
-                                if max_workers is not None
-                                else int(worker_group_count) * 4  # Allow 4x growth
-                            )
+                            # If max_workers is unlimited, cap at 10k total threads divided by threads/worker
+                            MAX_TOTAL_THREADS_CAP = 10000
+                            if max_workers is not None:
+                                worker_cap = int(max_workers)
+                            elif effective_max_threads_per_worker:
+                                # e.g., 10000 / 200 = 50 workers max
+                                worker_cap = max(1, MAX_TOTAL_THREADS_CAP // int(effective_max_threads_per_worker))
+                            else:
+                                worker_cap = MAX_TOTAL_THREADS_CAP // 100  # 100 workers if no thread limit
                             max_total = (
                                 int(effective_max_threads_per_worker) * worker_cap
                                 if effective_max_threads_per_worker is not None
-                                else worker_cap * 100
+                                else min(MAX_TOTAL_THREADS_CAP, worker_cap * 100)
                             )
                             min_total = int(min_threads_per_worker) * int(min_workers)
                         
                         qps_controller_state = QPSControllerState(
                             target_qps=float(target_qps_total),
+                            starting_threads=float(starting_threads) if starting_threads else 0.0,
+                            max_thread_increase=float(max_thread_increase) if max_thread_increase else 15.0,
                             min_threads=min_total,
                             max_threads=max_total,
                         )
                         logger.info(
-                            "QPS controller initialized: target=%.1f qps, threads=[%d, %d]",
+                            "QPS controller initialized: target=%.1f qps, starting_threads=%.1f, max_thread_increase=%.1f, threads=[%d, %d]",
                             target_qps_total,
+                            starting_threads or 0.0,
+                            max_thread_increase or 15.0,
                             min_total,
                             max_total,
                         )
                     
-                    # Rate limit scaling decisions (minimum 2 seconds between adjustments)
-                    min_interval = 2.0
-                    can_scale = (
-                        last_qps_scaling_time is None
-                        or (loop_time - last_qps_scaling_time) >= min_interval
+                    # Rate limit scaling decisions (minimum 10 seconds between adjustments)
+                    # This allows the backend to absorb changes and stabilize before re-evaluation
+                    min_interval = 10.0
+                    can_evaluate = (
+                        last_qps_evaluation_time is None
+                        or (loop_time - last_qps_evaluation_time) >= min_interval
                     )
                     
-                    if can_scale:
+                    if can_evaluate:
+                        last_qps_evaluation_time = loop_time
+                        old_target = target_connections_total
+                        
                         decision = evaluate_qps_scaling(
                             state=qps_controller_state,
                             current_qps=float(current_qps),
                             current_threads=int(target_connections_total),
+                        )
+                        
+                        # Calculate QPS error percentage for UI
+                        # Negative = below target (need more QPS), Positive = above target
+                        qps_error_pct = (
+                            ((current_qps - target_qps_total) / target_qps_total * 100)
+                            if target_qps_total > 0 else 0.0
                         )
                         
                         if decision.should_scale and decision.new_target > 0:
@@ -2701,6 +3060,7 @@ class OrchestratorService:
                             
                             qps_controller_step_number += 1
                             step_id = str(uuid.uuid4())
+                            step_time = datetime.now(UTC)
                             
                             logger.info(
                                 "QPS scaling: %s from %d to %d threads (qps=%.1f, target=%.1f, reason=%s)",
@@ -2718,8 +3078,60 @@ class OrchestratorService:
                                 step_number=qps_controller_step_number,
                                 reason=f"qps_scaling_{direction}",
                             )
+                            
+                            # Record step in history
+                            step_entry = {
+                                "step": qps_controller_step_number,
+                                "from_threads": old_target,
+                                "to_threads": effective_new,
+                                "direction": direction,
+                                "current_qps": current_qps,
+                                "target_qps": target_qps_total,
+                                "qps_error_pct": qps_error_pct,
+                                "reason": decision.reason,
+                                "timestamp": step_time.isoformat(),
+                            }
+                            qps_controller_step_history.append(step_entry)
+                            
+                            # Persist step to database
+                            await _insert_controller_step_history(
+                                step_id=step_id,
+                                step_number=qps_controller_step_number,
+                                step_type="QPS_SCALING",
+                                target_workers=effective_new,
+                                step_start_time=step_time,
+                                from_threads=old_target,
+                                to_threads=effective_new,
+                                direction=direction,
+                                qps=current_qps,
+                                target_qps=target_qps_total,
+                                qps_error_pct=qps_error_pct,
+                                outcome=decision.reason,
+                            )
+                            
                             target_connections_total = effective_new
                             last_qps_scaling_time = loop_time
+                        
+                        # Persist live QPS controller state for UI (every evaluation)
+                        # Use time.time() for epoch timestamps (loop_time is monotonic, not epoch)
+                        now_epoch_ms = int(time.time() * 1000)
+                        next_eval_epoch_ms = now_epoch_ms + int(min_interval * 1000)
+                        qps_live_state = {
+                            "mode": "QPS",
+                            "status": "RUNNING",
+                            "target_qps": target_qps_total,
+                            "current_qps": current_qps,
+                            "current_threads": target_connections_total,
+                            "min_threads": qps_controller_state.min_threads,
+                            "max_threads": qps_controller_state.max_threads,
+                            "last_evaluation_epoch_ms": now_epoch_ms,
+                            "next_evaluation_epoch_ms": next_eval_epoch_ms,
+                            "evaluation_interval_seconds": min_interval,
+                            "last_scaling_step": qps_controller_step_number,
+                            "qps_error_pct": qps_error_pct,
+                            "step_history": qps_controller_step_history[-10:],  # Last 10 steps
+                        }
+                        await _persist_qps_controller_state(qps_live_state)
 
                 if (
                     find_max_enabled
@@ -2745,9 +3157,10 @@ class OrchestratorService:
                                     effective_min,
                                 )
 
-                            find_max_step_started_at = now
+                            # Use fresh timestamp for step start (not stale 'now' from loop start)
+                            find_max_step_started_at = datetime.now(UTC)
                             find_max_step_started_epoch_ms = int(
-                                datetime.now(UTC).timestamp() * 1000
+                                find_max_step_started_at.timestamp() * 1000
                             )
                             find_max_step_end_epoch_ms = (
                                 int(
@@ -2759,6 +3172,38 @@ class OrchestratorService:
                             )
                             find_max_step_start_ops = total_ops
                             find_max_step_start_errors = error_count
+
+                            # Persist countdown immediately so frontend shows timer during worker spawn
+                            early_state = {
+                                "mode": "FIND_MAX_CONCURRENCY",
+                                "status": "STEP_STARTING",
+                                "current_step": int(find_max_step_number),
+                                "current_concurrency": int(find_max_step_target),
+                                "target_workers": int(find_max_step_target),
+                                "active_worker_count": int(workers_active),
+                                "next_planned_concurrency": int(
+                                    min(
+                                        max_concurrency,
+                                        int(find_max_step_target) + int(find_max_increment),
+                                    )
+                                ),
+                                "step_duration_seconds": int(find_max_step_seconds),
+                                "step_started_at_epoch_ms": find_max_step_started_epoch_ms,
+                                "step_end_at_epoch_ms": find_max_step_end_epoch_ms,
+                                "start_concurrency": int(find_max_start),
+                                "concurrency_increment": int(find_max_increment),
+                                "max_concurrency": int(max_concurrency),
+                                "best_concurrency": int(find_max_best_concurrency),
+                                "best_qps": float(find_max_best_qps),
+                                "last_updated": datetime.now(UTC).isoformat(),
+                            }
+                            logger.info(
+                                "FIND_MAX step %d: persisting early_state with step_end_at_epoch_ms=%s",
+                                find_max_step_number,
+                                find_max_step_end_epoch_ms,
+                            )
+                            await _persist_find_max_state(early_state)
+                            last_find_max_running_state_persist_mono = now_mono
 
                             await _ensure_workers_for_target(find_max_step_target)
 
@@ -2772,10 +3217,16 @@ class OrchestratorService:
                             # It should only be updated AFTER the step completes as stable
                             # (handled in the step completion logic below).
 
+                        # Use a fresh wall-clock timestamp here instead of the loop-level
+                        # `now` captured earlier in the iteration. The loop body can take
+                        # several seconds (DB writes, worker target updates), and using a
+                        # stale timestamp causes step completion to lag behind the UI timer.
+                        step_eval_now = datetime.now(UTC)
                         step_elapsed = 0.0
                         if find_max_step_started_at is not None:
                             step_elapsed = max(
-                                0.0, (now - find_max_step_started_at).total_seconds()
+                                0.0,
+                                (step_eval_now - find_max_step_started_at).total_seconds(),
                             )
                         step_ops = max(0, total_ops - find_max_step_start_ops)
                         step_errors = max(0, error_count - find_max_step_start_errors)
@@ -2806,15 +3257,40 @@ class OrchestratorService:
                                 / find_max_baseline_p95
                             ) * 100.0
 
-                        warehouse_snapshot = (
-                            await results_store.fetch_latest_warehouse_poll_snapshot(
-                                run_id=run_id
+                        # Re-evaluate elapsed time before any additional awaited I/O.
+                        # This keeps step boundaries tight even when per-iteration DB
+                        # operations are slow.
+                        step_completion_now = datetime.now(UTC)
+                        step_elapsed_for_completion = step_elapsed
+                        if find_max_step_started_at is not None:
+                            step_elapsed_for_completion = max(
+                                0.0,
+                                (
+                                    step_completion_now - find_max_step_started_at
+                                ).total_seconds(),
                             )
+                        step_reached_end = (
+                            step_elapsed_for_completion >= float(find_max_step_seconds)
                         )
-                        queue_detected = bool(
-                            warehouse_snapshot
-                            and (warehouse_snapshot.get("queued") or 0) > 0
-                        )
+                        if step_reached_end:
+                            # Use completion-time values for history + transition timestamps.
+                            step_elapsed = step_elapsed_for_completion
+                            step_eval_now = step_completion_now
+
+                        # Queue detection is only relevant for runs that have a warehouse.
+                        # Postgres runs have no warehouse and should avoid this extra query.
+                        warehouse_snapshot = None
+                        queue_detected = False
+                        if warehouse_name:
+                            warehouse_snapshot = (
+                                await results_store.fetch_latest_warehouse_poll_snapshot(
+                                    run_id=run_id
+                                )
+                            )
+                            queue_detected = bool(
+                                warehouse_snapshot
+                                and (warehouse_snapshot.get("queued") or 0) > 0
+                            )
 
                         state = {
                             "mode": "FIND_MAX_CONCURRENCY",
@@ -2858,9 +3334,49 @@ class OrchestratorService:
                             "last_updated": datetime.now(UTC).isoformat(),
                         }
 
-                        await _persist_find_max_state(state)
+                        if not step_reached_end:
+                            should_persist_running_state = (
+                                last_find_max_running_state_persist_mono is None
+                                or now_mono - last_find_max_running_state_persist_mono
+                                >= find_max_running_state_persist_interval_seconds
+                            )
+                            if should_persist_running_state:
+                                await _persist_find_max_state(state)
+                                last_find_max_running_state_persist_mono = now_mono
 
-                        if step_elapsed >= float(find_max_step_seconds):
+                            # DEBUG: Log step progress periodically
+                            if find_max_step_number >= 1 and int(step_elapsed) % 10 == 0 and step_elapsed > 0:
+                                logger.info(
+                                    "FIND_MAX step %d progress: elapsed=%.1fs, required=%.1fs, remaining=%.1fs",
+                                    find_max_step_number, step_elapsed, float(find_max_step_seconds),
+                                    max(0, float(find_max_step_seconds) - step_elapsed)
+                                )
+
+                        if step_reached_end:
+                            # Immediately persist "transitioning" state so frontend countdown
+                            # doesn't show 0 for several seconds during history insert
+                            transitioning_state = {
+                                "mode": "FIND_MAX_CONCURRENCY",
+                                "status": "TRANSITIONING",
+                                "current_step": int(find_max_step_number),
+                                "current_concurrency": int(find_max_step_target),
+                                "target_workers": int(find_max_step_target),
+                                "step_duration_seconds": int(find_max_step_seconds),
+                                # Set the end time to "now + 1.5s" as a placeholder
+                                # This will be replaced by the real next step's end time shortly
+                                "step_end_at_epoch_ms": int(
+                                    step_eval_now.timestamp() * 1000
+                                )
+                                + 1500,
+                                "start_concurrency": int(find_max_start),
+                                "concurrency_increment": int(find_max_increment),
+                                "max_concurrency": int(max_concurrency),
+                                "best_concurrency": int(find_max_best_concurrency),
+                                "best_qps": float(find_max_best_qps),
+                                "last_updated": datetime.now(UTC).isoformat(),
+                            }
+                            await _persist_find_max_state(transitioning_state)
+
                             stable = True
                             stop_reason = None
                             outcome = "STABLE"
@@ -2936,41 +3452,37 @@ class OrchestratorService:
                             }
                             find_max_step_history.append(step_entry)
 
-                            await _insert_find_max_step_history(
-                                step_id=str(find_max_step_id or uuid.uuid4()),
-                                step_number=int(find_max_step_number),
-                                target_workers=int(find_max_step_target),
-                                step_start_time=find_max_step_started_at or now,
-                                step_end_time=now,
-                                step_duration_seconds=float(step_elapsed),
-                                total_queries=int(step_ops),
-                                qps=float(step_qps),
-                                p50_latency_ms=aggregate_p50,
-                                p95_latency_ms=aggregate_p95,
-                                p99_latency_ms=aggregate_p99,
-                                error_count=int(step_errors),
-                                error_rate=float(step_error_rate),
-                                qps_vs_prior_pct=qps_vs_prior_pct,
-                                p95_vs_baseline_pct=p95_vs_baseline_pct,
-                                queue_detected=bool(queue_detected),
-                                outcome=str(outcome),
-                                stop_reason=stop_reason,
+                            logger.info(
+                                "FIND_MAX step %d complete: inserting history (outcome=%s, stable=%s)",
+                                find_max_step_number, outcome, stable
                             )
 
-                            state.update(
-                                {
-                                    "status": "STEP_COMPLETE",
-                                    "stable": bool(stable),
-                                    "stop_reason": stop_reason,
-                                    "step_history": list(find_max_step_history),
-                                    "baseline_p95_latency_ms": find_max_baseline_p95,
-                                    "baseline_p99_latency_ms": find_max_baseline_p99,
-                                    "best_concurrency": int(find_max_best_concurrency),
-                                    "best_qps": float(find_max_best_qps),
-                                    "last_updated": datetime.now(UTC).isoformat(),
-                                }
+                            history_task = asyncio.create_task(
+                                _insert_find_max_step_history(
+                                    step_id=str(find_max_step_id or uuid.uuid4()),
+                                    step_number=int(find_max_step_number),
+                                    target_workers=int(find_max_step_target),
+                                    step_start_time=find_max_step_started_at
+                                    or step_eval_now,
+                                    step_end_time=step_eval_now,
+                                    step_duration_seconds=float(step_elapsed),
+                                    total_queries=int(step_ops),
+                                    qps=float(step_qps),
+                                    p50_latency_ms=aggregate_p50,
+                                    p95_latency_ms=aggregate_p95,
+                                    p99_latency_ms=aggregate_p99,
+                                    error_count=int(step_errors),
+                                    error_rate=float(step_error_rate),
+                                    qps_vs_prior_pct=qps_vs_prior_pct,
+                                    p95_vs_baseline_pct=p95_vs_baseline_pct,
+                                    queue_detected=bool(queue_detected),
+                                    outcome=str(outcome),
+                                    stop_reason=stop_reason,
+                                )
                             )
-                            await _persist_find_max_state(state)
+                            _track_find_max_history_task(
+                                history_task, step_number=int(find_max_step_number)
+                            )
 
                             # Helper to setup next step
                             async def _setup_next_step(
@@ -2981,15 +3493,17 @@ class OrchestratorService:
                                 nonlocal find_max_step_started_epoch_ms, find_max_step_end_epoch_ms
                                 nonlocal find_max_step_start_ops, find_max_step_start_errors
                                 nonlocal find_max_prev_step_qps, find_max_is_backoff_step
+                                nonlocal last_find_max_running_state_persist_mono
 
                                 find_max_is_backoff_step = is_backoff
                                 find_max_prev_step_qps = float(step_qps)
                                 find_max_step_number += 1
                                 find_max_step_id = str(uuid.uuid4())
                                 find_max_step_target = next_target
+                                # Use single timestamp for consistency
                                 find_max_step_started_at = datetime.now(UTC)
                                 find_max_step_started_epoch_ms = int(
-                                    datetime.now(UTC).timestamp() * 1000
+                                    find_max_step_started_at.timestamp() * 1000
                                 )
                                 find_max_step_end_epoch_ms = (
                                     int(
@@ -3001,6 +3515,42 @@ class OrchestratorService:
                                 )
                                 find_max_step_start_ops = total_ops
                                 find_max_step_start_errors = error_count
+
+                                # Persist countdown immediately so frontend shows timer during worker spawn
+                                early_state = {
+                                    "mode": "FIND_MAX_CONCURRENCY",
+                                    "status": "STEP_STARTING",
+                                    "current_step": int(find_max_step_number),
+                                    "current_concurrency": int(find_max_step_target),
+                                    "target_workers": int(find_max_step_target),
+                                    "active_worker_count": int(workers_active),
+                                    "next_planned_concurrency": int(
+                                        min(
+                                            max_concurrency,
+                                            int(find_max_step_target)
+                                            + int(find_max_increment),
+                                        )
+                                    ),
+                                    "step_duration_seconds": int(find_max_step_seconds),
+                                    "step_started_at_epoch_ms": find_max_step_started_epoch_ms,
+                                    "step_end_at_epoch_ms": find_max_step_end_epoch_ms,
+                                    "start_concurrency": int(find_max_start),
+                                    "concurrency_increment": int(find_max_increment),
+                                    "max_concurrency": int(max_concurrency),
+                                    "best_concurrency": int(find_max_best_concurrency),
+                                    "best_qps": float(find_max_best_qps),
+                                    "is_backoff": bool(is_backoff),
+                                    "last_updated": datetime.now(UTC).isoformat(),
+                                }
+                                logger.info(
+                                    "FIND_MAX step %d (next): persisting early_state with step_end_at_epoch_ms=%s",
+                                    find_max_step_number,
+                                    find_max_step_end_epoch_ms,
+                                )
+                                await _persist_find_max_state(early_state)
+                                last_find_max_running_state_persist_mono = (
+                                    asyncio.get_running_loop().time()
+                                )
 
                                 await _ensure_workers_for_target(find_max_step_target)
 
@@ -3179,8 +3729,8 @@ class OrchestratorService:
                                 await _persist_find_max_result(final_state)
                                 await _mark_run_completed()
                     except Exception as exc:
-                        logger.debug(
-                            "Find Max controller error for run %s: %s", run_id, exc
+                        logger.error(
+                            "Find Max controller error for run %s: %s", run_id, exc, exc_info=True
                         )
 
                 should_rollup = False
@@ -3189,7 +3739,18 @@ class OrchestratorService:
                 if heartbeat_updated_at != last_heartbeat_update:
                     should_rollup = True
 
+                should_write_run_status_rollup = False
                 if should_rollup:
+                    if status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                        should_write_run_status_rollup = True
+                    elif (
+                        last_run_status_rollup_mono is None
+                        or now_mono - last_run_status_rollup_mono
+                        >= run_status_rollup_interval_active_seconds
+                    ):
+                        should_write_run_status_rollup = True
+
+                if should_write_run_status_rollup:
                     await self._pool.execute_query(
                         f"""
                         UPDATE {prefix}.RUN_STATUS
@@ -3214,22 +3775,46 @@ class OrchestratorService:
                     )
                     last_metrics_ts = latest_metrics_ts
                     last_heartbeat_update = heartbeat_updated_at
+                    last_run_status_rollup_mono = now_mono
 
-                if should_rollup or (
-                    status in {"COMPLETED", "FAILED", "CANCELLED"}
-                    and status != last_parent_rollup_status
-                ):
-                    try:
-                        await results_store.update_parent_run_aggregate(
-                            parent_run_id=run_id
-                        )
-                        last_parent_rollup_status = status
-                    except Exception as exc:
-                        logger.debug(
-                            "Failed to update parent rollup for %s: %s",
-                            run_id,
-                            exc,
-                        )
+                is_terminal_status = status in {"COMPLETED", "FAILED", "CANCELLED"}
+                should_update_parent_rollup = False
+                if should_rollup and not is_terminal_status:
+                    if (
+                        last_parent_rollup_mono is None
+                        or now_mono - last_parent_rollup_mono
+                        >= parent_rollup_interval_active_seconds
+                    ):
+                        should_update_parent_rollup = True
+                if is_terminal_status and status != last_parent_rollup_status:
+                    should_update_parent_rollup = True
+
+                if should_update_parent_rollup:
+                    if is_terminal_status:
+                        # For terminal states, await so final aggregates are durable.
+                        try:
+                            await results_store.update_parent_run_aggregate(
+                                parent_run_id=run_id
+                            )
+                            last_parent_rollup_status = status
+                            last_parent_rollup_mono = now_mono
+                        except Exception as exc:
+                            logger.debug(
+                                "Failed to update parent rollup for %s: %s",
+                                run_id,
+                                exc,
+                            )
+                    else:
+                        # During active runs, do this asynchronously to avoid blocking
+                        # the control loop and delaying FIND_MAX step transitions.
+                        if parent_rollup_task is None:
+                            parent_rollup_task = asyncio.create_task(
+                                results_store.update_parent_run_aggregate(
+                                    parent_run_id=run_id
+                                )
+                            )
+                            _track_parent_rollup_task(parent_rollup_task)
+                            last_parent_rollup_mono = now_mono
 
                 # Check if all worker processes have exited
                 if ctx.worker_procs:
@@ -3258,6 +3843,23 @@ class OrchestratorService:
                     and not ctx.worker_procs
                 ):
                     break
+
+                loop_cycle_elapsed = (
+                    asyncio.get_running_loop().time() - loop_cycle_started_mono
+                )
+                if (
+                    find_max_enabled
+                    and status == "RUNNING"
+                    and phase == "MEASUREMENT"
+                    and loop_cycle_elapsed > 2.0
+                ):
+                    logger.info(
+                        "FIND_MAX poll loop slow iteration for %s: %.2fs (should_rollup=%s, parent_rollup_task=%s)",
+                        run_id,
+                        loop_cycle_elapsed,
+                        should_rollup,
+                        "active" if parent_rollup_task is not None else "idle",
+                    )
 
         except asyncio.CancelledError:
             logger.info("Poll loop cancelled for run %s", run_id)
@@ -3299,6 +3901,39 @@ class OrchestratorService:
                 logger.error(
                     "Failed to finalize run %s status: %s", run_id, finalize_err
                 )
+
+            # Ensure background parent rollup task does not outlive the run.
+            if parent_rollup_task and not parent_rollup_task.done():
+                parent_rollup_task.cancel()
+                try:
+                    await parent_rollup_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            if worker_health_task and not worker_health_task.done():
+                worker_health_task.cancel()
+                try:
+                    await worker_health_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            if find_max_history_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *list(find_max_history_tasks), return_exceptions=True
+                        ),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timed out waiting for FIND_MAX history tasks for run %s",
+                        run_id,
+                    )
 
             # If we resumed an Interactive/Hybrid warehouse, suspend it to save costs
             ctx = self._active_runs.get(run_id)
@@ -3350,6 +3985,7 @@ class OrchestratorService:
             # Clean up active runs dictionary
             if run_id in self._active_runs:
                 del self._active_runs[run_id]
+            await live_controller_state.clear_run(run_id=run_id)
             logger.info("Poll loop ended for run %s", run_id)
 
     async def stop_run(self, run_id: str) -> None:

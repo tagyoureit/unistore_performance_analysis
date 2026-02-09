@@ -5,7 +5,7 @@ This powers the Configure UI dropdowns so users select from *existing* objects.
 
 Supported backends:
 - Snowflake (standard/hybrid/interactive tables): list databases, schemas, tables, and views
-- Postgres family (POSTGRES / SNOWFLAKE_POSTGRES): list databases, schemas, tables, and views
+- Postgres: list databases, schemas, tables, and views
 
 Notes:
 - For Postgres-family connections, we dynamically query available databases by connecting to the
@@ -18,16 +18,61 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+import ssl
+from typing import Any, Optional
 
+import asyncpg
 from fastapi import APIRouter, HTTPException, Query, status
 
 from backend.api.error_handling import http_exception
 from backend.connectors import postgres_pool, snowflake_pool
+from backend.core import connection_manager
 from backend.models.test_config import TableType
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+async def _postgres_fetch(
+    connection_id: str,
+    database: str,
+    query: str,
+    *args,
+    timeout: float = 30.0,
+) -> list[asyncpg.Record]:
+    """
+    Execute a query against a specific Postgres database using connection credentials.
+    
+    This connects directly to Postgres (not PgBouncer) for catalog operations.
+    Uses SSL for Snowflake Postgres instances.
+    """
+    conn_params = await connection_manager.get_connection_for_pool(connection_id)
+    if not conn_params:
+        raise ValueError(f"Connection not found: {connection_id}")
+    
+    if conn_params.get("connection_type") != "POSTGRES":
+        raise ValueError(f"Connection {connection_id} is not a Postgres connection")
+    
+    # Create SSL context that doesn't verify certificates (Snowflake Postgres uses self-signed)
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    conn = None
+    try:
+        conn = await asyncpg.connect(
+            host=conn_params["host"],
+            port=conn_params["port"],  # Direct port, not PgBouncer
+            database=database,
+            user=conn_params["user"],
+            password=conn_params["password"],
+            timeout=timeout,
+            ssl=ssl_context,
+        )
+        return await conn.fetch(query, *args, timeout=timeout)
+    finally:
+        if conn:
+            await conn.close()
 
 _IDENT_RE = re.compile(r"^[A-Z0-9_]+$")
 
@@ -61,27 +106,23 @@ def _table_type(value: Any) -> TableType:
 
 
 def _is_postgres_family(t: TableType) -> bool:
-    return t in (
-        TableType.POSTGRES,
-        TableType.SNOWFLAKE_POSTGRES,
-    )
+    return t == TableType.POSTGRES
 
 
 def _get_postgres_pool(table_type: TableType):
-    if table_type == TableType.SNOWFLAKE_POSTGRES:
-        return postgres_pool.get_snowflake_postgres_pool()
     return postgres_pool.get_default_pool()
 
 
 def _postgres_pool_type(table_type: TableType) -> str:
     """Return pool_type string for fetch_from_database()."""
-    if table_type == TableType.SNOWFLAKE_POSTGRES:
-        return "snowflake_postgres"
     return "default"
 
 
 @router.get("/databases", response_model=list[dict[str, Any]])
-async def list_databases(table_type: str = Query("standard")):
+async def list_databases(
+    table_type: str = Query("standard"),
+    connection_id: Optional[str] = Query(None),
+):
     """
     List available databases.
 
@@ -91,11 +132,16 @@ async def list_databases(table_type: str = Query("standard")):
 
     t = _table_type(table_type)
     if _is_postgres_family(t):
-        pool_type = _postgres_pool_type(t)
+        if not connection_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="connection_id is required for Postgres"
+            )
         try:
             # Connect to 'postgres' database (always exists) to list available databases
             # Catalog operations use direct PostgreSQL (port 5432), not PgBouncer
-            rows = await postgres_pool.fetch_from_database(
+            rows = await _postgres_fetch(
+                connection_id=connection_id,
                 database="postgres",
                 query="""
                     SELECT datname
@@ -104,8 +150,6 @@ async def list_databases(table_type: str = Query("standard")):
                       AND datallowconn = true
                     ORDER BY datname
                 """,
-                pool_type=pool_type,
-                use_pgbouncer=False,
             )
             # Preserve original case for Postgres (it's case-sensitive)
             return [{"name": str(r["datname"]), "type": "DATABASE"} for r in rows]
@@ -135,12 +179,13 @@ async def list_databases(table_type: str = Query("standard")):
 async def list_schemas(
     table_type: str = Query("standard"),
     database: str | None = Query(None),
+    connection_id: Optional[str] = Query(None),
 ):
     """
     List schemas in a database.
 
     - Snowflake: requires database, lists schemas in that database.
-    - Postgres-family: requires database, connects to that database to list schemas.
+    - Postgres-family: requires database and connection_id, connects to that database to list schemas.
     """
 
     t = _table_type(table_type)
@@ -151,17 +196,20 @@ async def list_schemas(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Missing database parameter",
             )
-        pool_type = _postgres_pool_type(t)
+        if not connection_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="connection_id is required for Postgres"
+            )
         try:
-            rows = await postgres_pool.fetch_from_database(
+            rows = await _postgres_fetch(
+                connection_id=connection_id,
                 database=db_name,
                 query="""
                     SELECT schema_name
                     FROM information_schema.schemata
                     ORDER BY schema_name
                 """,
-                pool_type=pool_type,
-                use_pgbouncer=False,
             )
             return [{"name": str(r["schema_name"]), "type": "SCHEMA"} for r in rows]
         except Exception as e:
@@ -219,6 +267,7 @@ async def list_objects(
     database: str | None = Query(None),
     schema: str | None = Query(None),
     filter_type: str | None = Query(None),
+    connection_id: Optional[str] = Query(None),
 ):
     """
     List tables (and optionally views) in a schema.
@@ -262,14 +311,19 @@ async def list_objects(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Missing schema"
             )
+        if not connection_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="connection_id is required for Postgres"
+            )
 
-        pool_type = _postgres_pool_type(t)
         try:
             out: list[dict[str, Any]] = []
 
             # Tables (detected_type is TABLE for Postgres)
             if _matches_filter("TABLE", filter_type):
-                table_rows = await postgres_pool.fetch_from_database(
+                table_rows = await _postgres_fetch(
+                    connection_id,
                     db_name,
                     """
                         SELECT table_name
@@ -279,8 +333,6 @@ async def list_objects(
                         ORDER BY table_name
                     """,
                     schema_name,
-                    pool_type=pool_type,
-                    use_pgbouncer=False,
                 )
                 out.extend(
                     {
@@ -293,7 +345,8 @@ async def list_objects(
 
             # Views (only if applicable for this table type)
             if include_views and _matches_filter("VIEW", filter_type):
-                view_rows = await postgres_pool.fetch_from_database(
+                view_rows = await _postgres_fetch(
+                    connection_id,
                     db_name,
                     """
                         SELECT table_name
@@ -302,8 +355,6 @@ async def list_objects(
                         ORDER BY table_name
                     """,
                     schema_name,
-                    pool_type=pool_type,
-                    use_pgbouncer=False,
                 )
                 out.extend(
                     {
@@ -462,8 +513,9 @@ async def list_objects(
 
 @router.get("/postgres/capabilities")
 async def get_postgres_capabilities(
-    table_type: str = Query(..., description="POSTGRES or SNOWFLAKE_POSTGRES"),
+    table_type: str = Query(..., description="POSTGRES"),
     database: str = Query(..., description="Target database name"),
+    connection_id: Optional[str] = Query(None, description="Connection ID for Postgres"),
 ) -> dict[str, Any]:
     """
     Check PostgreSQL server capabilities for pg_stat_statements enrichment.
@@ -481,26 +533,46 @@ async def get_postgres_capabilities(
     from backend.core.postgres_stats import get_capability_warnings, get_pg_capabilities
 
     table_type_upper = table_type.strip().upper()
-    if table_type_upper not in {"POSTGRES", "SNOWFLAKE_POSTGRES"}:
+    if table_type_upper != "POSTGRES":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid table_type: {table_type}. Must be POSTGRES or SNOWFLAKE_POSTGRES.",
+            detail=f"Invalid table_type: {table_type}. Must be POSTGRES.",
         )
 
-    pool_type = "snowflake_postgres" if table_type_upper == "SNOWFLAKE_POSTGRES" else "default"
-    # Catalog operations use direct PostgreSQL (port 5432), not PgBouncer
-    # PgBouncer is only for benchmark workloads where connection pooling helps
-    params = postgres_pool.get_postgres_connection_params(pool_type, use_pgbouncer=False)
+    if not connection_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="connection_id is required for Postgres"
+        )
+
+    conn_params = await connection_manager.get_connection_for_pool(connection_id)
+    if not conn_params:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Connection not found: {connection_id}"
+        )
+    
+    if conn_params.get("connection_type") != "POSTGRES":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Connection {connection_id} is not a Postgres connection"
+        )
+
+    # Create SSL context that doesn't verify certificates (Snowflake Postgres uses self-signed)
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
 
     conn = None
     try:
         conn = await asyncpg.connect(
-            host=params["host"],
-            port=params["port"],
+            host=conn_params["host"],
+            port=conn_params["port"],  # Direct port, not PgBouncer
             database=database,
-            user=params["user"],
-            password=params["password"],
+            user=conn_params["user"],
+            password=conn_params["password"],
             timeout=10.0,
+            ssl=ssl_context,
         )
 
         capabilities = await get_pg_capabilities(conn)

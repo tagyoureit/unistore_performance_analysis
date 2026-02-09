@@ -6,13 +6,16 @@ Manages templates stored in Snowflake TEST_TEMPLATES table.
 
 from datetime import UTC, datetime
 import logging
+import ssl
 from uuid import uuid4
 from typing import List, Dict, Any, Optional
 
+import asyncpg
 from fastapi import APIRouter, HTTPException, status
 
 from backend.config import settings
 from backend.connectors import postgres_pool, snowflake_pool
+from backend.core import connection_manager
 from backend.api.error_handling import http_exception
 from backend.core.table_profiler import profile_snowflake_table
 
@@ -22,7 +25,6 @@ from backend.api.routes.templates_modules.constants import (
     _CUSTOM_PCT_FIELDS,
     _DEFAULT_CUSTOM_QUERIES_SNOWFLAKE,
     _DEFAULT_CUSTOM_QUERIES_POSTGRES,
-    _PRESET_PCTS,
 )
 from backend.api.routes.templates_modules.utils import (
     _upper_str,
@@ -155,10 +157,36 @@ async def _ai_adjust_sql_postgres(sf_pool, cfg: dict[str, Any]) -> AiAdjustSqlRe
         )
 
     table_type = _upper_str(cfg.get("table_type") or "")
-    pool_type = (
-        "snowflake_postgres" if table_type == "SNOWFLAKE_POSTGRES" else "default"
-    )
-    pg_pool = postgres_pool.get_pool_for_database(db, pool_type=pool_type)
+    connection_id = cfg.get("connection_id")
+    
+    # Create pool using stored connection credentials if available
+    if connection_id:
+        conn_params = await connection_manager.get_connection_for_pool(connection_id)
+        if not conn_params:
+            raise ValueError(f"Connection not found: {connection_id}")
+        if conn_params.get("connection_type") != "POSTGRES":
+            raise ValueError(f"Connection {connection_id} is not a Postgres connection")
+        
+        # Create SSL context for Snowflake Postgres (self-signed certs)
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        pg_pool = postgres_pool.PostgresConnectionPool(
+            host=conn_params["host"],
+            port=conn_params["port"],
+            database=db,
+            user=conn_params["user"],
+            password=conn_params["password"],
+            min_size=1,
+            max_size=2,
+            pool_name="ai_adjust_sql",
+            ssl=ssl_context,
+        )
+    else:
+        # Fallback to environment variables (backward compat)
+        pg_pool = postgres_pool.get_pool_for_database(db)
+    
     full_name = _pg_qualified_name(schema, table)
 
     concurrency = int(cfg.get("concurrent_connections") or 1)
@@ -1521,69 +1549,89 @@ async def _check_pgbouncer_requirements(config: dict) -> None:
         return
 
     table_type = str(config.get("table_type", "")).upper()
-    if table_type not in ("POSTGRES", "SNOWFLAKE_POSTGRES"):
+    if table_type != "POSTGRES":
         return
 
     database = config.get("database", "")
-    if not database:
+    connection_id = config.get("connection_id", "")
+    if not database or not connection_id:
         return
 
-    pool_type = "snowflake_postgres" if table_type == "SNOWFLAKE_POSTGRES" else "default"
-
     try:
-        # Check if snowflake_pooler extension is installed
-        rows = await postgres_pool.fetch_from_database(
+        # Get connection credentials
+        conn_params = await connection_manager.get_connection_for_pool(connection_id)
+        if not conn_params:
+            raise ValueError(f"Connection not found: {connection_id}")
+        
+        if conn_params.get("connection_type") != "POSTGRES":
+            raise ValueError(f"Connection {connection_id} is not a Postgres connection")
+        
+        # Create SSL context for Snowflake Postgres
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Connect using direct port (not PgBouncer) to check extension
+        conn = await asyncpg.connect(
+            host=conn_params["host"],
+            port=conn_params["port"],  # Direct port, not PgBouncer
             database=database,
-            query="SELECT extname FROM pg_extension WHERE extname = 'snowflake_pooler'",
-            pool_type=pool_type,
-            use_pgbouncer=False,  # Must use direct connection to check
+            user=conn_params["user"],
+            password=conn_params["password"],
+            timeout=15,
+            ssl=ssl_context,
         )
-
-        if not rows:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "pgbouncer_extension_missing",
-                    "database": database,
-                    "message": (
-                        f"PgBouncer requires the 'snowflake_pooler' extension in database '{database}'. "
-                        f"Connect as snowflake_admin and run: CREATE EXTENSION snowflake_pooler;"
-                    ),
-                    "docs_url": "https://docs.snowflake.com/en/user-guide/snowflake-postgres/postgres-connection-pooling",
-                },
+        
+        try:
+            # Check if snowflake_pooler extension is installed
+            rows = await conn.fetch(
+                "SELECT extname FROM pg_extension WHERE extname = 'snowflake_pooler'"
             )
 
-        # Check if current user is a superuser or has replication privilege
-        # PgBouncer does not allow connections from either type
-        role_rows = await postgres_pool.fetch_from_database(
-            database=database,
-            query="SELECT rolsuper, rolreplication FROM pg_roles WHERE rolname = current_user",
-            pool_type=pool_type,
-            use_pgbouncer=False,
-        )
-
-        if role_rows:
-            is_superuser = role_rows[0][0]
-            has_replication = role_rows[0][1]
-            if is_superuser or has_replication:
-                reasons = []
-                if is_superuser:
-                    reasons.append("superuser")
-                if has_replication:
-                    reasons.append("replication")
+            if not rows:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail={
-                        "error": "pgbouncer_privileged_user_not_allowed",
+                        "error": "pgbouncer_extension_missing",
+                        "database": database,
                         "message": (
-                            f"PgBouncer does not allow connections from users with "
-                            f"{' or '.join(reasons)} privileges. "
-                            f"Create a non-privileged application role to use PgBouncer, "
-                            f"or disable the PgBouncer option."
+                            f"PgBouncer requires the 'snowflake_pooler' extension in database '{database}'. "
+                            f"Connect as snowflake_admin and run: CREATE EXTENSION snowflake_pooler;"
                         ),
                         "docs_url": "https://docs.snowflake.com/en/user-guide/snowflake-postgres/postgres-connection-pooling",
                     },
                 )
+
+            # Check if current user is a superuser or has replication privilege
+            # PgBouncer does not allow connections from either type
+            role_rows = await conn.fetch(
+                "SELECT rolsuper, rolreplication FROM pg_roles WHERE rolname = current_user"
+            )
+
+            if role_rows:
+                is_superuser = role_rows[0][0]
+                has_replication = role_rows[0][1]
+                if is_superuser or has_replication:
+                    reasons = []
+                    if is_superuser:
+                        reasons.append("superuser")
+                    if has_replication:
+                        reasons.append("replication")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            "error": "pgbouncer_privileged_user_not_allowed",
+                            "message": (
+                                f"PgBouncer does not allow connections from users with "
+                                f"{' or '.join(reasons)} privileges. "
+                                f"Create a non-privileged application role to use PgBouncer, "
+                                f"or disable the PgBouncer option."
+                            ),
+                            "docs_url": "https://docs.snowflake.com/en/user-guide/snowflake-postgres/postgres-connection-pooling",
+                        },
+                    )
+        finally:
+            await conn.close()
 
     except HTTPException:
         raise

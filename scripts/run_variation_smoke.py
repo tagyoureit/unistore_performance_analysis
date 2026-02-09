@@ -23,10 +23,7 @@ def _normalize_base_url(raw: str) -> str:
 
 
 def _normalize_table_type(raw: Any) -> str:
-    ttype = str(raw or "").strip().upper()
-    if ttype == "SNOWFLAKE_POSTGRES":
-        return "POSTGRES"
-    return ttype
+    return str(raw or "").strip().upper()
 
 
 def _normalize_ident(raw: Any, label: str) -> str:

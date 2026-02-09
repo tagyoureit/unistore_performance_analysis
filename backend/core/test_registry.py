@@ -115,10 +115,7 @@ class TestRegistry:
 
     def _warehouse_from_config(self, cfg: dict[str, Any]) -> Optional[str]:
         table_type = _table_type(cfg.get("table_type") or "STANDARD")
-        if table_type in (
-            TableType.POSTGRES,
-            TableType.SNOWFLAKE_POSTGRES,
-        ):
+        if table_type == TableType.POSTGRES:
             return None
 
         warehouse = str(cfg.get("warehouse_name") or "").strip()
@@ -144,6 +141,7 @@ class TestRegistry:
         table_type = _table_type(cfg.get("table_type") or "STANDARD")
         columns_raw = cfg.get("columns")
         columns = columns_raw if isinstance(columns_raw, dict) else {}
+        connection_id = cfg.get("connection_id")  # For Postgres stored connections
 
         table_config = TableConfig(
             name=table_name,
@@ -151,6 +149,7 @@ class TestRegistry:
             database=db,
             schema_name=schema,
             columns=columns,
+            connection_id=connection_id,
             clustering_keys=None,
             primary_key=None,
             indexes=None,
@@ -215,6 +214,11 @@ class TestRegistry:
             scaling_cfg = {}
         target_qps_raw = cfg.get("target_qps")
         target_qps = float(target_qps_raw) if target_qps_raw is not None else None
+        # Support both new and old field names for backwards compatibility
+        starting_threads_raw = cfg.get("starting_threads") or cfg.get("starting_qps")
+        starting_threads = float(starting_threads_raw) if starting_threads_raw is not None else None
+        max_thread_increase_raw = cfg.get("max_thread_increase") or cfg.get("max_qps_increase")
+        max_thread_increase = float(max_thread_increase_raw) if max_thread_increase_raw is not None else None
 
         # QPS mode supports concurrent_connections=-1 in the *template config* to mean
         # "no user cap". For runtime execution we must choose an effective cap bounded
@@ -222,7 +226,7 @@ class TestRegistry:
         raw_cc = cfg.get("concurrent_connections")
         cc = int(raw_cc) if raw_cc is not None else int(settings.DEFAULT_CONCURRENCY)
         if load_mode == "QPS" and cc == -1:
-            if table_type in (TableType.POSTGRES, TableType.SNOWFLAKE_POSTGRES):
+            if table_type == TableType.POSTGRES:
                 cc = int(settings.POSTGRES_POOL_MAX_SIZE)
             else:
                 cc = int(settings.SNOWFLAKE_BENCHMARK_EXECUTOR_MAX_WORKERS)
@@ -254,6 +258,8 @@ class TestRegistry:
             concurrent_connections=int(cc),
             load_mode=load_mode,
             target_qps=target_qps,
+            starting_threads=starting_threads,
+            max_thread_increase=max_thread_increase,
             min_connections=int(scaling_cfg.get("min_connections") or 1),
             start_concurrency=start_concurrency,
             concurrency_increment=concurrency_increment,

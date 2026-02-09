@@ -48,6 +48,7 @@ async def fetch_run_status(run_id: str) -> dict[str, Any] | None:
                 rs.WORKERS_ACTIVE,
                 rs.WORKERS_COMPLETED,
                 rs.FIND_MAX_STATE,
+                rs.QPS_CONTROLLER_STATE,
                 rs.CANCELLATION_REASON,
                 CASE
                     WHEN rs.STATUS IN ('COMPLETED', 'FAILED', 'CANCELLED', 'STOPPED') THEN
@@ -84,6 +85,7 @@ async def fetch_run_status(run_id: str) -> dict[str, Any] | None:
             workers_active,
             workers_completed,
             find_max_state,
+            qps_controller_state,
             cancellation_reason,
             elapsed_seconds,
             failure_reason,
@@ -99,6 +101,7 @@ async def fetch_run_status(run_id: str) -> dict[str, Any] | None:
             "workers_active": workers_active,
             "workers_completed": workers_completed,
             "find_max_state": find_max_state,
+            "qps_controller_state": qps_controller_state,
             "cancellation_reason": str(cancellation_reason)
             if cancellation_reason
             else None,

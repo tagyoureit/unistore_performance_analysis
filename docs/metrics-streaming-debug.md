@@ -262,3 +262,4 @@ WHERE RUN_ID = '<run_id>';
 - `docs/ui-architecture.md` - WebSocket and UI integration
 - `docs/orchestrator-spec.md` - Orchestrator design details
 - `docs/worker-implementation.md` - Worker internals
+- `docs/find-max-transition-lag-postmortem.md` - incident postmortem for FIND_MAX 0s transition lag

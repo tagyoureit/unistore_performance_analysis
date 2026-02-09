@@ -85,13 +85,14 @@
                 <table>
                     <thead>
                         <tr>
-                            <th style="width: 22%;">Name</th>
+                            <th style="width: 20%;">Name</th>
                             <th style="width: 5%;">Type</th>
-                            <th style="width: 18%;">Table</th>
-                            <th style="width: 12%;">Warehouse</th>
-                            <th style="width: 14%;">Workload</th>
-                            <th style="width: 10%;">Duration</th>
-                            <th style="width: 14%;">Scaling</th>
+                            <th style="width: 16%;">Table</th>
+                            <th style="width: 11%;">Size</th>
+                            <th style="width: 11%;">Load Mode</th>
+                            <th style="width: 12%;">Workload</th>
+                            <th style="width: 9%;">Duration</th>
+                            <th style="width: 12%;">Scaling</th>
                             <th style="width: 4%;">Used</th>
                             <th style="width: 11%;">Actions</th>
                         </tr>
@@ -113,7 +114,8 @@
                                     >
                                 </td>
                                 <td class="templates-mono" x-text="tableFqn(template)"></td>
-                                <td x-text="warehouseDisplay(template)"></td>
+                                <td x-html="warehouseDisplay(template)"></td>
+                                <td x-html="loadModeDisplay(template.config)"></td>
                                 <td x-html="workloadMixDisplay(template.config)"></td>
                                 <td x-html="durationDisplay(template.config)"></td>
                                 <td x-html="scalingDisplay(template.config)"></td>

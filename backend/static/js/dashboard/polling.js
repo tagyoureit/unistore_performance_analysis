@@ -115,46 +115,12 @@ window.DashboardMixins.polling = {
     this._multiWorkerMetricsIntervalId = null;
   },
 
-  startMultiNodeTestInfoPolling() {
-    if (this._multiWorkerTestInfoIntervalId) return;
-    if (this._destroyed) return;
-    const poll = () => {
-      if (this._destroyed) {
-        this.stopMultiNodeTestInfoPolling();
-        return;
-      }
-      this.loadTestInfo();
-    };
-    this._multiWorkerTestInfoIntervalId = setInterval(poll, 1000);
-  },
-
-  stopMultiNodeTestInfoPolling() {
-    if (!this._multiWorkerTestInfoIntervalId) return;
-    clearInterval(this._multiWorkerTestInfoIntervalId);
-    this._multiWorkerTestInfoIntervalId = null;
-  },
-
-  startEnrichmentPolling() {
-    if (this._enrichmentPollIntervalId) return;
-    if (this._destroyed) return;
-    const wsOpen = this.websocket && this.websocket.readyState === 1;
-    if (this.mode === "live" && wsOpen) return;
-    this.pollEnrichmentStatus();
-    this._enrichmentPollIntervalId = setInterval(() => {
-      if (this._destroyed) {
-        this.stopEnrichmentPolling();
-        return;
-      }
-      this.pollEnrichmentStatus();
-    }, 5000);
-  },
-
-  stopEnrichmentPolling() {
-    if (this._enrichmentPollIntervalId) {
-      clearInterval(this._enrichmentPollIntervalId);
-      this._enrichmentPollIntervalId = null;
-    }
-  },
+  // Polling removed - WebSocket is the sole data transport for live tests.
+  // These no-op stubs remain for compatibility with existing call sites.
+  startMultiNodeTestInfoPolling() {},
+  stopMultiNodeTestInfoPolling() {},
+  startEnrichmentPolling() {},
+  stopEnrichmentPolling() {},
 
   applyEnrichmentProgress(data) {
     if (!data || typeof data !== "object") return;
@@ -207,34 +173,5 @@ window.DashboardMixins.polling = {
     }
   },
 
-  async pollEnrichmentStatus() {
-    if (!this.testId) return;
-    if (this._destroyed) return;
-    try {
-      const resp = await fetch(`/api/tests/${this.testId}/enrichment-status`);
-      if (!resp.ok) return;
-      const data = await resp.json();
-      this.enrichmentProgress = data;
-      if (data.enrichment_status !== "PENDING" || data.is_complete) {
-        this.stopEnrichmentPolling();
-        if (this.templateInfo) {
-          this.templateInfo.enrichment_status = data.enrichment_status;
-        }
-        if (data.enrichment_status === "COMPLETED") {
-          await this.loadTestInfo();
-          // Explicitly set phase to COMPLETED - loadTestInfo may not update reactive state
-          this.phase = "COMPLETED";
-          // Stop the elapsed timer now that we're fully complete
-          if (typeof this.stopElapsedTimer === "function") {
-            this.stopElapsedTimer();
-          }
-          if (window.toast && typeof window.toast.success === "function") {
-            window.toast.success(`Enrichment completed (${data.enrichment_ratio_pct}% queries enriched)`);
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to poll enrichment status:", e);
-    }
-  },
+  // pollEnrichmentStatus removed - enrichment status comes via WebSocket
 };

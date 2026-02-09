@@ -37,10 +37,7 @@ def create_table_manager(config: TableConfig) -> TableManager:
         return InteractiveTableManager(config)
     elif table_type == TableType.DYNAMIC:
         return DynamicTableManager(config)
-    elif table_type in (
-        TableType.POSTGRES,
-        TableType.SNOWFLAKE_POSTGRES,
-    ):
+    elif table_type == TableType.POSTGRES:
         return PostgresTableManager(config)
     else:
         raise ValueError(f"Unsupported table type: {table_type}")

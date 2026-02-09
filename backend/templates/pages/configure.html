@@ -77,10 +77,30 @@
             </div>
         </div>
 
+        <!-- Connection Selection -->
+        <div class="card">
+            <div class="card-title">Connection</div>
+            
+            <div class="form-group">
+                <label class="form-label">Select Connection *</label>
+                <select id="connection-select" class="form-select" x-model="config.connection_id" @change="onConnectionChanged()" required>
+                    <option value="">-- Select a connection --</option>
+                    <template x-for="conn in availableConnections" :key="conn.connection_id">
+                        <option 
+                            :value="conn.connection_id" 
+                            x-text="conn.connection_name + ' (' + conn.connection_type + ')'"
+                        ></option>
+                    </template>
+                </select>
+                <small class="form-text">Choose which database connection to use for this test</small>
+            </div>
+        </div>
+
         <div class="card">
             <div class="card-title">Table Configuration</div>
             
-            <div class="form-group">
+            <!-- Object Type Filter - only show for Snowflake connections -->
+            <div class="form-group" x-show="!isPostgresConnection()">
                 <label class="form-label">Object Type Filter</label>
                 <select class="form-select" x-model="objectTypeFilter" @change="onObjectTypeFilterChanged()">
                     <option value="ALL_SNOWFLAKE">All Snowflake</option>
@@ -89,11 +109,8 @@
                     <option value="DYNAMIC">Dynamic Tables</option>
                     <option value="INTERACTIVE">Interactive Tables</option>
                     <option value="VIEW">Views</option>
-                    <option disabled>───────────</option>
-                    <option value="POSTGRES">Postgres</option>
-                    <option value="SNOWFLAKE_POSTGRES">Snowflake Postgres</option>
                 </select>
-                <small class="form-text">Filter objects or switch to Postgres connection</small>
+                <small class="form-text">Filter by table type</small>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -186,7 +203,7 @@
             </template>
         </div>
 
-        <div class="card" x-show="config.table_type !== 'POSTGRES' && config.table_type !== 'SNOWFLAKE_POSTGRES'">
+        <div class="card" x-show="config.table_type !== 'POSTGRES'">
             <div class="card-title">Warehouse Configuration</div>
             
             <div class="form-group">
@@ -196,7 +213,7 @@
                     class="form-select"
                     x-model="config.warehouse_name"
                     @change="loadWarehouseDetails"
-                    :required="config.table_type !== 'POSTGRES' && config.table_type !== 'SNOWFLAKE_POSTGRES'"
+                    :required="config.table_type !== 'POSTGRES'"
                 >
                     <option value="">-- Select a warehouse --</option>
                     <template x-for="wh in availableWarehouses" :key="wh.name">
@@ -257,10 +274,10 @@
             <div class="form-group">
                 <label class="form-label" style="display: flex; align-items: center; gap: 8px;">
                     <input type="checkbox" x-model="config.use_pgbouncer" style="margin: 0;">
-                    Use PgBouncer (port 5431)
+                    Use PgBouncer
                 </label>
                 <small class="form-text">
-                    Connects via PgBouncer (port 5431) for connection pooling. Requires <code>snowflake_pooler</code> extension 
+                    Connects via PgBouncer for connection pooling. Requires <code>snowflake_pooler</code> extension 
                     and a non-superuser role. <strong>Without PgBouncer: max 500 connections. With PgBouncer: up to 1000.</strong>
                 </small>
             </div>
@@ -620,6 +637,18 @@
                             <label class="form-label">Target QPS</label>
                             <input type="number" class="form-input" x-model.number="config.target_qps" min="1" max="100000" step="1">
                             <small class="form-text">Operations per second</small>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                            <div class="form-group">
+                                <label class="form-label" style="font-size: 0.75rem;">Starting Threads</label>
+                                <input type="number" class="form-input" x-model.number="config.starting_threads" min="0" step="1" placeholder="0">
+                                <small class="form-text">Initial threads (0 = ramp from min)</small>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" style="font-size: 0.75rem;">Max Threads/Interval</label>
+                                <input type="number" class="form-input" x-model.number="config.max_thread_increase" min="1" max="200" step="1" placeholder="15">
+                                <small class="form-text">Max thread increase (~10s)</small>
+                            </div>
                         </div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem;">
                             <div class="form-group">
@@ -996,6 +1025,7 @@
 function testConfiguration() {
     return {
         config: {
+            connection_id: '',  // Selected connection UUID
             table_type: 'STANDARD',
             database: '{{ default_database }}',
             schema: 'PUBLIC',
@@ -1009,6 +1039,8 @@ function testConfiguration() {
             duration: 300,
             load_mode: 'CONCURRENCY',
             target_qps: 100,
+            starting_threads: null,
+            max_thread_increase: 15,
             scaling: {
                 mode: 'AUTO',
                 min_workers: 1,
@@ -1036,7 +1068,7 @@ function testConfiguration() {
             think_time: 0,
             warmup: 30,
             use_cached_result: true,
-            use_pgbouncer: false,  // PgBouncer (port 6432) may not be available on all instances
+            use_pgbouncer: false,  // PgBouncer may not be available on all instances
             custom_point_lookup_query: 'SELECT * FROM {table} WHERE id = ?',
             custom_range_scan_query:
                 'SELECT * FROM {table} WHERE id BETWEEN ? AND ? + 100 ORDER BY id LIMIT 100',
@@ -1065,6 +1097,7 @@ function testConfiguration() {
             description: ''
         },
         loadedTemplate: null,
+        availableConnections: [],  // List of available database connections
         availableWarehouses: [],
         selectedWarehouseDetails: null,
         resultsWarehouse: null,
@@ -1121,6 +1154,7 @@ function testConfiguration() {
         getComparableConfig() {
             const c = this.config;
             return {
+                connection_id: c.connection_id,
                 template_name: c.template_name,
                 description: c.description,
                 table_type: c.table_type,
@@ -1133,6 +1167,8 @@ function testConfiguration() {
                 think_time: c.think_time,
                 load_mode: c.load_mode,
                 target_qps: c.target_qps,
+                starting_threads: c.starting_threads,
+                max_thread_increase: c.max_thread_increase,
                 concurrent_connections: c.concurrent_connections,
                 start_concurrency: c.start_concurrency,
                 concurrency_increment: c.concurrency_increment,
@@ -1201,9 +1237,26 @@ function testConfiguration() {
             return `${aw.source_database}.${aw.source_schema}.${aw.source_table}`;
         },
 
+        // Check if the selected connection is a Postgres connection
+        isPostgresConnection() {
+            if (!this.config.connection_id) return false;
+            const conn = (this.availableConnections || []).find(
+                c => c.connection_id === this.config.connection_id
+            );
+            return conn?.connection_type === 'POSTGRES';
+        },
+
+        // Get the selected connection object
+        getSelectedConnection() {
+            if (!this.config.connection_id) return null;
+            return (this.availableConnections || []).find(
+                c => c.connection_id === this.config.connection_id
+            ) || null;
+        },
+
         isPostgresFamilyTableType(tableType) {
             const tt = String(tableType || '').trim().toUpperCase();
-            return tt === 'POSTGRES' || tt === 'SNOWFLAKE_POSTGRES';
+            return tt === 'POSTGRES';
         },
 
         isInteractiveTable(tableType) {
@@ -1430,9 +1483,7 @@ function testConfiguration() {
 
         async onTableTypeChanged() {
             const tableType = String(this.config.table_type || '').trim().toUpperCase();
-            const isPostgres =
-                tableType === 'POSTGRES' ||
-                tableType === 'SNOWFLAKE_POSTGRES';
+            const isPostgres = tableType === 'POSTGRES';
 
             if (isPostgres) {
                 // Avoid persisting/using a Snowflake execution warehouse for Postgres templates.
@@ -1491,7 +1542,7 @@ function testConfiguration() {
             // Map detected_type to config.table_type
             // For Snowflake: STANDARD, HYBRID, DYNAMIC, INTERACTIVE, VIEW -> use as table_type (VIEW uses STANDARD)
             // For Postgres: TABLE, VIEW -> keep current Postgres table_type
-            const isPostgresFilter = this.objectTypeFilter === 'POSTGRES' || this.objectTypeFilter === 'SNOWFLAKE_POSTGRES';
+            const isPostgresFilter = this.objectTypeFilter === 'POSTGRES';
             
             if (isPostgresFilter) {
                 // Keep the Postgres table_type, don't change it
@@ -1519,9 +1570,52 @@ function testConfiguration() {
             }
         },
 
+        // Called when the connection dropdown changes
+        async onConnectionChanged() {
+            const conn = this.getSelectedConnection();
+            if (!conn) {
+                // No connection selected - reset everything
+                this.objectTypeFilter = 'ALL_SNOWFLAKE';
+                this.config.table_type = 'STANDARD';
+                this.config.database = '';
+                this.config.schema = '';
+                this.config.table_name = '';
+                this.availableDatabases = [];
+                this.availableSchemas = [];
+                this.availableObjects = [];
+                return;
+            }
+
+            const isPostgres = conn.connection_type === 'POSTGRES';
+
+            // Clear existing selections when switching connections
+            this.config.database = '';
+            this.config.schema = '';
+            this.config.table_name = '';
+            this.availableDatabases = [];
+            this.availableSchemas = [];
+            this.availableObjects = [];
+            this.detectedTableType = null;
+
+            if (isPostgres) {
+                // For Postgres connections, set filter and table type to POSTGRES
+                this.objectTypeFilter = 'POSTGRES';
+                this.config.table_type = 'POSTGRES';
+                this.config.warehouse_name = '';
+                this.selectedWarehouseDetails = null;
+            } else {
+                // For Snowflake connections, default to ALL_SNOWFLAKE filter
+                this.objectTypeFilter = 'ALL_SNOWFLAKE';
+                this.config.table_type = 'STANDARD';
+            }
+
+            // Reload the catalog for the new connection
+            await this.loadCatalog();
+        },
+
         async onObjectTypeFilterChanged() {
             const filter = String(this.objectTypeFilter || 'ALL_SNOWFLAKE').toUpperCase();
-            const isPostgres = filter === 'POSTGRES' || filter === 'SNOWFLAKE_POSTGRES';
+            const isPostgres = filter === 'POSTGRES';
             const wasPostgres = this.isPostgresFamilyTableType(this.config.table_type);
             const isConnectionSwitch = isPostgres !== wasPostgres;
 
@@ -1559,11 +1653,22 @@ function testConfiguration() {
             const savedTableName = String(this.config.table_name || '').trim();
             const isEditingTemplate = this.mode === 'edit' || this.mode === 'view';
 
+            // Don't load catalog until a connection is selected
+            if (!this.config.connection_id) {
+                this.availableDatabases = [];
+                this.availableSchemas = [];
+                this.availableObjects = [];
+                return;
+            }
+
             try {
                 const t = String(this.config.table_type || '').trim().toLowerCase();
-                const dbResp = await fetch(
-                    `/api/catalog/databases?table_type=${encodeURIComponent(t)}`,
-                );
+                let url = `/api/catalog/databases?table_type=${encodeURIComponent(t)}`;
+                // Pass connection_id for future multi-connection support
+                if (this.config.connection_id) {
+                    url += `&connection_id=${encodeURIComponent(this.config.connection_id)}`;
+                }
+                const dbResp = await fetch(url);
                 if (!dbResp.ok) {
                     const errPayload = await dbResp.json().catch(() => ({}));
                     const detail = errPayload?.detail || `HTTP ${dbResp.status}`;
@@ -1643,9 +1748,13 @@ function testConfiguration() {
 
             try {
                 const t = String(this.config.table_type || '').trim().toLowerCase();
-                const url =
+                let url =
                     `/api/catalog/schemas?table_type=${encodeURIComponent(t)}` +
                     `&database=${encodeURIComponent(db)}`;
+                // Pass connection_id for Postgres connections
+                if (this.config.connection_id) {
+                    url += `&connection_id=${encodeURIComponent(this.config.connection_id)}`;
+                }
                 const resp = await fetch(url);
                 if (!resp.ok) {
                     const errPayload = await resp.json().catch(() => ({}));
@@ -1724,9 +1833,14 @@ function testConfiguration() {
                     `&database=${encodeURIComponent(db)}` +
                     `&schema=${encodeURIComponent(schema)}`;
                 
+                // Pass connection_id for Postgres connections
+                if (this.config.connection_id) {
+                    url += `&connection_id=${encodeURIComponent(this.config.connection_id)}`;
+                }
+                
                 // Add filter_type param for Snowflake when a specific filter is selected
                 const filter = String(this.objectTypeFilter || 'ALL_SNOWFLAKE').toUpperCase();
-                const isPostgres = filter === 'POSTGRES' || filter === 'SNOWFLAKE_POSTGRES';
+                const isPostgres = filter === 'POSTGRES';
                 if (!isPostgres && filter !== 'ALL_SNOWFLAKE') {
                     url += `&filter_type=${encodeURIComponent(filter)}`;
                 }
@@ -1920,7 +2034,7 @@ function testConfiguration() {
                             this.config.use_cached_result = !['0', 'false', 'no', 'off'].includes(v);
                         }
                         // Default use_pgbouncer to FALSE for Postgres connections.
-                        // PgBouncer (port 6432) may not be available on all instances.
+                        // PgBouncer may not be available on all instances.
                         // Coerce to a boolean for the checkbox UI.
                         if (this.config.use_pgbouncer == null) {
                             this.config.use_pgbouncer = false;
@@ -1933,7 +2047,7 @@ function testConfiguration() {
                         this.config.description = template.description;
                         // Initialize objectTypeFilter based on loaded template's table_type
                         const tt = String(this.config.table_type || '').toUpperCase();
-                        if (tt === 'POSTGRES' || tt === 'SNOWFLAKE_POSTGRES') {
+                        if (tt === 'POSTGRES') {
                             this.objectTypeFilter = tt;
                         } else {
                             // For Snowflake types, default to ALL_SNOWFLAKE (type will be auto-detected)
@@ -1957,10 +2071,7 @@ function testConfiguration() {
 
             // If this is a Postgres-based template type, clear warehouse fields to avoid
             // accidentally persisting/using the results warehouse as an "execution" warehouse.
-            if (
-                this.config.table_type === 'POSTGRES' ||
-                this.config.table_type === 'SNOWFLAKE_POSTGRES'
-            ) {
+            if (this.config.table_type === 'POSTGRES') {
                 this.config.warehouse_name = '';
                 this.selectedWarehouseDetails = null;
             }
@@ -1968,11 +2079,81 @@ function testConfiguration() {
             // Load warehouses before enabling the form so users don't start editing
             // and then have dropdowns/details change underneath them.
             try {
+                await this.loadConnections();
                 await this.loadWarehouses();
                 await this.loadCatalog();
             } finally {
                 this.snapshotConfig();
                 this.isInitializing = false;
+            }
+        },
+
+        async loadConnections() {
+            try {
+                const resp = await fetch('/api/connections/');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.availableConnections = data.connections || [];
+                    
+                    // Capture the saved connection_id before any modifications
+                    const savedConnectionId = this.config.connection_id || '';
+                    
+                    // If we have a saved connection_id from template, verify it exists
+                    // and set the objectTypeFilter accordingly
+                    if (savedConnectionId) {
+                        const match = this.availableConnections.find(
+                            c => c.connection_id === savedConnectionId
+                        );
+                        if (!match) {
+                            // Connection no longer exists - clear it
+                            console.warn('Saved connection_id not found:', savedConnectionId);
+                            this.config.connection_id = '';
+                        } else {
+                            // Set objectTypeFilter based on the loaded connection's type
+                            if (match.connection_type === 'POSTGRES') {
+                                this.objectTypeFilter = 'POSTGRES';
+                                this.config.table_type = 'POSTGRES';
+                            } else {
+                                // Keep existing objectTypeFilter for Snowflake (could be HYBRID, STANDARD, etc.)
+                                // but ensure it's not POSTGRES
+                                if (this.objectTypeFilter === 'POSTGRES') {
+                                    this.objectTypeFilter = 'ALL_SNOWFLAKE';
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If no connection selected and only one exists, auto-select it
+                    if (!this.config.connection_id && this.availableConnections.length === 1) {
+                        this.config.connection_id = this.availableConnections[0].connection_id;
+                        // Set the appropriate filter based on connection type
+                        const conn = this.availableConnections[0];
+                        if (conn.connection_type === 'POSTGRES') {
+                            this.objectTypeFilter = 'POSTGRES';
+                            this.config.table_type = 'POSTGRES';
+                        }
+                    }
+                    
+                    // Wait for Alpine to render the options, then force the select value
+                    await this.nextTickAsync();
+                    await this.nextTickAsync();
+                    
+                    // Restore the connection_id (x-model may have cleared it while options were loading)
+                    if (savedConnectionId && this.availableConnections.find(c => c.connection_id === savedConnectionId)) {
+                        this.config.connection_id = savedConnectionId;
+                    }
+                    
+                    // Force DOM select to match
+                    await this.nextTickAsync();
+                    this.forceSelectValue('connection-select', this.config.connection_id);
+                    
+                } else {
+                    console.warn('Failed to load connections:', resp.status);
+                    window.toast.error('Failed to load connections');
+                }
+            } catch (e) {
+                console.error('Error loading connections:', e);
+                window.toast.error('Error loading connections: ' + (e?.message || e));
             }
         },
         
@@ -2383,9 +2564,7 @@ function testConfiguration() {
             }
 
             const tableType = String(this.config.table_type || '').trim().toUpperCase();
-            const isPostgres =
-                tableType === 'POSTGRES' ||
-                tableType === 'SNOWFLAKE_POSTGRES';
+            const isPostgres = tableType === 'POSTGRES';
 
             if (!isPostgres && !String(this.config.warehouse_name || '').trim()) {
                 window.toast.warning('Please select an existing warehouse');
@@ -2538,7 +2717,7 @@ function testConfiguration() {
                 this.config = { ...this.config, ...templateConfig };
                 this.config.scaling = { ...defaultScaling, ...(templateConfig.scaling || {}) };
                 this.config.guardrails = { ...defaultGuardrails, ...(templateConfig.guardrails || {}) };
-                // Coerce use_pgbouncer to boolean (default FALSE - port 6432 may not be available)
+                // Coerce use_pgbouncer to boolean (default FALSE - PgBouncer may not be available)
                 if (this.config.use_pgbouncer == null) {
                     this.config.use_pgbouncer = false;
                 } else {
@@ -2627,7 +2806,7 @@ function testConfiguration() {
             }
 
             const tableType = String(this.config.table_type || '').toUpperCase();
-            const isPostgres = tableType === 'POSTGRES' || tableType === 'SNOWFLAKE_POSTGRES';
+            const isPostgres = tableType === 'POSTGRES';
 
             this.prepareTemplateLoading = true;
             try {
@@ -2847,6 +3026,8 @@ function testConfiguration() {
                     duration: 300,
                     load_mode: 'CONCURRENCY',
                     target_qps: 100,
+                    starting_threads: null,
+                    max_thread_increase: 15,
                     scaling: {
                         mode: 'AUTO',
                         min_connections: 5,
