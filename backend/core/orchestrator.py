@@ -1794,6 +1794,51 @@ class OrchestratorService:
                 )
                 pg_stats_enabled = False
 
+        async def _capture_postgres_measurement_snapshot(trigger: str) -> None:
+            """Capture final pg_stat snapshot and compute deltas once per run."""
+            if not (pg_stats_enabled and pg_stats_conn):
+                return
+            if ctx.pg_snapshot_after_measurement is not None:
+                return
+            try:
+                ctx.pg_snapshot_after_measurement = await capture_pg_stat_snapshot(
+                    pg_stats_conn
+                )
+                logger.info(
+                    "Captured pg_stat_statements snapshot 3 (after_measurement) for %s via %s: %d queries",
+                    run_id,
+                    trigger,
+                    len(ctx.pg_snapshot_after_measurement.stats),
+                )
+                baseline_snapshot = (
+                    ctx.pg_snapshot_after_warmup
+                    if ctx.pg_snapshot_after_warmup
+                    else ctx.pg_snapshot_before_warmup
+                )
+                if baseline_snapshot:
+                    ctx.pg_delta_measurement = compute_snapshot_delta(
+                        baseline_snapshot,
+                        ctx.pg_snapshot_after_measurement,
+                    )
+                if ctx.pg_snapshot_before_warmup:
+                    ctx.pg_delta_total = compute_snapshot_delta(
+                        ctx.pg_snapshot_before_warmup,
+                        ctx.pg_snapshot_after_measurement,
+                    )
+                logger.info(
+                    "Computed pg_stat deltas for %s: measurement=%s, total=%s",
+                    run_id,
+                    ctx.pg_delta_measurement is not None,
+                    ctx.pg_delta_total is not None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to capture pg_stat snapshot 3 for %s (%s): %s",
+                    run_id,
+                    trigger,
+                    e,
+                )
+
         async def _poll_warehouse(elapsed: float | None) -> None:
             if not warehouse_name:
                 return
@@ -2740,51 +2785,7 @@ class OrchestratorService:
                     )
                     status = "STOPPING"
 
-                    # Capture third pg_stat_statements snapshot (after measurement)
-                    if (
-                        pg_stats_enabled
-                        and pg_stats_conn
-                        and ctx.pg_snapshot_after_measurement is None
-                    ):
-                        try:
-                            ctx.pg_snapshot_after_measurement = (
-                                await capture_pg_stat_snapshot(pg_stats_conn)
-                            )
-                            logger.info(
-                                "Captured pg_stat_statements snapshot 3 (after_measurement) for %s: %d queries",
-                                run_id,
-                                len(ctx.pg_snapshot_after_measurement.stats),
-                            )
-                            # Compute measurement phase delta (after_warmup -> after_measurement)
-                            # If no warmup, use before_warmup as the baseline
-                            baseline_snapshot = (
-                                ctx.pg_snapshot_after_warmup
-                                if ctx.pg_snapshot_after_warmup
-                                else ctx.pg_snapshot_before_warmup
-                            )
-                            if baseline_snapshot:
-                                ctx.pg_delta_measurement = compute_snapshot_delta(
-                                    baseline_snapshot,
-                                    ctx.pg_snapshot_after_measurement,
-                                )
-                            # Compute total delta (before_warmup -> after_measurement)
-                            if ctx.pg_snapshot_before_warmup:
-                                ctx.pg_delta_total = compute_snapshot_delta(
-                                    ctx.pg_snapshot_before_warmup,
-                                    ctx.pg_snapshot_after_measurement,
-                                )
-                            logger.info(
-                                "Computed pg_stat deltas for %s: measurement=%s, total=%s",
-                                run_id,
-                                ctx.pg_delta_measurement is not None,
-                                ctx.pg_delta_total is not None,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to capture pg_stat snapshot 3 for %s: %s",
-                                run_id,
-                                e,
-                            )
+                    await _capture_postgres_measurement_snapshot("duration_elapsed")
 
                 total_ops = 0
                 error_count = 0
@@ -3694,6 +3695,9 @@ class OrchestratorService:
                                 )
 
                             if should_stop:
+                                await _capture_postgres_measurement_snapshot(
+                                    "find_max_stop"
+                                )
                                 find_max_completed = True
                                 max_type = None
                                 bounded = False
@@ -3911,6 +3915,15 @@ class OrchestratorService:
                     pass
                 except Exception:
                     pass
+
+            # Force one final durable parent rollup after status finalization.
+            # This reconciles stale parent TEST_RESULTS rows when async rollups raced.
+            try:
+                await results_store.update_parent_run_aggregate(parent_run_id=run_id)
+            except Exception as rollup_err:
+                logger.debug(
+                    "Final parent rollup failed for %s: %s", run_id, rollup_err
+                )
 
             if worker_health_task and not worker_health_task.done():
                 worker_health_task.cancel()

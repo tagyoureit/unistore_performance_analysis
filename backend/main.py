@@ -109,12 +109,19 @@ async def _cleanup_orphaned_tests_background() -> None:
     PREPARED, STARTING, RUNNING, or CANCELLING states (with no recent activity)
     are marked as CANCELLED.
 
-    Also handles stale enrichment:
+    Also handles startup data reconciliation:
+    - Parent rollup backfill: reconcile stale TEST_RESULTS parent rows
+      against child metrics for terminal runs
+    - Stale enrichment:
     - Parent tests with pending enrichment: retry enrichment
     - Child tests or non-completed: mark enrichment as SKIPPED
     """
     try:
-        from backend.core.results_store import cleanup_orphaned_tests, cleanup_stale_enrichment
+        from backend.core.results_store import (
+            backfill_parent_run_rollups,
+            cleanup_orphaned_tests,
+            cleanup_stale_enrichment,
+        )
 
         logger.info("🧹 Checking for orphaned tests...")
         result = await cleanup_orphaned_tests(
@@ -131,6 +138,19 @@ async def _cleanup_orphaned_tests_background() -> None:
             )
         else:
             logger.info("🧹 No orphaned tests found")
+
+        # Reconcile stale parent TEST_RESULTS rollups (bounded batch).
+        logger.info("🧩 Checking for stale parent rollups...")
+        rollup_result = await backfill_parent_run_rollups(batch_size=200)
+        if rollup_result.candidate_count > 0:
+            logger.info(
+                "🧩 Parent rollup backfill: %d updated, %d failed (batch=%d)",
+                rollup_result.updated_count,
+                rollup_result.failed_count,
+                rollup_result.candidate_count,
+            )
+        else:
+            logger.info("🧩 No stale parent rollups found")
 
         # Clean up stale enrichment
         logger.info("🔄 Checking for stale enrichment...")
@@ -312,22 +332,36 @@ async def dashboard_test(request: Request, test_id: str):
             pool = snowflake_pool.get_default_pool()
             rows = await pool.execute_query(
                 f"""
-                SELECT STATUS
-                FROM {settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}.TEST_RESULTS
-                WHERE TEST_ID = ?
+                SELECT
+                    tr.STATUS AS TEST_STATUS,
+                    rs.STATUS AS RUN_STATUS
+                FROM {settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}.TEST_RESULTS tr
+                LEFT JOIN {settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}.RUN_STATUS rs
+                  ON rs.RUN_ID = tr.TEST_ID
+                WHERE tr.TEST_ID = ?
                 LIMIT 1
                 """,
                 params=[test_id],
             )
             if rows:
-                db_status = str(rows[0][0] or "").upper()
-                if db_status in {
+                test_status = str(rows[0][0] or "").upper()
+                run_status = str(rows[0][1] or "").upper()
+                live_statuses = {
                     "PREPARED",
                     "READY",
                     "PENDING",
                     "RUNNING",
                     "CANCELLING",
-                }:
+                }
+                # Prefer RUN_STATUS when either source indicates an active run.
+                # For terminal-vs-terminal disagreements, keep TEST_RESULTS.
+                db_status = test_status
+                if run_status and (
+                    run_status in live_statuses or test_status in live_statuses
+                ):
+                    db_status = run_status
+
+                if db_status in live_statuses:
                     # Test exists in DB with a live status - serve live dashboard
                     is_htmx = request.headers.get("HX-Request") == "true"
                     template = "pages/dashboard.html"

@@ -1979,6 +1979,86 @@ async def get_enrichment_status(*, test_id: str) -> dict[str, Any] | None:
 
 
 # -----------------------------------------------------------------------------
+# Parent Rollup Backfill
+# -----------------------------------------------------------------------------
+
+
+class ParentRollupBackfillResult(NamedTuple):
+    """Result of startup parent rollup backfill."""
+
+    candidate_count: int
+    updated_count: int
+    failed_count: int
+    candidate_run_ids: list[str]
+    failed_run_ids: list[str]
+
+
+async def backfill_parent_run_rollups(
+    *,
+    batch_size: int = 200,
+    dry_run: bool = False,
+) -> ParentRollupBackfillResult:
+    """
+    Recompute stale parent TEST_RESULTS rollups from child rows.
+
+    Startup-safe behavior:
+    - Limited to terminal RUN_STATUS rows (COMPLETED/FAILED/CANCELLED)
+    - Bounded by batch_size
+    - Best-effort per run (continues on individual failures)
+    """
+    pool = snowflake_pool.get_default_pool()
+    prefix = _results_prefix()
+
+    candidate_rows = await pool.execute_query(
+        f"""
+        SELECT tr.TEST_ID
+        FROM {prefix}.TEST_RESULTS tr
+        JOIN {prefix}.RUN_STATUS rs
+          ON rs.RUN_ID = tr.TEST_ID
+        WHERE tr.RUN_ID = tr.TEST_ID
+          AND UPPER(COALESCE(rs.STATUS, '')) = 'COMPLETED'
+          AND (
+            UPPER(COALESCE(tr.STATUS, '')) IN (
+              'PREPARED', 'STARTING', 'RUNNING', 'STOPPING', 'CANCELLING', 'PROCESSING'
+            )
+            OR tr.END_TIME IS NULL
+          )
+        ORDER BY COALESCE(tr.UPDATED_AT, tr.START_TIME) DESC
+        LIMIT ?
+        """,
+        params=[int(max(batch_size, 1))],
+    )
+    candidate_run_ids = [str(row[0]) for row in (candidate_rows or []) if row and row[0]]
+
+    if dry_run or not candidate_run_ids:
+        return ParentRollupBackfillResult(
+            candidate_count=len(candidate_run_ids),
+            updated_count=0,
+            failed_count=0,
+            candidate_run_ids=candidate_run_ids,
+            failed_run_ids=[],
+        )
+
+    updated_count = 0
+    failed_run_ids: list[str] = []
+    for run_id in candidate_run_ids:
+        try:
+            await update_parent_run_aggregate(parent_run_id=run_id)
+            updated_count += 1
+        except Exception as e:
+            failed_run_ids.append(run_id)
+            logger.warning("Parent rollup backfill failed for %s: %s", run_id, e)
+
+    return ParentRollupBackfillResult(
+        candidate_count=len(candidate_run_ids),
+        updated_count=updated_count,
+        failed_count=len(failed_run_ids),
+        candidate_run_ids=candidate_run_ids,
+        failed_run_ids=failed_run_ids,
+    )
+
+
+# -----------------------------------------------------------------------------
 # Orphan Cleanup
 # -----------------------------------------------------------------------------
 

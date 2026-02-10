@@ -1587,18 +1587,18 @@ async def list_tests(
         params: list[Any] = []
 
         if table_type:
-            where_clauses.append("TABLE_TYPE = ?")
+            where_clauses.append("tr.TABLE_TYPE = ?")
             params.append(table_type.upper())
         if warehouse_size:
-            where_clauses.append("WAREHOUSE_SIZE = ?")
+            where_clauses.append("tr.WAREHOUSE_SIZE = ?")
             params.append(warehouse_size.upper())
         if status_filter:
-            where_clauses.append("STATUS = ?")
+            where_clauses.append("tr.STATUS = ?")
             params.append(status_filter.upper())
 
         if date_range in {"today", "week", "month"}:
             days = {"today": 1, "week": 7, "month": 30}[date_range]
-            where_clauses.append("START_TIME >= DATEADD(day, ?, CURRENT_TIMESTAMP())")
+            where_clauses.append("tr.START_TIME >= DATEADD(day, ?, CURRENT_TIMESTAMP())")
             params.append(-days)
         elif date_range == "custom":
 
@@ -1606,10 +1606,10 @@ async def list_tests(
                 return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""))
 
             if _is_date(start_date):
-                where_clauses.append("START_TIME >= TO_DATE(?)")
+                where_clauses.append("tr.START_TIME >= TO_DATE(?)")
                 params.append(start_date)
             if _is_date(end_date):
-                where_clauses.append("START_TIME < DATEADD(day, 1, TO_DATE(?))")
+                where_clauses.append("tr.START_TIME < DATEADD(day, 1, TO_DATE(?))")
                 params.append(end_date)
 
         where_sql = ""
@@ -1619,30 +1619,34 @@ async def list_tests(
         offset = max(page - 1, 0) * page_size
         query = f"""
         SELECT
-            TEST_ID,
-            RUN_ID,
-            TEST_NAME,
-            TABLE_TYPE,
-            WAREHOUSE_SIZE,
-            START_TIME,
-            QPS,
-            P95_LATENCY_MS,
-            P99_LATENCY_MS,
-            ERROR_RATE,
-            STATUS,
-            CONCURRENT_CONNECTIONS,
-            DURATION_SECONDS,
-            FAILURE_REASON,
-            ENRICHMENT_STATUS,
-            TEST_CONFIG:template_config:postgres_instance_size::STRING AS POSTGRES_INSTANCE_SIZE
-        FROM {_prefix()}.TEST_RESULTS
+            tr.TEST_ID,
+            tr.RUN_ID,
+            tr.TEST_NAME,
+            tr.TABLE_TYPE,
+            tr.WAREHOUSE_SIZE,
+            tr.START_TIME,
+            tr.QPS,
+            tr.P95_LATENCY_MS,
+            tr.P99_LATENCY_MS,
+            tr.ERROR_RATE,
+            tr.STATUS,
+            tr.CONCURRENT_CONNECTIONS,
+            tr.DURATION_SECONDS,
+            tr.FAILURE_REASON,
+            tr.ENRICHMENT_STATUS,
+            tr.TEST_CONFIG:template_config:postgres_instance_size::STRING AS POSTGRES_INSTANCE_SIZE,
+            rs.STATUS AS RUN_STATUS,
+            rs.PHASE AS RUN_PHASE
+        FROM {_prefix()}.TEST_RESULTS tr
+        LEFT JOIN {_prefix()}.RUN_STATUS rs
+          ON rs.RUN_ID = tr.TEST_ID
         {where_sql}
-        ORDER BY START_TIME DESC
+        ORDER BY tr.START_TIME DESC
         LIMIT ? OFFSET ?
         """
         rows = await pool.execute_query(query, params=[*params, page_size, offset])
 
-        count_query = f"SELECT COUNT(*) FROM {_prefix()}.TEST_RESULTS {where_sql}"
+        count_query = f"SELECT COUNT(*) FROM {_prefix()}.TEST_RESULTS tr {where_sql}"
         count_rows = await pool.execute_query(count_query, params=params)
         total = int(count_rows[0][0]) if count_rows else 0
         total_pages = max((total + page_size - 1) // page_size, 1)
@@ -1666,10 +1670,33 @@ async def list_tests(
                 failure_reason,
                 enrichment_status,
                 postgres_instance_size,
+                run_status_db,
+                run_phase_db,
             ) = row
 
-            # For in-memory tests, get the current phase from the registry
+            is_parent_run = bool(run_id) and str(run_id) == str(test_id)
+            status_db_u = str(status_db or "").upper()
+            run_status_u = str(run_status_db or "").upper()
+            live_statuses = {
+                "PREPARED",
+                "READY",
+                "PENDING",
+                "STARTING",
+                "RUNNING",
+                "STOPPING",
+                "CANCELLING",
+                "PROCESSING",
+            }
+            effective_status = status_db_u or status_db
             phase = None
+            if is_parent_run and run_status_u and (
+                run_status_u in live_statuses or status_db_u in live_statuses
+            ):
+                # Reconcile stale/active parent states from RUN_STATUS.
+                effective_status = run_status_u
+                phase = str(run_phase_db or "").upper() or None
+
+            # For in-memory tests, use the latest phase from the registry.
             try:
                 running = await registry.get(test_id)
                 if running is not None and isinstance(running.last_payload, dict):
@@ -1678,12 +1705,15 @@ async def list_tests(
                 pass
             if (
                 not phase
-                and str(status_db or "").upper() == "COMPLETED"
+                and str(effective_status or "").upper() == "COMPLETED"
                 and str(enrichment_status or "").upper() == "PENDING"
             ):
                 phase = "PROCESSING"
-            status_out = status_db
-            if str(status_db or "").upper() == "COMPLETED" and phase == "PROCESSING":
+            status_out = effective_status
+            if (
+                str(effective_status or "").upper() == "COMPLETED"
+                and str(phase or "").upper() == "PROCESSING"
+            ):
                 status_out = "PROCESSING"
 
             results.append(
@@ -2153,13 +2183,21 @@ async def get_test(test_id: str) -> dict[str, Any]:
             status_db = row[8]
             end_time = row[10]
             run_id = row[1]
+            run_status_value = (
+                str((prefetched_run_status or {}).get("status") or "").upper()
+                if isinstance(prefetched_run_status, dict)
+                else ""
+            )
             if (
                 run_id
                 and str(run_id) == str(test_id)
-                and end_time is not None
                 and str(status_db or "").upper() == "RUNNING"
+                and (
+                    end_time is not None
+                    or run_status_value in {"COMPLETED", "FAILED", "CANCELLED"}
+                )
             ):
-                # Fire-and-forget: schedule aggregate update without blocking response
+                # Fire-and-forget repair for stale parent rows in TEST_RESULTS.
                 asyncio.create_task(
                     update_parent_run_aggregate(parent_run_id=str(test_id))
                 )
@@ -2470,17 +2508,31 @@ async def get_test(test_id: str) -> dict[str, Any]:
 
         # Use prefetched run_status and enrichment from Phase 1 parallel fetch
         run_status = prefetched_run_status if is_parent_run else None
-        status_live = status_db
+        status_live = str(status_db or "").upper()
         phase_live: str | None = None
         cancellation_reason_live: str | None = None
         start_time_live = start_time
         end_time_live = end_time
         if is_parent_run and run_status:
-            status_live = run_status.get("status") or status_live
-            phase_live = run_status.get("phase") or phase_live
-            cancellation_reason_live = run_status.get("cancellation_reason")
-            start_time_live = run_status.get("start_time") or start_time_live
-            end_time_live = run_status.get("end_time") or end_time_live
+            run_status_value = str(run_status.get("status") or "").upper()
+            live_statuses = {
+                "PREPARED",
+                "READY",
+                "PENDING",
+                "STARTING",
+                "RUNNING",
+                "STOPPING",
+                "CANCELLING",
+                "PROCESSING",
+            }
+            if run_status_value and (
+                run_status_value in live_statuses or status_live in live_statuses
+            ):
+                status_live = run_status_value
+                phase_live = run_status.get("phase") or phase_live
+                cancellation_reason_live = run_status.get("cancellation_reason")
+                start_time_live = run_status.get("start_time") or start_time_live
+                end_time_live = run_status.get("end_time") or end_time_live
 
         enrichment_status_live = enrichment_status
         enrichment_error_live = enrichment_error
@@ -2787,7 +2839,7 @@ async def get_test(test_id: str) -> dict[str, Any]:
         # Parallel query execution for performance optimization
         # These queries are independent and can run concurrently via asyncio.gather
         # ---------------------------------------------------------------------------
-        status_upper = str(status_db or "").upper()
+        status_upper = str(status_live or "").upper()
         is_terminal = status_upper in {"COMPLETED", "FAILED", "STOPPED", "CANCELLED"}
 
         # Build list of coroutines to run in parallel

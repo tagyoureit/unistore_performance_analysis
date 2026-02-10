@@ -89,6 +89,33 @@ async def test_dashboard_test_redirects_when_not_in_registry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_test_prefers_run_status_over_stale_parent_row(monkeypatch):
+    from backend import main as main_app
+
+    test_id = "test-stale-parent"
+
+    async def fake_get(_: str):
+        return None
+
+    class StubPool:
+        async def execute_query(self, query: str, params=None):
+            # TEST_RESULTS status is stale RUNNING, but RUN_STATUS is terminal.
+            return [("RUNNING", "COMPLETED")]
+
+    monkeypatch.setattr(main_app.registry, "get", fake_get)
+    monkeypatch.setattr(
+        main_app.snowflake_pool, "get_default_pool", lambda: StubPool()
+    )
+
+    req = _make_request(f"/dashboard/{test_id}")
+    resp = await main_app.dashboard_test(req, test_id)
+
+    assert isinstance(resp, RedirectResponse)
+    assert resp.status_code == 302
+    assert resp.headers.get("location") == f"/dashboard/history/{test_id}"
+
+
+@pytest.mark.asyncio
 async def test_dashboard_test_htmx_terminal_sets_hx_redirect(monkeypatch):
     from backend import main as main_app
 
