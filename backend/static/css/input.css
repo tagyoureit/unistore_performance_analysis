@@ -1127,7 +1127,7 @@
   
   .card-collapsible__summary::after {
     content: "▸";
-    @apply text-gray-500 text-[0.9rem];
+    @apply text-gray-500 text-4xl;
   }
   
   .card-collapsible[open] .card-collapsible__summary::after {

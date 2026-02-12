@@ -188,6 +188,35 @@ def _prefix() -> str:
     return f"{settings.RESULTS_DATABASE}.{settings.RESULTS_SCHEMA}"
 
 
+async def _call_sp(pool: Any, sp_name: str, *args: Any) -> dict[str, Any]:
+    """
+    Call a stored procedure and return parsed JSON result.
+    
+    Args:
+        pool: Snowflake connection pool
+        sp_name: Name of the stored procedure (without schema prefix)
+        *args: Arguments to pass to the stored procedure
+        
+    Returns:
+        Parsed JSON result from the stored procedure
+    """
+    prefix = _prefix()
+    # Build parameter placeholders
+    placeholders = ", ".join(["?" for _ in args]) if args else ""
+    query = f"CALL {prefix}.{sp_name}({placeholders})"
+    
+    rows = await pool.execute_query(query, params=list(args) if args else [])
+    
+    if not rows or not rows[0] or not rows[0][0]:
+        return {}
+    
+    result = rows[0][0]
+    # Handle both string JSON and already-parsed dict
+    if isinstance(result, str):
+        return json.loads(result)
+    return dict(result) if result else {}
+
+
 async def _fetch_run_status(pool: Any, run_id: str) -> dict[str, Any] | None:
     rows = await pool.execute_query(
         f"""
@@ -8385,124 +8414,12 @@ async def get_error_timeline(test_id: str) -> dict[str, Any]:
     allowing calculation of error rates over time.
 
     For parent runs (multi-worker), aggregates data from all child runs.
+    
+    Uses stored procedure GET_ERROR_TIMELINE for consistency.
     """
     try:
         pool = snowflake_pool.get_default_pool()
-        prefix = _prefix()
-
-        # Check if this is a parent run
-        run_id_rows = await pool.execute_query(
-            f"SELECT RUN_ID FROM {prefix}.TEST_RESULTS WHERE TEST_ID = ?",
-            params=[test_id],
-        )
-        run_id = run_id_rows[0][0] if run_id_rows and run_id_rows[0] else None
-        is_parent = bool(run_id) and str(run_id) == str(test_id)
-
-        # Build the WHERE clause based on parent/child status
-        if is_parent:
-            test_filter = f"""
-            qe.TEST_ID IN (
-                SELECT TEST_ID FROM {prefix}.TEST_RESULTS WHERE RUN_ID = ?
-            )
-            """
-            params = [test_id]
-        else:
-            test_filter = "qe.TEST_ID = ?"
-            params = [test_id]
-
-        # Get the time range and bucket errors by 5-second intervals
-        query = f"""
-        WITH query_bounds AS (
-            SELECT
-                MIN(qe.START_TIME) AS FIRST_QUERY,
-                MAX(qe.START_TIME) AS LAST_QUERY,
-                MIN(CASE WHEN COALESCE(qe.WARMUP, FALSE) = FALSE THEN qe.START_TIME END) AS FIRST_MEASUREMENT
-            FROM {prefix}.QUERY_EXECUTIONS qe
-            WHERE {test_filter}
-        ),
-        time_buckets AS (
-            SELECT
-                FLOOR(DATEDIFF('second', qb.FIRST_QUERY, qe.START_TIME) / 5) * 5 AS BUCKET_SECONDS,
-                COUNT(*) AS TOTAL_QUERIES,
-                SUM(CASE WHEN qe.SUCCESS = FALSE THEN 1 ELSE 0 END) AS ERROR_COUNT,
-                SUM(CASE WHEN qe.SUCCESS = FALSE AND qe.QUERY_KIND = 'POINT_LOOKUP' THEN 1 ELSE 0 END) AS POINT_LOOKUP_ERRORS,
-                SUM(CASE WHEN qe.SUCCESS = FALSE AND qe.QUERY_KIND = 'RANGE_SCAN' THEN 1 ELSE 0 END) AS RANGE_SCAN_ERRORS,
-                SUM(CASE WHEN qe.SUCCESS = FALSE AND qe.QUERY_KIND = 'INSERT' THEN 1 ELSE 0 END) AS INSERT_ERRORS,
-                SUM(CASE WHEN qe.SUCCESS = FALSE AND qe.QUERY_KIND = 'UPDATE' THEN 1 ELSE 0 END) AS UPDATE_ERRORS,
-                MAX(CASE WHEN qe.START_TIME < qb.FIRST_MEASUREMENT THEN 1 ELSE 0 END) AS IS_WARMUP
-            FROM {prefix}.QUERY_EXECUTIONS qe
-            CROSS JOIN query_bounds qb
-            WHERE {test_filter.replace('qe.TEST_ID', 'qe.TEST_ID')}
-            GROUP BY FLOOR(DATEDIFF('second', qb.FIRST_QUERY, qe.START_TIME) / 5) * 5
-        )
-        SELECT
-            BUCKET_SECONDS,
-            TOTAL_QUERIES,
-            ERROR_COUNT,
-            POINT_LOOKUP_ERRORS,
-            RANGE_SCAN_ERRORS,
-            INSERT_ERRORS,
-            UPDATE_ERRORS,
-            IS_WARMUP
-        FROM time_buckets
-        ORDER BY BUCKET_SECONDS ASC
-        """
-        # Double the params for the two test_filter usages
-        rows = await pool.execute_query(query, params=params + params)
-
-        if not rows:
-            return {
-                "test_id": test_id,
-                "available": False,
-                "message": "No query execution data available",
-                "points": [],
-            }
-
-        points: list[dict[str, Any]] = []
-        total_errors = 0
-        total_queries = 0
-        warmup_end_bucket: int | None = None
-
-        for row in rows:
-            bucket_seconds = int(row[0] or 0)
-            bucket_total = int(row[1] or 0)
-            bucket_errors = int(row[2] or 0)
-            is_warmup = bool(row[7])
-
-            total_queries += bucket_total
-            total_errors += bucket_errors
-
-            # Track where warmup ends
-            if not is_warmup and warmup_end_bucket is None:
-                warmup_end_bucket = bucket_seconds
-
-            error_rate_pct = (bucket_errors / bucket_total * 100) if bucket_total > 0 else 0.0
-
-            points.append({
-                "elapsed_seconds": bucket_seconds,
-                "total_queries": bucket_total,
-                "error_count": bucket_errors,
-                "error_rate_pct": round(error_rate_pct, 2),
-                "point_lookup_errors": int(row[3] or 0),
-                "range_scan_errors": int(row[4] or 0),
-                "insert_errors": int(row[5] or 0),
-                "update_errors": int(row[6] or 0),
-                "warmup": is_warmup,
-            })
-
-        overall_error_rate = (total_errors / total_queries * 100) if total_queries > 0 else 0.0
-
-        return {
-            "test_id": test_id,
-            "available": True,
-            "is_parent_run": is_parent,
-            "bucket_size_seconds": 5,
-            "total_queries": total_queries,
-            "total_errors": total_errors,
-            "overall_error_rate_pct": round(overall_error_rate, 2),
-            "warmup_end_elapsed_seconds": warmup_end_bucket,
-            "points": points,
-        }
+        return await _call_sp(pool, "GET_ERROR_TIMELINE", test_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -8516,188 +8433,12 @@ async def get_latency_breakdown(test_id: str) -> dict[str, Any]:
     - Read vs Write operations summary (count, ops/s, P50/P95/P99/min/max)
     - Per-query-type latency breakdown (Point Lookup, Range Scan, Insert, Update)
     For parent runs (multi-worker), aggregates data from all child runs.
+    
+    Uses stored procedure GET_LATENCY_BREAKDOWN for consistency.
     """
     try:
         pool = snowflake_pool.get_default_pool()
-        prefix = _prefix()
-
-        # Determine if this is a parent run (multi-worker aggregation)
-        run_id_rows = await pool.execute_query(
-            f"SELECT RUN_ID FROM {prefix}.TEST_RESULTS WHERE TEST_ID = ?",
-            params=[test_id],
-        )
-        run_id = run_id_rows[0][0] if run_id_rows and run_id_rows[0] else None
-        is_parent = bool(run_id) and str(run_id) == str(test_id)
-
-        if is_parent:
-            test_filter = f"TEST_ID IN (SELECT TEST_ID FROM {prefix}.TEST_RESULTS WHERE RUN_ID = ?)"
-        else:
-            test_filter = "TEST_ID = ?"
-
-        # Query for read/write breakdown with percentiles
-        # Reads = Point Lookup + Range Scan, Writes = Insert + Update
-        query = f"""
-        WITH raw_data AS (
-            SELECT
-                APP_ELAPSED_MS,
-                QUERY_KIND,
-                CASE
-                    WHEN UPPER(REPLACE(QUERY_KIND, '_', ' ')) IN ('POINT LOOKUP', 'RANGE SCAN', 'SELECT', 'READ') THEN 'READ'
-                    WHEN UPPER(REPLACE(QUERY_KIND, '_', ' ')) IN ('INSERT', 'UPDATE', 'DELETE', 'WRITE') THEN 'WRITE'
-                    ELSE 'OTHER'
-                END AS OPERATION_TYPE,
-                SUCCESS,
-                WARMUP,
-                START_TIME
-            FROM {_prefix()}.QUERY_EXECUTIONS
-            WHERE {test_filter}
-              AND WARMUP = FALSE
-              AND SUCCESS = TRUE
-              AND APP_ELAPSED_MS IS NOT NULL
-        ),
-        duration_info AS (
-            SELECT
-                TIMESTAMPDIFF('SECOND', MIN(START_TIME), MAX(START_TIME)) AS duration_seconds
-            FROM raw_data
-        ),
-        -- Read/Write aggregation
-        rw_stats AS (
-            SELECT
-                OPERATION_TYPE,
-                COUNT(*) AS query_count,
-                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY APP_ELAPSED_MS) AS p50_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY APP_ELAPSED_MS) AS p95_ms,
-                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY APP_ELAPSED_MS) AS p99_ms,
-                MIN(APP_ELAPSED_MS) AS min_ms,
-                MAX(APP_ELAPSED_MS) AS max_ms,
-                AVG(APP_ELAPSED_MS) AS avg_ms
-            FROM raw_data
-            WHERE OPERATION_TYPE IN ('READ', 'WRITE')
-            GROUP BY OPERATION_TYPE
-        ),
-        -- Per query kind aggregation
-        qk_stats AS (
-            SELECT
-                QUERY_KIND,
-                COUNT(*) AS query_count,
-                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY APP_ELAPSED_MS) AS p50_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY APP_ELAPSED_MS) AS p95_ms,
-                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY APP_ELAPSED_MS) AS p99_ms,
-                MIN(APP_ELAPSED_MS) AS min_ms,
-                MAX(APP_ELAPSED_MS) AS max_ms,
-                AVG(APP_ELAPSED_MS) AS avg_ms
-            FROM raw_data
-            GROUP BY QUERY_KIND
-        )
-        SELECT
-            'RW' AS stat_type,
-            OPERATION_TYPE AS category,
-            query_count,
-            p50_ms,
-            p95_ms,
-            p99_ms,
-            min_ms,
-            max_ms,
-            avg_ms,
-            (SELECT duration_seconds FROM duration_info) AS duration_seconds
-        FROM rw_stats
-
-        UNION ALL
-
-        SELECT
-            'QK' AS stat_type,
-            QUERY_KIND AS category,
-            query_count,
-            p50_ms,
-            p95_ms,
-            p99_ms,
-            min_ms,
-            max_ms,
-            avg_ms,
-            (SELECT duration_seconds FROM duration_info) AS duration_seconds
-        FROM qk_stats
-        ORDER BY stat_type, category
-        """
-
-        rows = await pool.execute_query(query, params=[test_id])
-
-        if not rows:
-            return {
-                "test_id": test_id,
-                "available": False,
-                "message": "No query execution data available",
-            }
-
-        read_ops: dict[str, Any] | None = None
-        write_ops: dict[str, Any] | None = None
-        per_query_type: list[dict[str, Any]] = []
-        duration_seconds: float = 0
-
-        for row in rows:
-            stat_type = row[0]
-            category = row[1]
-            count = int(row[2] or 0)
-            p50 = _to_float_or_none(row[3])
-            p95 = _to_float_or_none(row[4])
-            p99 = _to_float_or_none(row[5])
-            min_ms = _to_float_or_none(row[6])
-            max_ms = _to_float_or_none(row[7])
-            avg_ms = _to_float_or_none(row[8])
-            dur = _to_float_or_none(row[9])
-
-            if dur is not None and dur > duration_seconds:
-                duration_seconds = dur
-
-            stats = {
-                "count": count,
-                "p50_ms": round(p50, 2) if p50 is not None else None,
-                "p95_ms": round(p95, 2) if p95 is not None else None,
-                "p99_ms": round(p99, 2) if p99 is not None else None,
-                "min_ms": round(min_ms, 2) if min_ms is not None else None,
-                "max_ms": round(max_ms, 2) if max_ms is not None else None,
-                "avg_ms": round(avg_ms, 2) if avg_ms is not None else None,
-            }
-
-            if stat_type == "RW":
-                ops_per_second = count / duration_seconds if duration_seconds > 0 else 0
-                stats["ops_per_second"] = round(ops_per_second, 2)
-
-                if category == "READ":
-                    read_ops = stats
-                elif category == "WRITE":
-                    write_ops = stats
-            else:
-                # Per query kind
-                per_query_type.append({
-                    "query_type": category,
-                    **stats,
-                })
-
-        # Sort per_query_type: Reads first (Point Lookup, Range Scan), then Writes (Insert, Update)
-        query_type_order = {
-            "POINT LOOKUP": 1,
-            "RANGE SCAN": 2,
-            "SELECT": 3,
-            "INSERT": 4,
-            "UPDATE": 5,
-            "DELETE": 6,
-        }
-        per_query_type.sort(
-            key=lambda x: query_type_order.get(x["query_type"].upper(), 99)
-        )
-
-        total_ops = (read_ops["count"] if read_ops else 0) + (write_ops["count"] if write_ops else 0)
-
-        return {
-            "test_id": test_id,
-            "available": True,
-            "is_parent_run": is_parent,
-            "duration_seconds": duration_seconds,
-            "total_operations": total_ops,
-            "read_operations": read_ops,
-            "write_operations": write_ops,
-            "per_query_type": per_query_type,
-        }
+        return await _call_sp(pool, "GET_LATENCY_BREAKDOWN", test_id)
     except HTTPException:
         raise
     except Exception as e:

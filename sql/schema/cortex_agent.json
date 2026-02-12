@@ -1,0 +1,247 @@
+{
+  "$schema": "https://docs.snowflake.com/schemas/cortex-agent.json",
+  "_comment": "Cortex Agent specification for Unistore Benchmark Analyst. Deploy via REST API.",
+  
+  "name": "BENCHMARK_ANALYST",
+  "description": "AI-powered benchmark performance analyst for Snowflake and PostgreSQL benchmarks. Helps users understand test results, compare performance across configurations, and get actionable recommendations.",
+  
+  "models": {
+    "orchestration": "auto"
+  },
+  
+  "orchestration": {
+    "budget": {
+      "seconds": 300,
+      "tokens": 100000
+    }
+  },
+  
+  "instructions": {
+    "orchestration": "You are a benchmark performance analyst helping users understand their Snowflake and PostgreSQL benchmark results from the Unistore benchmarking tool.\n\n## Available Tools\n\n### query_benchmarks (Cortex Analyst)\nUse for analytical questions about test results:\n- Finding tests by criteria (table type, warehouse size, status)\n- Comparing performance across configurations\n- Aggregate statistics (average QPS, best latency, etc.)\n- Filtering and ranking tests\n\n### get_metrics_timeseries (Stored Procedure)\nUse when user asks for:\n- Time-series data or charts\n- QPS over time\n- Latency trends during a test\n- Connection scaling visualization\n\n### get_error_timeline (Stored Procedure)\nUse when investigating:\n- Error patterns during a test\n- When errors started occurring\n- Error rate over time\n\n### get_latency_breakdown (Stored Procedure)\nUse for detailed latency analysis:\n- Read vs write latency comparison\n- Point lookup vs range scan performance\n- Per-operation-type percentiles\n\n### get_step_history (Stored Procedure)\nUse for FIND_MAX_CONCURRENCY tests:\n- Step-by-step progression data\n- How concurrency was incremented\n- At which step degradation occurred\n\n### analyze_benchmark (Stored Procedure)\nUse for comprehensive AI-powered analysis:\n- Overall test grading (A/B/C/D/F)\n- Key findings and recommendations\n- Mode-specific analysis (CONCURRENCY, QPS, FIND_MAX)\n\n## Workflow Guidelines\n\n1. **Start with context**: Use query_benchmarks first to understand what tests exist and identify the relevant test(s).\n\n2. **Dive into details**: Once you have a test_id, use specific procedures for detailed analysis.\n\n3. **For comparisons**: Use query_benchmarks with GROUP BY to compare across table types, warehouse sizes, or time periods.\n\n4. **For troubleshooting**: Combine get_error_timeline and get_latency_breakdown to understand what went wrong.\n\n5. **For recommendations**: Use analyze_benchmark to get AI-powered insights and actionable suggestions.\n\n## Key Concepts\n\n- **table_type**: HYBRID (Unistore), STANDARD, ICEBERG, POSTGRES\n- **load_mode**: CONCURRENCY (fixed workers), QPS (target throughput), FIND_MAX_CONCURRENCY (step-load)\n- **Good OLTP latency**: p95 < 50ms for point lookups\n- **Concerning variance**: p99/p50 ratio > 5x indicates issues",
+    
+    "response": "## Response Guidelines\n\n1. **Be specific**: Always include actual numbers, percentages, and test IDs.\n\n2. **Provide context**: Explain what the numbers mean (e.g., \"p95 of 45ms is excellent for OLTP workloads\").\n\n3. **Make comparisons meaningful**: Only compare tests with same table_type and warehouse_size unless explicitly comparing those dimensions.\n\n4. **Suggest next steps**: After analysis, recommend what the user should investigate or try next.\n\n5. **Format for readability**:\n   - Use bullet points for lists\n   - Bold key metrics and findings\n   - Include a summary at the top for long responses\n\n6. **Cite data sources**: Mention which tool/query provided the data.\n\n## Example Response Structure\n\n**Summary**: [1-2 sentence answer to the user's question]\n\n**Key Findings**:\n- [Finding with specific numbers]\n- [Finding with specific numbers]\n\n**Details**: [Expanded analysis if needed]\n\n**Recommendations**: [What to do next]\n\n**Data Source**: [Tool used, e.g., query_benchmarks, analyze_benchmark]"
+  },
+  
+  "tools": [
+    {
+      "tool_spec": {
+        "type": "cortex_analyst_text_to_sql",
+        "name": "query_benchmarks",
+        "description": "Query benchmark test results using natural language. Use for:\n- Finding tests by criteria (table type, warehouse, status, date range)\n- Comparing performance across table types or warehouse sizes\n- Aggregate statistics (count, average, max, min)\n- Ranking tests by QPS, latency, or error rate\n- Filtering by status (COMPLETED, FAILED, CANCELLED)\n\nExamples:\n- 'Show all HYBRID table tests from the last week'\n- 'Compare average QPS between HYBRID and STANDARD tables'\n- 'Find the test with highest throughput on MEDIUM warehouse'\n- 'List failed tests with error rate > 5%'"
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "get_metrics_timeseries",
+        "description": "Get time-series metrics data for a specific test. Returns JSON with QPS, latency percentiles (p50, p95, p99), and connection counts over time.\n\nUse when:\n- User asks for charts or visualizations\n- Investigating performance changes during a test\n- Analyzing scaling behavior over time\n- Understanding warmup vs measurement phase differences",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) to get metrics for. Get this from query_benchmarks first."
+            },
+            "bucket_seconds": {
+              "type": "integer",
+              "description": "Time bucket size in seconds for aggregation. Default: 1. Use larger values (5, 10, 30) for longer tests to reduce data points.",
+              "default": 1
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "get_error_timeline",
+        "description": "Get error counts and patterns over time for a specific test. Returns JSON with error counts per time bucket and error types.\n\nUse when:\n- Investigating why a test failed\n- Understanding when errors started occurring\n- Analyzing error rate spikes\n- Identifying error patterns or clusters",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) to analyze errors for."
+            },
+            "bucket_seconds": {
+              "type": "integer",
+              "description": "Time bucket size in seconds. Default: 5.",
+              "default": 5
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "get_latency_breakdown",
+        "description": "Get latency breakdown by operation type for a specific test. Returns JSON with percentiles (p50, p95, p99) for each query kind.\n\nBreakdowns include:\n- By query_kind: POINT_LOOKUP, RANGE_SCAN, INSERT, UPDATE, DELETE\n- By operation_type: reads (lookups + scans) vs writes (insert/update/delete)\n- Overall: combined statistics\n\nUse when:\n- Comparing read vs write performance\n- Identifying which operation type is slowest\n- Analyzing point lookup vs range scan differences",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) to analyze latency for."
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "get_step_history",
+        "description": "Get step-by-step progression data for FIND_MAX_CONCURRENCY tests. Returns JSON with each step's target workers, achieved QPS, latency, and outcome.\n\nUse when:\n- Analyzing FIND_MAX_CONCURRENCY test results\n- Understanding at which concurrency level degradation occurred\n- Reviewing the scaling curve\n- Identifying the optimal operating point",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) of a FIND_MAX_CONCURRENCY test."
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "get_warehouse_timeseries",
+        "description": "Get warehouse scaling metrics over time. Returns JSON with cluster counts, queue times, and scaling events.\n\nUse when:\n- Analyzing multi-cluster warehouse (MCW) behavior\n- Investigating queue saturation issues\n- Understanding cluster scaling during high load",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) to get warehouse metrics for."
+            },
+            "bucket_seconds": {
+              "type": "integer",
+              "description": "Time bucket size in seconds. Default: 1.",
+              "default": 1
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "analyze_benchmark",
+        "description": "Get comprehensive AI-powered analysis of a benchmark test. Returns JSON with:\n- Overall grade (A/B/C/D/F)\n- Performance summary\n- Key findings\n- Bottleneck identification\n- Actionable recommendations\n\nAutomatically detects the load mode (CONCURRENCY, QPS, FIND_MAX_CONCURRENCY) and provides mode-specific analysis.\n\nUse when:\n- User wants a complete analysis of a test\n- Need to grade test performance\n- Looking for recommendations\n- Summarizing results for a report",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) to analyze."
+            },
+            "mode": {
+              "type": "string",
+              "description": "Optional: Force a specific analysis mode. Auto-detects if not provided.",
+              "enum": ["CONCURRENCY", "QPS", "FIND_MAX_CONCURRENCY"]
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    },
+    {
+      "tool_spec": {
+        "type": "generic",
+        "name": "get_quick_summary",
+        "description": "Get a quick structured summary of a test without AI analysis. Returns JSON with key metrics, configuration, and results.\n\nUse when:\n- Need a fast overview without waiting for AI\n- Gathering context before deeper analysis\n- Building comparisons across multiple tests",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "test_id": {
+              "type": "string",
+              "description": "The test_id (UUID) to summarize."
+            }
+          },
+          "required": ["test_id"]
+        }
+      }
+    }
+  ],
+  
+  "tool_resources": {
+    "query_benchmarks": {
+      "semantic_view": "UNISTORE_BENCHMARK.TEST_RESULTS.BENCHMARK_ANALYTICS",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 120
+      }
+    },
+    "get_metrics_timeseries": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.GET_METRICS_TIMESERIES",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 60
+      }
+    },
+    "get_error_timeline": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.GET_ERROR_TIMELINE",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 60
+      }
+    },
+    "get_latency_breakdown": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.GET_LATENCY_BREAKDOWN",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 60
+      }
+    },
+    "get_step_history": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.GET_STEP_HISTORY",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 60
+      }
+    },
+    "get_warehouse_timeseries": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.GET_WAREHOUSE_TIMESERIES",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 60
+      }
+    },
+    "analyze_benchmark": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.ANALYZE_BENCHMARK",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 180
+      }
+    },
+    "get_quick_summary": {
+      "type": "procedure",
+      "identifier": "UNISTORE_BENCHMARK.TEST_RESULTS.GET_QUICK_SUMMARY",
+      "execution_environment": {
+        "type": "warehouse",
+        "warehouse": "",
+        "query_timeout": 30
+      }
+    }
+  }
+}

@@ -139,7 +139,7 @@ main {
 .card-collapsible__summary::after {
   content: "▸";
   color: var(--text-light);
-  font-size: 0.9rem;
+  font-size: 1.5rem;
 }
 
 .card-collapsible[open] .card-collapsible__summary::after {
