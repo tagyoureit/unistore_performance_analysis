@@ -118,4 +118,73 @@ async def generate_preflight_warnings(
             },
         })
 
+    # -------------------------------------------------------------------------
+    # Interactive table checks
+    # -------------------------------------------------------------------------
+    if table_type == "interactive":
+        # Check: no clustering key specified
+        clustering_keys = scenario_config.get("clustering_keys", [])
+        if not clustering_keys:
+            warnings.append({
+                "severity": "high",
+                "title": "Missing Clustering Key",
+                "message": (
+                    "Interactive tables require a CLUSTER BY clause for partition pruning. "
+                    "Without it, the interactive warehouse scans all partitions and queries "
+                    "hit the 5-second statement timeout, falling back to standard execution."
+                ),
+                "recommendations": [
+                    "Add clustering_keys to the table configuration matching your query predicates",
+                    "For point lookups: cluster by the lookup column (e.g. account_id)",
+                    "For composite access: put the most selective column first",
+                ],
+                "details": {
+                    "table_type": table_type,
+                    "table_name": table_name,
+                },
+            })
+
+        # Check: warehouse type mismatch
+        warehouse_cfg = scenario_config.get("warehouse", {})
+        wh_type = str(warehouse_cfg.get("type", "")).lower()
+        if wh_type and wh_type != "interactive":
+            warnings.append({
+                "severity": "high",
+                "title": "Warehouse Type Mismatch",
+                "message": (
+                    f"Table type is INTERACTIVE but warehouse type is '{wh_type.upper()}'. "
+                    "Interactive tables must be served by an interactive warehouse to get "
+                    "sub-second latency. On a standard warehouse they behave like regular tables."
+                ),
+                "recommendations": [
+                    "Use an interactive warehouse (CREATE INTERACTIVE WAREHOUSE ...)",
+                    "Attach the table: ALTER WAREHOUSE <iwh> ADD TABLES (<table>)",
+                ],
+                "details": {
+                    "table_type": table_type,
+                    "table_name": table_name,
+                    "warehouse_type": wh_type,
+                },
+            })
+
+        # Check: write workload on interactive table
+        if write_pct > 0:
+            warnings.append({
+                "severity": "medium",
+                "title": "Writes on Interactive Table",
+                "message": (
+                    f"Configuration includes ~{write_pct*100:.0f}% write operations. "
+                    "Interactive tables on interactive warehouses are optimized for reads. "
+                    "Writes go through the standard execution path and may affect read latency."
+                ),
+                "recommendations": [
+                    "Use interactive tables for read-only serving workloads",
+                    "Route writes to a standard warehouse or use dynamic interactive tables",
+                ],
+                "details": {
+                    "table_type": table_type,
+                    "write_percentage": round(write_pct * 100, 1),
+                },
+            })
+
     return warnings
