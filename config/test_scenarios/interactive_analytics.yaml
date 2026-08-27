@@ -1,0 +1,123 @@
+# ============================================================================
+# TEMPLATE METADATA
+# ============================================================================
+name: "Interactive Analytics - Dashboard Serving"
+description: "Point lookups, range scans, and aggregations on interactive tables with interactive warehouse"
+version: "1.0"
+category: "INTERACTIVE"
+
+# ============================================================================
+# Interactive Analytics Template
+# Simulates a dashboard serving workload: high concurrency point lookups
+# by a well-clustered key, range scans over date windows, and pre-aggregated
+# rollups. Requires an interactive warehouse with the target table attached.
+#
+# Based on a 4B-row (433 GiB) benchmark across 9 configurations comparing
+# interactive tables, standard tables on interactive warehouses, and standard
+# warehouses. Key finding: the interactive warehouse type accounts for 2-4x
+# latency reduction; the interactive table format adds ~10-15% on top.
+#
+# Reference: github.com/mars137/interactive-analytics-benchmark
+# ============================================================================
+
+# Table configuration
+table:
+  name: "fact_interactive"
+  table_type: "INTERACTIVE"
+  database: "IA_BENCH"
+  schema: "BENCH"
+  # NOTE: Table creation is disabled. This table/view must already exist.
+  # Use CREATE INTERACTIVE TABLE ... CLUSTER BY (account_id, event_date) AS SELECT ...
+  # The clustering key MUST match primary access patterns or the interactive
+  # warehouse cannot prune and queries hit the 5-second statement timeout.
+
+  columns:
+    account_id: "NUMBER"
+    event_date: "DATE"
+    campaign_id: "NUMBER"
+    channel: "STRING"
+    engagement_score: "NUMBER(10,2)"
+    impressions: "NUMBER"
+    clicks: "NUMBER"
+    conversions: "NUMBER"
+    spend: "NUMBER(12,2)"
+    region: "STRING"
+
+  clustering_keys:
+    - "account_id"
+    - "event_date"
+
+  initial_row_count: 5000000  # 5M rows minimum; tested up to 4B
+
+# Warehouse configuration
+warehouse:
+  size: "XSMALL"
+  name: "IA_BENCH_INTERACTIVE_XS"
+  type: "INTERACTIVE"
+  auto_suspend: 86400  # 24h - keep warm for consistent benchmarks
+  auto_resume: false
+
+  # Interactive warehouse requires explicit table attachment
+  tables_to_attach:
+    - "IA_BENCH.BENCH.fact_interactive"
+
+# Workload configuration
+workload:
+  type: "OLAP"
+  read_weight: 1.0
+  write_weight: 0.0  # Interactive tables on IWH are read-only serving
+
+  # Query mix simulating a dashboard backend
+  point_lookup_weight: 0.5   # WHERE account_id = ?
+  range_scan_weight: 0.3     # WHERE account_id = ? AND event_date BETWEEN ...
+  aggregation_weight: 0.2    # GROUP BY region, channel
+
+# Load pattern
+load_pattern:
+  type: "STEADY"
+  target_ops_per_second: 100  # Dashboard-level QPS
+
+# Test parameters
+test:
+  duration_seconds: 180  # 3 minutes per arm
+  concurrent_connections: 10
+  warmup_seconds: 30  # Critical: first access is 5-7x slower (remote fetch)
+  think_time_ms: 0
+
+  # Performance targets based on benchmark results at 5M rows / XS
+  targets:
+    max_p95_latency_ms: 500
+    max_p99_latency_ms: 1000
+    max_error_rate_percent: 1.0
+
+# Connection pool settings
+connection_pool:
+  pool_size: 10
+  max_overflow: 5
+  timeout_seconds: 30
+
+# Reporting
+report:
+  save_results: true
+  generate_charts: true
+  export_format: "CSV"
+  include_warehouse_stats: true
+
+# ============================================================================
+# NOTES FOR OPERATORS
+# ============================================================================
+# 1. Cache warming: The first query after attach pulls from remote storage
+#    (552ms vs 73ms warm). The warmup_seconds parameter handles this, but
+#    if you skip it your p99 will include cold-start outliers.
+#
+# 2. Clustering key order: For composite keys, the FIRST column dominates
+#    partition pruning. (account_id, event_date) prunes on account_id lookups;
+#    (event_date, account_id) does NOT prune on account_id.
+#
+# 3. Fallback behavior: If a query exceeds the 5-second interactive timeout,
+#    it silently falls back to standard warehouse execution. Monitor
+#    WAREHOUSE_TYPE in QUERY_HISTORY to detect this.
+#
+# 4. Standard tables work too: ALTER WAREHOUSE iwh ADD TABLES (db.schema.tbl)
+#    gives most of the speedup without converting to interactive table format.
+# ============================================================================
